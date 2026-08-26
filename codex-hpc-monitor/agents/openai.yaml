@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex HPC Monitor"
+  short_description: "Detached low-token Slurm job monitoring"
+  default_prompt: "Use $codex-hpc-monitor to monitor this Slurm job with the detached local supervisor."

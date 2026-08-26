@@ -1,0 +1,858 @@
+#!/usr/bin/env python3
+"""Detach, supervise, and read local status for the Slurm watcher."""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+import fcntl
+import hashlib
+import json
+import os
+import re
+import secrets
+import signal
+import stat
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+
+JOB_ID_RE = re.compile(r"^[0-9]+(?:_[0-9]+)?$")
+HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+SCHEMA_PREFIX = "codex-hpc-monitor"
+WATCHER_EXIT_EVENTS = {
+    0: {"completed"},
+    3: {"terminal_failure"},
+    4: {"pending_alert"},
+    5: {"query_error"},
+    6: {"running"},
+    7: {"anomalous_state"},
+    8: {"lost_observability"},
+    9: {"identity_mismatch"},
+    10: {"watch_timeout"},
+    11: {"duplicate_watcher"},
+    12: {"dependency_error", "watcher_error"},
+}
+WATCHER_EXIT_CLASSIFICATIONS = {
+    0: {"scheduler_success"},
+    3: {"scheduler_terminal_failure"},
+    4: {"scheduler_pending_alert"},
+    5: {"scheduler_query_failure"},
+    6: {"scheduler_active"},
+    7: {"scheduler_anomalous_state"},
+    8: {"scheduler_observability_failure"},
+    9: {"scheduler_identity_mismatch"},
+    10: {"scheduler_watch_timeout"},
+    11: {"watcher_duplicate"},
+    12: {"watcher_infrastructure_failure"},
+}
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def canonical_json(payload: object) -> bytes:
+    return (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+
+def fsync_directory(path: Path) -> None:
+    fd = os.open(str(path), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def ensure_private_directory(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if path.is_symlink() or not path.is_dir():
+        raise ValueError(f"unsafe state directory: {path}")
+    os.chmod(path, 0o700)
+
+
+def write_temp(path: Path, payload: object) -> Path:
+    ensure_private_directory(path.parent)
+    temp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
+    fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        data = canonical_json(payload)
+        os.write(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    return temp
+
+
+def replace_json(path: Path, payload: object) -> None:
+    temp = write_temp(path, payload)
+    try:
+        os.replace(str(temp), str(path))
+        os.chmod(path, 0o600)
+        fsync_directory(path.parent)
+    finally:
+        try:
+            temp.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def publish_json_no_replace(path: Path, payload: object) -> None:
+    temp = write_temp(path, payload)
+    try:
+        os.link(str(temp), str(path), follow_symlinks=False)
+        os.chmod(path, 0o600)
+        fsync_directory(path.parent)
+    finally:
+        try:
+            temp.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def read_json(path: Path) -> Dict[str, Any]:
+    try:
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            return {}
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def process_start_ticks(pid: int) -> Optional[str]:
+    try:
+        value = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        return value[value.rfind(")") + 2 :].split()[19]
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def process_matches(pid: object, ticks: object) -> bool:
+    return (
+        isinstance(pid, int)
+        and pid > 1
+        and isinstance(ticks, str)
+        and bool(ticks)
+        and process_start_ticks(pid) == ticks
+    )
+
+
+def base_dir(state_dir: Path, host: str, job_id: str) -> Path:
+    return state_dir / "supervisors" / f"{host}-{job_id}"
+
+
+def current_run(base: Path) -> Optional[Path]:
+    current = read_json(base / "current.json")
+    run_id = current.get("run_id")
+    if not isinstance(run_id, str) or not re.fullmatch(r"run_[A-Za-z0-9_-]+", run_id):
+        return None
+    run = base / "runs" / run_id
+    try:
+        run.relative_to(base / "runs")
+    except ValueError:
+        return None
+    return run
+
+
+def verified_local_state(run: Path, host: str, job_id: str) -> Dict[str, Any]:
+    manifest_path = run / "manifest.json"
+    manifest = read_json(manifest_path)
+    started = read_json(run / "supervisor_started.json")
+    expected_manifest_sha = started.get("manifest_sha256")
+    if (
+        not manifest
+        or manifest.get("run_id") != run.name
+        or manifest.get("host") != host
+        or manifest.get("job_id") != job_id
+        or not isinstance(expected_manifest_sha, str)
+        or sha256_file(manifest_path) != expected_manifest_sha
+    ):
+        return {"present": False, "verified": False, "reason": "manifest_unverified"}
+
+    state_dir = Path(str(manifest.get("state_dir", "")))
+    path = state_dir / f"{host}-{job_id}.state.json"
+    payload = read_json(path)
+    if not payload:
+        return {"present": False, "verified": False, "path": str(path)}
+
+    problems = []
+    if payload.get("schema_version") != 1:
+        problems.append("schema_mismatch")
+    if payload.get("host") != host:
+        problems.append("host_mismatch")
+    snapshot = payload.get("snapshot")
+    if isinstance(snapshot, dict) and snapshot.get("job_id") != job_id:
+        problems.append("job_id_mismatch")
+    try:
+        if path.stat().st_mtime_ns < manifest_path.stat().st_mtime_ns:
+            problems.append("stale_state")
+    except OSError:
+        problems.append("state_stat_failed")
+    return {
+        "present": True,
+        "verified": not problems,
+        "path": str(path),
+        "sha256": sha256_file(path) if not problems else None,
+        "problems": problems,
+        "payload": payload if not problems else None,
+    }
+
+
+def run_status(run: Optional[Path], host: str, job_id: str) -> Dict[str, Any]:
+    if run is None:
+        return {
+            "schema_version": f"{SCHEMA_PREFIX}.status/v1",
+            "state": "not_started",
+            "host": host,
+            "job_id": job_id,
+        }
+
+    watcher_state = verified_local_state(run, host, job_id)
+    terminal = read_json(run / "terminal.json")
+    if terminal:
+        return {
+            "schema_version": f"{SCHEMA_PREFIX}.status/v1",
+            "state": "terminal",
+            "host": host,
+            "job_id": job_id,
+            "run_id": run.name,
+            "run_dir": str(run),
+            "terminal": terminal,
+            "watcher_state": watcher_state,
+        }
+
+    started = read_json(run / "supervisor_started.json")
+    runtime = read_json(run / "runtime.json")
+    child_exit = read_json(run / "child_exit.json")
+    supervisor_alive = process_matches(started.get("pid"), started.get("pid_start_ticks"))
+    watcher_alive = process_matches(runtime.get("pid"), runtime.get("pid_start_ticks"))
+    if supervisor_alive:
+        state = "active"
+    elif child_exit:
+        state = "exit_observed_terminal_missing"
+    elif started:
+        state = "supervisor_lost"
+    else:
+        state = "launch_unconfirmed"
+    return {
+        "schema_version": f"{SCHEMA_PREFIX}.status/v1",
+        "state": state,
+        "host": host,
+        "job_id": job_id,
+        "run_id": run.name,
+        "run_dir": str(run),
+        "supervisor_alive": supervisor_alive,
+        "watcher_alive": watcher_alive,
+        "supervisor": started or None,
+        "runtime": runtime or None,
+        "child_exit": child_exit or None,
+        "watcher_state": watcher_state,
+    }
+
+
+def open_lifetime_lock(base: Path) -> int:
+    ensure_private_directory(base)
+    path = base / "monitor.lock"
+    fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        raise
+    return fd
+
+
+def watcher_command(args: argparse.Namespace) -> List[str]:
+    command = [
+        sys.executable,
+        str(args.watcher_path.resolve()),
+        args.job_id,
+        "--host",
+        args.host,
+        "--poll-seconds",
+        str(args.poll_seconds),
+        "--pending-alert-seconds",
+        str(args.pending_alert_seconds),
+        "--terminal-observability-seconds",
+        str(args.terminal_observability_seconds),
+        "--max-watch-seconds",
+        str(args.max_watch_seconds),
+        "--query-failures",
+        str(args.query_failures),
+        "--state-dir",
+        str(args.state_dir.resolve()),
+    ]
+    for option, value in (
+        ("--expected-owner", args.expected_owner),
+        ("--expected-job-name", args.expected_job_name),
+        ("--expected-partition", args.expected_partition),
+    ):
+        if value is not None:
+            command.extend([option, value])
+    return command
+
+
+def validate_identity(job_id: str, host: str) -> None:
+    if not JOB_ID_RE.fullmatch(job_id):
+        raise ValueError("job_id must be numeric, optionally followed by _<array-index>")
+    if not HOST_RE.fullmatch(host):
+        raise ValueError("host contains unsupported characters")
+
+
+def start_monitor(args: argparse.Namespace) -> int:
+    validate_identity(args.job_id, args.host)
+    watcher_input = args.watcher_path.expanduser()
+    if watcher_input.is_symlink():
+        raise ValueError(f"watcher path must not be a symlink: {watcher_input}")
+    watcher = watcher_input.resolve(strict=True)
+    if not watcher.is_file():
+        raise ValueError(f"watcher is not a regular file: {watcher}")
+    args.watcher_path = watcher
+    ensure_private_directory(args.state_dir)
+    base = base_dir(args.state_dir, args.host, args.job_id)
+    try:
+        lock_fd = open_lifetime_lock(base)
+    except BlockingIOError:
+        payload = run_status(current_run(base), args.host, args.job_id)
+        payload["start_result"] = "already_active"
+        print(json.dumps(payload, sort_keys=True))
+        return 2
+
+    try:
+        previous = run_status(current_run(base), args.host, args.job_id)
+        if previous["state"] != "not_started" and not args.restart:
+            previous["start_result"] = "restart_required"
+            print(json.dumps(previous, sort_keys=True))
+            return 3
+
+        run_id = f"run_{int(time.time())}_{os.getpid()}_{secrets.token_hex(4)}"
+        run = base / "runs" / run_id
+        ensure_private_directory(run)
+        command = watcher_command(args)
+        manifest = {
+            "schema_version": f"{SCHEMA_PREFIX}.manifest/v1",
+            "run_id": run_id,
+            "host": args.host,
+            "job_id": args.job_id,
+            "created_at": utc_now(),
+            "watcher_argv": command,
+            "watcher_path_sha256": sha256_file(watcher),
+            "state_dir": str(args.state_dir.resolve()),
+            "scope": "slurm_only",
+            "project_gate_evaluated": False,
+        }
+        publish_json_no_replace(run / "manifest.json", manifest)
+        manifest_sha = sha256_file(run / "manifest.json")
+        replace_json(
+            base / "current.json",
+            {
+                "schema_version": f"{SCHEMA_PREFIX}.current/v1",
+                "host": args.host,
+                "job_id": args.job_id,
+                "run_id": run_id,
+                "updated_at": utc_now(),
+            },
+        )
+        os.ftruncate(lock_fd, 0)
+        os.write(lock_fd, canonical_json({"run_id": run_id, "launcher_pid": os.getpid()}))
+        os.fsync(lock_fd)
+
+        supervisor_stdout = os.open(
+            str(run / "supervisor.log"), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600
+        )
+        try:
+            child = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve()),
+                    "_supervise",
+                    "--run-dir",
+                    str(run),
+                    "--manifest-sha256",
+                    manifest_sha,
+                    "--lock-fd",
+                    str(lock_fd),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=supervisor_stdout,
+                stderr=supervisor_stdout,
+                close_fds=True,
+                pass_fds=(lock_fd,),
+                start_new_session=True,
+            )
+        finally:
+            os.close(supervisor_stdout)
+        os.close(lock_fd)
+        lock_fd = -1
+
+        deadline = time.monotonic() + args.handshake_seconds
+        while time.monotonic() < deadline:
+            status = run_status(run, args.host, args.job_id)
+            if status["state"] in {"active", "terminal", "exit_observed_terminal_missing"}:
+                status["start_result"] = "started"
+                status["launcher_observed_pid"] = child.pid
+                print(json.dumps(status, sort_keys=True))
+                return 0
+            if child.poll() is not None:
+                break
+            time.sleep(0.05)
+        status = run_status(run, args.host, args.job_id)
+        status["start_result"] = "handshake_failed"
+        status["launcher_observed_pid"] = child.pid
+        print(json.dumps(status, sort_keys=True))
+        return 4
+    finally:
+        if lock_fd >= 0:
+            os.close(lock_fd)
+
+
+def set_parent_death_signal() -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(1, signal.SIGTERM) != 0:  # PR_SET_PDEATHSIG
+        raise OSError(ctypes.get_errno(), "prctl(PR_SET_PDEATHSIG) failed")
+    if os.getppid() == 1:
+        os.kill(os.getpid(), signal.SIGTERM)
+
+
+def validate_manifest_watcher(manifest: Dict[str, Any]) -> None:
+    argv = manifest.get("watcher_argv")
+    expected_sha = manifest.get("watcher_path_sha256")
+    if not isinstance(argv, list) or len(argv) < 2 or not isinstance(argv[1], str):
+        raise ValueError("manifest watcher argv is invalid")
+    watcher = Path(argv[1])
+    if watcher.is_symlink() or not watcher.is_file():
+        raise ValueError("manifest watcher path is not a regular non-symlink file")
+    if not isinstance(expected_sha, str) or sha256_file(watcher) != expected_sha:
+        raise ValueError("watcher hash mismatch")
+
+
+def verified_watcher_result(
+    manifest: Dict[str, Any],
+    started_epoch_ns: int,
+    watcher_exit_code: Optional[int],
+    watcher_signal: Optional[int],
+) -> Dict[str, Any]:
+    state_dir = Path(str(manifest["state_dir"]))
+    path = state_dir / f"{manifest['host']}-{manifest['job_id']}.result.json"
+    payload = read_json(path)
+    if not payload:
+        return {
+            "present": False,
+            "verified": False,
+            "path": str(path),
+            "problems": ["result_missing"],
+        }
+    problems = []
+    if payload.get("job_id") != manifest["job_id"]:
+        problems.append("job_id_mismatch")
+    if payload.get("scope") != "slurm_only":
+        problems.append("scope_mismatch")
+    if payload.get("project_gate_evaluated") is not False:
+        problems.append("project_gate_mismatch")
+    if watcher_signal is not None:
+        problems.append("watcher_signaled")
+    exit_key = watcher_exit_code if watcher_exit_code is not None else -1
+    allowed_events = WATCHER_EXIT_EVENTS.get(exit_key, set())
+    if payload.get("event") not in allowed_events:
+        problems.append("exit_event_mismatch")
+    allowed_classifications = WATCHER_EXIT_CLASSIFICATIONS.get(exit_key, set())
+    if payload.get("slurm_classification") not in allowed_classifications:
+        problems.append("exit_classification_mismatch")
+    if watcher_exit_code == 0 and (
+        payload.get("state") != "COMPLETED" or payload.get("exit_code") != "0:0"
+    ):
+        problems.append("success_evidence_mismatch")
+    if watcher_exit_code == 3 and (
+        payload.get("state") == "COMPLETED" and payload.get("exit_code") == "0:0"
+    ):
+        problems.append("failure_evidence_mismatch")
+    try:
+        if path.stat().st_mtime_ns < started_epoch_ns:
+            problems.append("stale_result")
+    except OSError:
+        problems.append("result_stat_failed")
+    return {
+        "present": True,
+        "verified": not problems,
+        "path": str(path),
+        "sha256": sha256_file(path) if not problems else None,
+        "event": payload.get("event"),
+        "problems": problems,
+        "payload": payload if not problems else None,
+    }
+
+
+def supervise(args: argparse.Namespace) -> int:
+    run = args.run_dir.resolve()
+    lock_fd = args.lock_fd
+    child: Optional[subprocess.Popen[bytes]] = None
+    started_monotonic = time.monotonic()
+    started_epoch_ns = time.time_ns()
+    try:
+        manifest_path = run / "manifest.json"
+        if sha256_file(manifest_path) != args.manifest_sha256:
+            raise ValueError("manifest hash mismatch")
+        manifest = read_json(manifest_path)
+        if manifest.get("run_id") != run.name:
+            raise ValueError("manifest run identity mismatch")
+        validate_manifest_watcher(manifest)
+        started = {
+            "schema_version": f"{SCHEMA_PREFIX}.supervisor-started/v1",
+            "run_id": run.name,
+            "pid": os.getpid(),
+            "pid_start_ticks": process_start_ticks(os.getpid()),
+            "started_at": utc_now(),
+            "manifest_sha256": args.manifest_sha256,
+        }
+        publish_json_no_replace(run / "supervisor_started.json", started)
+
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        requested_signal: Dict[str, Optional[int]] = {"value": None}
+
+        def forward(signum: int, _frame: object) -> None:
+            requested_signal["value"] = signum
+            if child is not None and child.poll() is None:
+                try:
+                    child.send_signal(signum)
+                except ProcessLookupError:
+                    pass
+
+        signal.signal(signal.SIGTERM, forward)
+        signal.signal(signal.SIGINT, forward)
+
+        stdout_fd = os.open(
+            str(run / "watcher.stdout.log"), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600
+        )
+        stderr_fd = os.open(
+            str(run / "watcher.stderr.log"), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600
+        )
+        try:
+            child = subprocess.Popen(
+                list(manifest["watcher_argv"]),
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_fd,
+                stderr=stderr_fd,
+                close_fds=True,
+                preexec_fn=set_parent_death_signal,
+            )
+            if requested_signal["value"] is not None:
+                child.send_signal(requested_signal["value"])
+        finally:
+            os.close(stdout_fd)
+            os.close(stderr_fd)
+        replace_json(
+            run / "runtime.json",
+            {
+                "schema_version": f"{SCHEMA_PREFIX}.runtime/v1",
+                "run_id": run.name,
+                "pid": child.pid,
+                "pid_start_ticks": process_start_ticks(child.pid),
+                "started_at": utc_now(),
+            },
+        )
+        return_code = child.wait()
+        exit_code = return_code if return_code >= 0 else None
+        signal_number = -return_code if return_code < 0 else None
+        child_exit = {
+            "schema_version": f"{SCHEMA_PREFIX}.child-exit/v1",
+            "run_id": run.name,
+            "observed_at": utc_now(),
+            "exit_code": exit_code,
+            "signal": signal_number,
+            "requested_supervisor_signal": requested_signal["value"],
+        }
+        publish_json_no_replace(run / "child_exit.json", child_exit)
+        result = verified_watcher_result(
+            manifest, started_epoch_ns, exit_code, signal_number
+        )
+        if signal_number is not None:
+            outcome = "watcher_signaled"
+        elif exit_code == 0:
+            outcome = "watcher_exit_zero"
+        else:
+            outcome = "watcher_exit_nonzero"
+        terminal = {
+            "schema_version": f"{SCHEMA_PREFIX}.terminal/v1",
+            "run_id": run.name,
+            "host": manifest["host"],
+            "job_id": manifest["job_id"],
+            "scope": "slurm_only",
+            "project_gate_evaluated": False,
+            "observer_state": "exited",
+            "observer_outcome": outcome,
+            "watcher_exit_code": exit_code,
+            "watcher_signal": signal_number,
+            "watcher_result": result,
+            "started_at": started["started_at"],
+            "ended_at": utc_now(),
+            "duration_monotonic_ms": int((time.monotonic() - started_monotonic) * 1000),
+            "manifest_sha256": args.manifest_sha256,
+        }
+        publish_json_no_replace(run / "terminal.json", terminal)
+        return 0
+    except Exception as exc:
+        failure = {
+            "schema_version": f"{SCHEMA_PREFIX}.supervisor-failure/v1",
+            "run_id": run.name,
+            "observed_at": utc_now(),
+            "failure_type": type(exc).__name__,
+            "child_started": child is not None,
+        }
+        try:
+            replace_json(run / "supervisor_failure.json", failure)
+        except Exception:
+            pass
+        if child is None:
+            try:
+                publish_json_no_replace(
+                    run / "terminal.json",
+                    {
+                        "schema_version": f"{SCHEMA_PREFIX}.terminal/v1",
+                        "run_id": run.name,
+                        "scope": "observer_only",
+                        "project_gate_evaluated": False,
+                        "observer_state": "launch_failed",
+                        "observer_outcome": "supervisor_failure",
+                        "failure_type": type(exc).__name__,
+                        "ended_at": utc_now(),
+                    },
+                )
+            except Exception:
+                pass
+        return 12
+    finally:
+        os.close(lock_fd)
+
+
+def status_command(args: argparse.Namespace) -> int:
+    validate_identity(args.job_id, args.host)
+    status = run_status(
+        current_run(base_dir(args.state_dir, args.host, args.job_id)),
+        args.host,
+        args.job_id,
+    )
+    print(json.dumps(status, sort_keys=True))
+    if args.require_terminal and status["state"] != "terminal":
+        return 3
+    return 0
+
+
+def terminal_wait_result(status: Dict[str, Any]) -> tuple[int, Dict[str, Any]]:
+    terminal = status.get("terminal")
+    watcher_result = terminal.get("watcher_result") if isinstance(terminal, dict) else None
+    problems = []
+    expected_schema = f"{SCHEMA_PREFIX}.terminal/v1"
+    if not isinstance(terminal, dict):
+        problems.append("terminal_missing")
+    else:
+        if terminal.get("schema_version") != expected_schema:
+            problems.append("terminal_schema_mismatch")
+        if terminal.get("host") != status.get("host"):
+            problems.append("terminal_host_mismatch")
+        if terminal.get("job_id") != status.get("job_id"):
+            problems.append("terminal_job_id_mismatch")
+        if terminal.get("scope") != "slurm_only":
+            problems.append("terminal_scope_mismatch")
+        if terminal.get("project_gate_evaluated") is not False:
+            problems.append("terminal_project_gate_mismatch")
+        if not isinstance(watcher_result, dict) or watcher_result.get("verified") is not True:
+            problems.append("watcher_result_unverified")
+
+    watcher_exit_code = terminal.get("watcher_exit_code") if isinstance(terminal, dict) else None
+    if type(watcher_exit_code) is not int:
+        problems.append("watcher_exit_code_invalid")
+
+    terminal_sha = None
+    run_dir = status.get("run_dir")
+    if isinstance(run_dir, str):
+        path = Path(run_dir) / "terminal.json"
+        try:
+            terminal_sha = sha256_file(path)
+        except OSError:
+            problems.append("terminal_hash_failed")
+    else:
+        problems.append("run_dir_missing")
+
+    payload: Dict[str, Any] = {
+        "schema_version": f"{SCHEMA_PREFIX}.wait/v1",
+        "state": "terminal",
+        "host": status.get("host"),
+        "job_id": status.get("job_id"),
+        "run_id": status.get("run_id"),
+        "terminal_verified": not problems,
+        "terminal_outcome": terminal.get("observer_outcome") if isinstance(terminal, dict) else None,
+        "watcher_exit_code": watcher_exit_code,
+        "terminal_sha256": terminal_sha,
+    }
+    if problems:
+        payload["problems"] = problems
+        return 12, payload
+
+    result_payload = watcher_result.get("payload")
+    if isinstance(result_payload, dict):
+        payload["slurm_classification"] = result_payload.get("slurm_classification")
+    return (0 if watcher_exit_code == 0 else 3), payload
+
+
+def wait_command(args: argparse.Namespace) -> int:
+    if not args.notification_worker_ack:
+        raise ValueError(
+            "wait requires --notification-worker-ack; the flag acknowledges the "
+            "notification-worker contract but does not authenticate a model role"
+        )
+    validate_identity(args.job_id, args.host)
+    deadline = time.monotonic() + args.timeout_seconds
+    publication_missing_since: Optional[float] = None
+    while True:
+        status = run_status(
+            current_run(base_dir(args.state_dir, args.host, args.job_id)),
+            args.host,
+            args.job_id,
+        )
+        state = status.get("state")
+        if state == "terminal":
+            exit_code, payload = terminal_wait_result(status)
+            print(json.dumps(payload, sort_keys=True))
+            return exit_code
+        if state == "exit_observed_terminal_missing":
+            if publication_missing_since is None:
+                publication_missing_since = time.monotonic()
+            elif time.monotonic() - publication_missing_since >= args.terminal_publication_grace_seconds:
+                print(
+                    json.dumps(
+                        {
+                            "schema_version": f"{SCHEMA_PREFIX}.wait/v1",
+                            "state": state,
+                            "host": args.host,
+                            "job_id": args.job_id,
+                            "run_id": status.get("run_id"),
+                        },
+                        sort_keys=True,
+                    )
+                )
+                return 12
+        elif state == "active":
+            publication_missing_since = None
+        else:
+            print(
+                json.dumps(
+                    {
+                        "schema_version": f"{SCHEMA_PREFIX}.wait/v1",
+                        "state": state,
+                        "host": args.host,
+                        "job_id": args.job_id,
+                        "run_id": status.get("run_id"),
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 11 if state == "supervisor_lost" else 12
+
+        if time.monotonic() >= deadline:
+            print(
+                json.dumps(
+                    {
+                        "schema_version": f"{SCHEMA_PREFIX}.wait/v1",
+                        "state": "wait_timeout",
+                        "host": args.host,
+                        "job_id": args.job_id,
+                        "run_id": status.get("run_id"),
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 4
+        time.sleep(min(args.poll_seconds, max(0.0, deadline - time.monotonic())))
+
+
+def positive_float(value: str) -> float:
+    parsed = float(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
+
+
+def nonnegative_float(value: str) -> float:
+    parsed = float(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be nonnegative")
+    return parsed
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(description=__doc__)
+    sub = result.add_subparsers(dest="command", required=True)
+    start = sub.add_parser("start", help="start one detached deterministic monitor")
+    start.add_argument("job_id")
+    start.add_argument("--host", default="hpc142")
+    start.add_argument("--state-dir", type=Path, default=Path.home() / ".cache" / "codex-hpc-monitor")
+    start.add_argument("--watcher-path", type=Path, default=Path(__file__).with_name("watch_slurm_job.py"))
+    start.add_argument("--poll-seconds", type=positive_float, default=60.0)
+    start.add_argument(
+        "--pending-alert-seconds",
+        type=nonnegative_float,
+        default=0.0,
+        help="stop on prolonged pending after this many seconds; 0 disables the stop",
+    )
+    start.add_argument("--terminal-observability-seconds", type=nonnegative_float, default=300.0)
+    start.add_argument("--max-watch-seconds", type=nonnegative_float, default=604800.0)
+    start.add_argument("--query-failures", type=int, default=3)
+    start.add_argument("--expected-owner")
+    start.add_argument("--expected-job-name")
+    start.add_argument("--expected-partition")
+    start.add_argument("--restart", action="store_true", help="start a new run after a prior terminal or lost supervisor")
+    start.add_argument("--handshake-seconds", type=positive_float, default=10.0)
+    start.set_defaults(func=start_monitor)
+
+    status = sub.add_parser("status", help="read local artifacts without querying Slurm")
+    status.add_argument("job_id")
+    status.add_argument("--host", default="hpc142")
+    status.add_argument("--state-dir", type=Path, default=Path.home() / ".cache" / "codex-hpc-monitor")
+    status.add_argument("--require-terminal", action="store_true")
+    status.set_defaults(func=status_command)
+
+    wait = sub.add_parser("wait", help="block on local supervisor state without querying Slurm")
+    wait.add_argument("job_id")
+    wait.add_argument("--host", default="hpc142")
+    wait.add_argument("--state-dir", type=Path, default=Path.home() / ".cache" / "codex-hpc-monitor")
+    wait.add_argument("--timeout-seconds", type=positive_float, required=True)
+    wait.add_argument("--poll-seconds", type=positive_float, default=1.0)
+    wait.add_argument("--notification-worker-ack", action="store_true")
+    wait.add_argument("--terminal-publication-grace-seconds", type=nonnegative_float, default=10.0)
+    wait.set_defaults(func=wait_command)
+
+    internal = sub.add_parser("_supervise", help=argparse.SUPPRESS)
+    internal.add_argument("--run-dir", type=Path, required=True)
+    internal.add_argument("--manifest-sha256", required=True)
+    internal.add_argument("--lock-fd", type=int, required=True)
+    internal.set_defaults(func=supervise)
+    return result
+
+
+def main() -> int:
+    args = parser().parse_args()
+    if getattr(args, "query_failures", 1) < 1:
+        raise SystemExit("--query-failures must be at least 1")
+    try:
+        return int(args.func(args))
+    except (OSError, ValueError) as exc:
+        print(json.dumps({"error": type(exc).__name__, "detail": str(exc)}, sort_keys=True))
+        return 12
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

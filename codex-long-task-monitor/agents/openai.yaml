@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Long Task Monitor"
+  short_description: "Detached monitoring without model polling"
+  default_prompt: "Use $codex-long-task-monitor to monitor this task with a detached deterministic supervisor and no unchanged-state model polling."
