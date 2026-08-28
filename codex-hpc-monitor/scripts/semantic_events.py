@@ -67,6 +67,8 @@ MAX_CONFIG_BYTES = 16 * 1024
 MAX_BINDING_BYTES = 8 * 1024
 MAX_POSTFLIGHT_BYTES = 4 * 1024
 MAX_SAFE_MESSAGE_CHARS = 200
+MIN_REQUEST_TIMEOUT_SECONDS = 0.05
+MIN_LEASE_SECONDS = 0.1
 
 
 class SemanticEventError(ValueError):
@@ -312,6 +314,16 @@ def validate_bridge_config(value: object) -> Dict[str, Any]:
     # A delivery performs up to three requests plus a bounded turn wait; a
     # lease shorter than the request budget cannot be made safe even with
     # renewal, so reject it up front.
+    if request_timeout < MIN_REQUEST_TIMEOUT_SECONDS:
+        raise SemanticEventError(
+            "config_request_timeout_too_short",
+            f"request_timeout_seconds must be at least {MIN_REQUEST_TIMEOUT_SECONDS}",
+        )
+    if lease < MIN_LEASE_SECONDS:
+        raise SemanticEventError(
+            "config_lease_too_short",
+            f"lease_seconds must be at least {MIN_LEASE_SECONDS}",
+        )
     if lease < 2 * request_timeout:
         raise SemanticEventError(
             "config_lease_too_short",
@@ -1183,10 +1195,18 @@ def postflight_reset(state_dir: Path, event_id: str, *, confirm: bool) -> str:
     if not confirm:
         return "confirmation_required"
     path = postflight_path(state_dir, event_id)
-    record = _postflight_read(state_dir, event_id)
-    if record is None:
-        return "not_begun"
-    path.unlink()
+    with open(_postflight_lock(state_dir), "a+") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        record = _postflight_read(state_dir, event_id)
+        if record is None:
+            return "not_begun"
+        if record.get("state", "completed") == "completed":
+            # A completed marker is immutable evidence. In particular, a
+            # reset that raced with complete must never delete the completed
+            # replacement and reopen the side effect.
+            return "already_completed"
+        path.unlink()
+        fsync_directory(path.parent)
     return "reset"
 
 

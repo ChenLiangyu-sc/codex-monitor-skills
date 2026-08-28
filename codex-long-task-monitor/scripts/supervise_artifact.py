@@ -330,16 +330,21 @@ def reconcile_run_event(run: Path | None) -> str | None:
         return None
     if not (run / "terminal.json").exists():
         return None
-    if (run / "semantic_event.json").exists() or (
-        run / "semantic_event_failure.json"
-    ).exists():
+    if (run / "semantic_event.json").exists():
         return None
-    terminal = read_json(run / "terminal.json")
+    prior_failure = read_json(run / "semantic_event_failure.json")
+    if prior_failure and prior_failure.get("retryable") is False:
+        return None
+    status = run_status(run, str(manifest.get("task_handle", "")))
+    if status.get("state") != "terminal" or status.get("terminal_verified") is not True:
+        return None
+    terminal = status.get("terminal") or {}
     exit_code = terminal.get("watcher_exit_code")
     if not isinstance(exit_code, int):
         return None
     publish_semantic_event(run, manifest=manifest, watcher_exit_code=exit_code)
-    return read_json(run / "semantic_event.json").get("state")
+    published = read_json(run / "semantic_event.json")
+    return published.get("state") if published else None
 
 
 def publish_semantic_event(
@@ -355,6 +360,13 @@ def publish_semantic_event(
     """
     binding = manifest.get("event_binding")
     if not isinstance(binding, dict):
+        return
+    status = run_status(run, str(manifest.get("task_handle", "")))
+    if status.get("state") != "terminal" or status.get("terminal_verified") is not True:
+        return
+    verified_terminal = status.get("terminal") or {}
+    verified_exit_code = verified_terminal.get("watcher_exit_code")
+    if verified_exit_code != watcher_exit_code:
         return
     event_enum = ARTIFACT_SEMANTIC_EVENTS.get(
         watcher_exit_code if watcher_exit_code is not None else -1
@@ -390,7 +402,13 @@ def publish_semantic_event(
         except FileExistsError:
             # A reconciling observer recorded this publication first.
             pass
+        try:
+            (run / "semantic_event_failure.json").unlink()
+        except FileNotFoundError:
+            pass
     except (OSError, ValueError, semantic_events.SemanticEventError) as exc:
+        if (run / "semantic_event.json").exists():
+            return
         replace_json(
             run / "semantic_event_failure.json",
             {
@@ -398,6 +416,7 @@ def publish_semantic_event(
                 "run_id": run.name,
                 "state": "publish_failed",
                 "reason": getattr(exc, "reason", type(exc).__name__),
+                "retryable": isinstance(exc, OSError),
                 "observed_at": utc_now(),
             },
         )
@@ -531,6 +550,11 @@ def watcher_argv(run: Path, contract: dict[str, Any], deadline_epoch_seconds: fl
     # The watcher's relative timeout is capped so a restart generation can
     # never extend the frozen absolute observation window.
     remaining = deadline_epoch_seconds - time.time()
+    if remaining <= 0:
+        raise ValueError(
+            "observation window expired before watcher launch; restart cannot "
+            "extend the frozen deadline"
+        )
     timeout_seconds = min(float(contract["timeout_seconds"]), max(remaining, 0.0))
     command = [
         sys.executable,
@@ -630,11 +654,13 @@ def start_monitor(args: argparse.Namespace) -> int:
             )
         run_id = f"run_{int(time.time())}_{os.getpid()}_{secrets.token_hex(4)}"
         run = base / "runs" / run_id
-        ensure_private_directory(run)
         watcher_bytes = read_regular_bytes_no_follow(watcher)
+        # Resolve the last deadline check before creating any run artifacts,
+        # so an expiry at this boundary cannot leave an orphan run directory.
+        command = watcher_argv(run, contract, deadline_epoch_seconds)
+        ensure_private_directory(run)
         frozen = run / "watch_artifact_frozen.py"
         write_bytes_exclusive(frozen, watcher_bytes, 0o500)
-        command = watcher_argv(run, contract, deadline_epoch_seconds)
         manifest = {
             "schema_version": f"{SCHEMA_PREFIX}.manifest/v1",
             "task_handle": handle,

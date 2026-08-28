@@ -157,12 +157,18 @@ class BridgeConfigTests(unittest.TestCase):
             {**make_config(), "transport": {"type": "stdio"}},
             {**make_config(), "transport": {"type": "stdio", "command": []}},
             {**make_config(), "request_timeout_seconds": 0},
+            {**make_config(), "request_timeout_seconds": 0.001},
             {**make_config(), "max_attempts": 0},
             {**make_config(), "backoff_max_seconds": 1},
             {**make_config(), "extra_key": True},
             {**make_config(), "codex_home": "relative/path"},
             {**make_config(), "codex_home_id": "sha256:" + "b" * 64},
             {**make_config(), "lease_seconds": 31},
+            {
+                **make_config(),
+                "request_timeout_seconds": 0.05,
+                "lease_seconds": 0.002,
+            },
             {**make_config(), "turn_completion_timeout_seconds": 0},
         ):
             with self.assertRaises(se.SemanticEventError):
@@ -807,6 +813,22 @@ class PostflightStateMachineTests(unittest.TestCase):
             ),
             "digest_conflict",
         )
+
+    def test_reset_never_removes_completed_marker(self) -> None:
+        se.postflight_begin(
+            self.state, self.event_id, terminal_digest=self.digest, owner="turn-1"
+        )
+        self.assertEqual(
+            se.postflight_complete(self.state, self.event_id, owner="turn-1"),
+            "completed",
+        )
+        self.assertEqual(
+            se.postflight_reset(self.state, self.event_id, confirm=True),
+            "already_completed",
+        )
+        result = se.postflight_check(self.state, self.event_id)
+        self.assertTrue(result["processed"])
+        self.assertEqual(result["state"], "completed")
 
     def test_legacy_marker_without_state_is_completed(self) -> None:
         path = se.postflight_path(self.state, self.event_id)

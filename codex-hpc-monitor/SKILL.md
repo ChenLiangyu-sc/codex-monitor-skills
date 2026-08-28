@@ -154,7 +154,8 @@ Interpret `state` as:
 
 - `not_started`: no supervisor run is recorded.
 - `active`: the supervisor PID and Linux process start ticks match.
-- `terminal`: read the embedded verified terminal record.
+- `terminal`: inspect `terminal_verified`; only `true` is a verified
+  terminal record. A present but corrupt/unverified record fails closed.
 - `launch_unconfirmed`: no supervisor handshake exists.
 - `supervisor_lost`: the recorded supervisor identity is no longer live; no Slurm terminal result is established.
 - `exit_observed_terminal_missing`: the watcher exit was observed but terminal publication is incomplete; fail closed.

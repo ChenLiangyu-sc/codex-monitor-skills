@@ -56,11 +56,14 @@ The HPC skill is the specialized Slurm backend. The general long-task skill rout
 `unattended` is the default and needs no configuration. The
 **experimental** event bridge is opt-in: each monitor started with
 `--event-binding` publishes one durable semantic event into a local outbox
-after a **verified** terminal record (unverified records wake only as
+after a **verified** terminal record (an HPC terminal with a structurally
+valid envelope but unverified watcher result wakes only as
 `contract_violation`; pending-threshold alerts publish nothing), and a
 delivery daemon you run separately resumes the exact bound Codex thread,
 starts one wake turn, holds the session open until `turn/completed`, and
-only then acknowledges delivery. It uses only the stable `initialize`,
+acknowledges only when that notification belongs to the started turn and
+has `status=completed`. Failed, interrupted, missing-id, or malformed
+completion events never acknowledge delivery. It uses only the stable `initialize`,
 `thread/resume`, and `turn/start` App Server methods over stdio, pins
 `CODEX_HOME`, and requires the resumed thread's `cwd` to match the bound
 workspace. Delivery is at-least-once (no network-level exactly-once is
@@ -68,7 +71,9 @@ claimed) with leases renewed throughout delivery, exponential backoff,
 dead-lettering, and instance isolation; the woken turn performs an
 idempotent postflight guarded by an atomic begin/complete claim plus digest
 checks. If a supervisor dies between the terminal record and the event
-publication, any later `status`/`wait` observation reconciles it.
+publication, any later `status`/`wait` observation reconciles it; transient
+publication failures remain retryable instead of permanently suppressing
+that repair.
 
 A terminal file can never awaken an inactive Codex turn by itself. The
 bridge is a notification transport only — never terminal authority — and
@@ -76,7 +81,7 @@ until the release gates below are met it stays disabled by default and
 labeled experimental. Full setup, failure matrix, and disable procedure:
 [`codex-hpc-monitor/references/app-server-bridge.md`](codex-hpc-monitor/references/app-server-bridge.md).
 
-Bridge release gates (not yet met): all tests green on supported Pythons,
+Bridge release gates (partially met): all tests green on supported Pythons,
 skill validation for both skills, one opt-in live end-to-end test against a
 real Codex App Server, offline/duplicate-delivery and multi-instance
 isolation tests, no secrets in fixtures, and an independent review with no
@@ -99,8 +104,10 @@ Both supervisors expose `start`, `status`, `wait`, plus:
 
 Bridge tooling lives in `scripts/app_server_bridge.py`
 (`init-config`, `init-binding`, `status`, `deliver`) and the idempotent
-postflight marker in `scripts/postflight_guard.py`
-(`check`, `mark`, `list`). Shared runtime code
+postflight state machine in `scripts/postflight_guard.py` (`begin` → perform
+side effects → `complete`; `reset --i-mean-it` only clears an in-progress
+claim and never a completed marker; `mark` is only for a single atomic
+action). Shared runtime code
 (`semantic_events.py`, `app_server_bridge.py`, `postflight_guard.py`) is
 vendored as byte-identical copies in each skill so both remain
 independently installable; a synchronization test enforces this whenever
@@ -276,17 +283,19 @@ python3 -m unittest discover -s codex-hpc-monitor/scripts -p 'test_*.py'
 python3 -m unittest discover -s codex-long-task-monitor/scripts -p 'test_*.py'
 ```
 
-Current baseline after the first independent review round: **307 tests
-passing** (171 HPC monitor tests and 136 long-task monitor tests),
+Current baseline after the second independent review round: **330 tests
+passing** (182 HPC monitor tests and 148 long-task monitor tests),
 including the outbox, App Server fake, postflight claim, doctor,
 vendored-copy synchronization, and per-skill start-to-wake suites. The
 "end-to-end" suites use a deterministic fake App Server: they verify the
 full local chain (start with binding -> verified terminal -> outbox ->
 delivery daemon -> fixed wake template -> awaited turn/completed ->
 idempotent postflight claim) but **not** a real Codex App Server or a real
-model turn. No credentials or network access are required; live App Server
-end-to-end tests remain an explicit opt-in outside the default suite and
-have not been run yet.
+model turn. No credentials or network access are required. An opt-in live
+lifecycle smoke was also run successfully with Codex CLI 0.150.1 on
+2026-08-28 (real thread resume, wake turn, strict `turn/completed`, and
+outbox acknowledgement); it is not part of default CI and does not by
+itself prove the woken model performed a business postflight correctly.
 
 ## Contributing
 

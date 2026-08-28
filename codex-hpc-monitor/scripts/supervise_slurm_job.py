@@ -244,7 +244,7 @@ def run_status(run: Optional[Path], host: str, job_id: str) -> Dict[str, Any]:
     watcher_state = verified_local_state(run, host, job_id)
     terminal = read_json(run / "terminal.json")
     if terminal:
-        return {
+        candidate = {
             "schema_version": f"{SCHEMA_PREFIX}.status/v1",
             "state": "terminal",
             "host": host,
@@ -259,6 +259,11 @@ def run_status(run: Optional[Path], host: str, job_id: str) -> Dict[str, Any]:
             "terminal": terminal,
             "watcher_state": watcher_state,
         }
+        _code, verification = terminal_wait_result(candidate)
+        candidate["terminal_verified"] = verification["terminal_verified"]
+        if not verification["terminal_verified"]:
+            candidate["problems"] = verification.get("problems", [])
+        return candidate
 
     started = read_json(run / "supervisor_started.json")
     runtime = read_json(run / "runtime.json")
@@ -292,10 +297,17 @@ def run_status(run: Optional[Path], host: str, job_id: str) -> Dict[str, Any]:
 def open_lifetime_lock(base: Path) -> int:
     ensure_private_directory(base)
     path = base / "monitor.lock"
-    fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(str(path), flags, 0o600)
     try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("monitor lock is not a regular file")
+        os.fchmod(fd, 0o600)
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
+    except Exception:
         os.close(fd)
         raise
     return fd
@@ -406,13 +418,16 @@ def reconcile_run_event(run: Optional[Path]) -> Optional[str]:
         return None
     if not (run / "terminal.json").exists():
         return None
-    if (run / "semantic_event.json").exists() or (
-        run / "semantic_event_failure.json"
-    ).exists():
+    if (run / "semantic_event.json").exists():
+        return None
+    prior_failure = read_json(run / "semantic_event_failure.json")
+    if prior_failure and prior_failure.get("retryable") is False:
         return None
     terminal = read_json(run / "terminal.json")
     exit_code = terminal.get("watcher_exit_code")
     if not isinstance(exit_code, int):
+        return None
+    if not terminal_event_envelope_verified(run, manifest, terminal):
         return None
     publish_semantic_event(
         run,
@@ -420,7 +435,48 @@ def reconcile_run_event(run: Optional[Path]) -> Optional[str]:
         terminal=terminal,
         watcher_exit_code=exit_code,
     )
-    return read_json(run / "semantic_event.json").get("state")
+    published = read_json(run / "semantic_event.json")
+    return published.get("state") if published else None
+
+
+def terminal_event_envelope_verified(
+    run: Path, manifest: Dict[str, Any], terminal: Dict[str, Any]
+) -> bool:
+    """Verify immutable run/child evidence before any wake publication.
+
+    The watcher result may itself be unverified; that case intentionally
+    publishes ``contract_violation``. The surrounding terminal envelope must
+    still be fully bound to this run and its observed child exit.
+    """
+    try:
+        binding = semantic_events.validate_event_binding(manifest.get("event_binding"))
+        started = read_json(run / "supervisor_started.json")
+        child_exit = read_json(run / "child_exit.json")
+        manifest_sha = sha256_file(run / "manifest.json")
+    except (OSError, ValueError, semantic_events.SemanticEventError):
+        return False
+    exit_code = terminal.get("watcher_exit_code")
+    signal_number = terminal.get("watcher_signal")
+    return bool(
+        binding
+        and manifest.get("schema_version") == f"{SCHEMA_PREFIX}.manifest/v1"
+        and manifest.get("run_id") == run.name
+        and terminal.get("schema_version") == f"{SCHEMA_PREFIX}.terminal/v1"
+        and terminal.get("run_id") == run.name
+        and terminal.get("host") == manifest.get("host")
+        and terminal.get("job_id") == manifest.get("job_id")
+        and terminal.get("scope") == "slurm_only"
+        and terminal.get("project_gate_evaluated") is False
+        and terminal.get("manifest_sha256") == manifest_sha
+        and started.get("manifest_sha256") == manifest_sha
+        and terminal.get("contract_digest") == manifest.get("contract_digest")
+        and type(exit_code) is int
+        and (signal_number is None or type(signal_number) is int)
+        and child_exit.get("schema_version") == f"{SCHEMA_PREFIX}.child-exit/v1"
+        and child_exit.get("run_id") == run.name
+        and child_exit.get("exit_code") == exit_code
+        and child_exit.get("signal") == signal_number
+    )
 
 
 def publish_semantic_event(
@@ -437,6 +493,8 @@ def publish_semantic_event(
     """
     binding = manifest.get("event_binding")
     if not isinstance(binding, dict):
+        return
+    if not terminal_event_envelope_verified(run, manifest, terminal):
         return
     event_enum = HPC_SEMANTIC_EVENTS.get(
         watcher_exit_code if watcher_exit_code is not None else -1
@@ -481,7 +539,13 @@ def publish_semantic_event(
         except FileExistsError:
             # A reconciling observer recorded this publication first.
             pass
+        try:
+            (run / "semantic_event_failure.json").unlink()
+        except FileNotFoundError:
+            pass
     except (OSError, ValueError, semantic_events.SemanticEventError) as exc:
+        if (run / "semantic_event.json").exists():
+            return
         replace_json(
             run / "semantic_event_failure.json",
             {
@@ -489,6 +553,7 @@ def publish_semantic_event(
                 "run_id": run.name,
                 "state": "publish_failed",
                 "reason": getattr(exc, "reason", type(exc).__name__),
+                "retryable": isinstance(exc, OSError),
                 "observed_at": utc_now(),
             },
         )
@@ -874,7 +939,9 @@ def status_command(args: argparse.Namespace) -> int:
         pass
     status = run_status(run, args.host, args.job_id)
     print(json.dumps(status, sort_keys=True))
-    if args.require_terminal and status["state"] != "terminal":
+    if args.require_terminal and (
+        status["state"] != "terminal" or status.get("terminal_verified") is not True
+    ):
         return 3
     return 0
 
@@ -889,6 +956,8 @@ def terminal_wait_result(status: Dict[str, Any]) -> tuple[int, Dict[str, Any]]:
     else:
         if terminal.get("schema_version") != expected_schema:
             problems.append("terminal_schema_mismatch")
+        if terminal.get("run_id") is not None and terminal.get("run_id") != status.get("run_id"):
+            problems.append("terminal_run_id_mismatch")
         if terminal.get("host") != status.get("host"):
             problems.append("terminal_host_mismatch")
         if terminal.get("job_id") != status.get("job_id"):
@@ -921,9 +990,35 @@ def terminal_wait_result(status: Dict[str, Any]) -> tuple[int, Dict[str, Any]]:
     evidence_strength = "legacy"
     if isinstance(terminal, dict) and isinstance(terminal.get("contract_digest"), str):
         evidence_strength = "full"
-        manifest = read_json(Path(str(run_dir)) / "manifest.json") if isinstance(run_dir, str) else {}
+        run_path = Path(str(run_dir)) if isinstance(run_dir, str) else None
+        manifest = read_json(run_path / "manifest.json") if run_path is not None else {}
+        if (
+            terminal.get("run_id") != status.get("run_id")
+            and "terminal_run_id_mismatch" not in problems
+        ):
+            problems.append("terminal_run_id_mismatch")
         if not manifest or manifest.get("contract_digest") != terminal.get("contract_digest"):
             problems.append("terminal_contract_digest_mismatch")
+        if run_path is not None:
+            started = read_json(run_path / "supervisor_started.json")
+            child_exit = read_json(run_path / "child_exit.json")
+            try:
+                manifest_sha = sha256_file(run_path / "manifest.json")
+            except OSError:
+                manifest_sha = None
+            if (
+                manifest_sha is None
+                or terminal.get("manifest_sha256") != manifest_sha
+                or started.get("manifest_sha256") != manifest_sha
+            ):
+                problems.append("terminal_manifest_digest_mismatch")
+            if (
+                child_exit.get("schema_version") != f"{SCHEMA_PREFIX}.child-exit/v1"
+                or child_exit.get("run_id") != status.get("run_id")
+                or child_exit.get("exit_code") != watcher_exit_code
+                or child_exit.get("signal") != terminal.get("watcher_signal")
+            ):
+                problems.append("terminal_child_exit_mismatch")
 
     payload: Dict[str, Any] = {
         "schema_version": f"{SCHEMA_PREFIX}.wait/v1",

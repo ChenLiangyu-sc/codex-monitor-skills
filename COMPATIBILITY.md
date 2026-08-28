@@ -68,6 +68,23 @@ Review round 2 contract changes (all additive, validated strictly):
 - `thread/resume` must return the bound thread id **and** a `cwd` equal to
   the bound workspace; missing or wrong `cwd` dead-letters.
 
+Review round 3 behavior hardening (no schema-string changes):
+
+- `turn/completed` acknowledges only an exact target turn with
+  `status=completed`; official `failed` and `interrupted` statuses retry,
+  while malformed completion shapes fail closed.
+- delivery preserves notifications received before a request response,
+  renews before every blocking-read deadline (including sub-second leases),
+  and stops a stale owner immediately after lease loss. Config validation
+  rejects request timeouts below 50 ms and leases below 100 ms, where OS
+  scheduling cannot uphold the renewal contract reliably.
+- postflight reset now shares the begin/complete lock and can clear only an
+  `in_progress` marker, never completed evidence.
+- HPC terminal envelopes and artifact terminals are verified before crash
+  reconciliation can publish an event; HPC lock files reject symlinks.
+- transient terminal-to-outbox publication failures remain eligible for a
+  later idempotent `status`/`wait` repair.
+
 ## 3. Migration behavior
 
 - Every pre-existing on-disk schema keeps its schema string. New fields are

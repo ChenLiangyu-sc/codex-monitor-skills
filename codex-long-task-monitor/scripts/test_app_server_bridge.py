@@ -94,11 +94,23 @@ for raw in sys.stdin:
             sys.exit(0)
         else:
             log(message["params"]["input"][0]["text"])
+            if MODE == "completion_before_reply":
+                send({"method": "turn/completed", "params": {"turn": {"id": "turn_fake_1", "status": "completed"}}})
             send({"id": mid, "result": {"turn": {"id": "turn_fake_1", "status": "inProgress", "items": [], "error": None}}})
             if MODE != "no_completion":
                 time.sleep(TURN_DELAY)
                 if MODE == "turn_failed_notification":
                     send({"method": "turn/failed", "params": {"turn": {"id": "turn_fake_1", "status": "failed"}}})
+                elif MODE == "completed_failed":
+                    send({"method": "turn/completed", "params": {"turn": {"id": "turn_fake_1", "status": "failed"}}})
+                elif MODE == "completed_interrupted":
+                    send({"method": "turn/completed", "params": {"turn": {"id": "turn_fake_1", "status": "interrupted"}}})
+                elif MODE == "completion_missing_id":
+                    send({"method": "turn/completed", "params": {"turn": {"status": "completed"}}})
+                elif MODE == "completion_missing_status":
+                    send({"method": "turn/completed", "params": {"turn": {"id": "turn_fake_1"}}})
+                elif MODE == "completion_before_reply":
+                    pass
                 else:
                     send({"method": "turn/completed", "params": {"turn": {"id": "turn_fake_1", "status": "completed"}}})
 '''
@@ -249,6 +261,59 @@ class BridgeAdapterTests(unittest.TestCase):
         self.assertEqual(records[0]["state"], "scheduled_retry")
         self.assertEqual(self.delivery_of(event["event_id"])["state"], "pending")
 
+    def test_official_failed_completion_is_retryable(self) -> None:
+        config = self.write_config()
+        event = self.publish_event()
+        _, records = self.deliver(config, mode="completed_failed")
+        self.assertEqual(records[0]["error_code"], "turn_failed")
+        self.assertEqual(records[0]["state"], "scheduled_retry")
+        self.assertEqual(self.delivery_of(event["event_id"])["state"], "pending")
+
+    def test_official_interrupted_completion_is_retryable(self) -> None:
+        config = self.write_config()
+        event = self.publish_event()
+        _, records = self.deliver(config, mode="completed_interrupted")
+        self.assertEqual(records[0]["error_code"], "turn_aborted")
+        self.assertEqual(records[0]["state"], "scheduled_retry")
+        self.assertEqual(self.delivery_of(event["event_id"])["state"], "pending")
+
+    def test_completion_without_turn_id_never_acknowledges(self) -> None:
+        config = self.write_config(turn_completion_timeout_seconds=0.2)
+        event = self.publish_event()
+        _, records = self.deliver(config, mode="completion_missing_id")
+        self.assertEqual(records[0]["error_code"], "turn_completion_timeout")
+        self.assertEqual(self.delivery_of(event["event_id"])["state"], "pending")
+
+    def test_completion_without_status_dead_letters(self) -> None:
+        config = self.write_config()
+        event = self.publish_event()
+        _, records = self.deliver(config, mode="completion_missing_status")
+        self.assertEqual(records[0]["error_code"], "unsupported_response_shape")
+        self.assertEqual(self.delivery_of(event["event_id"])["state"], "dead_letter")
+
+    def test_completion_arriving_before_turn_reply_is_preserved(self) -> None:
+        config = self.write_config()
+        event = self.publish_event()
+        _, records = self.deliver(config, mode="completion_before_reply")
+        self.assertEqual(records[0]["state"], "acknowledged")
+        self.assertEqual(self.delivery_of(event["event_id"])["state"], "delivered")
+
+    def test_wait_without_renew_callback_keeps_reading_after_tick(self) -> None:
+        session = __import__("app_server_bridge").AppServerSession(
+            [sys.executable, str(self.fake)], 2,
+            env=self.deliver_env("ok", turn_delay=0.2),
+        )
+        try:
+            session.initialize()
+            session.resume_thread("thr_test_1", str(self.project))
+            turn_id = session.start_turn("thr_test_1", "fixed wake")
+            status = session.wait_turn_completion(
+                turn_id, 2, tick_seconds=0.05
+            )
+            self.assertEqual(status, "completed")
+        finally:
+            session.close()
+
     def test_second_run_has_nothing_left_to_deliver(self) -> None:
         config = self.write_config()
         self.publish_event()
@@ -280,6 +345,28 @@ class BridgeAdapterTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(records[-1]["state"], "idle")
         stdout, _ = first.communicate(timeout=30)
+        first_records = [json.loads(line) for line in stdout.splitlines() if line.strip()]
+        self.assertEqual(first_records[0]["state"], "acknowledged", first_records)
+        self.assertEqual(self.wake_log.read_text().count("==="), 1)
+
+    def test_subsecond_lease_is_renewed_before_blocking_read(self) -> None:
+        config = self.write_config(
+            request_timeout_seconds=0.1,
+            lease_seconds=0.3,
+            turn_completion_timeout_seconds=5,
+        )
+        self.publish_event()
+        first = subprocess.Popen(
+            [sys.executable, str(BRIDGE), "deliver",
+             "--state-dir", str(self.state), "--bridge-config", str(config), "--once"],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=self.deliver_env("ok", turn_delay=1.0),
+        )
+        time.sleep(0.5)
+        code, records = self.deliver(config, mode="ok")
+        self.assertEqual(code, 0)
+        self.assertEqual(records[-1]["state"], "idle")
+        stdout, _ = first.communicate(timeout=10)
         first_records = [json.loads(line) for line in stdout.splitlines() if line.strip()]
         self.assertEqual(first_records[0]["state"], "acknowledged", first_records)
         self.assertEqual(self.wake_log.read_text().count("==="), 1)

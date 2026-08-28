@@ -116,13 +116,19 @@ One delivery attempt is one App Server session:
 5. **keep the session open and read notifications until the turn reaches
    `turn/completed`** (bounded by `turn_completion_timeout_seconds`) —
    closing after `turn/start` would abort the wake turn mid-postflight;
-6. only after an interpretable turn outcome is the event acknowledged
-   delivered, recording `turn_id` and `turn_status` together.
+6. acknowledge only when that notification explicitly names the started
+   turn and carries `status=completed`, recording `turn_id` and
+   `turn_status` together. Official `failed`/`interrupted` statuses remain
+   retryable; missing ids or malformed statuses never acknowledge.
 
 The delivery lease is renewed after each stage and periodically while
 waiting for turn completion. Configuration validation additionally
 requires `lease_seconds >= 2 * request_timeout_seconds` so the request
-budget always fits the lease; these two mechanisms together make
+budget always fits the lease. To stay above practical OS scheduling
+granularity, validation also requires `request_timeout_seconds >= 0.05`
+and `lease_seconds >= 0.1`. The read deadline is capped by the next
+renewal tick even for sub-second leases, and losing ownership stops the
+stale attempt without mutating another owner's state. These mechanisms make
 concurrent delivery of one event require both a lease expiry and a
 stale-owner race, and the postflight claim keeps even that race harmless.
 No stronger exclusivity is claimed.
@@ -180,7 +186,9 @@ python3 <skill-dir>/scripts/postflight_guard.py complete <event_id> \
 ```
 
 A stuck `in_progress` claim (owner died mid-postflight) is recovered only
-by an explicit human `reset --i-mean-it`, never automatically.
+by an explicit human `reset --i-mean-it`, never automatically. Reset uses
+the same lock as completion and refuses a completed marker, so it cannot
+race with `complete` and reopen an already-recorded side effect.
 
 ## Failure matrix
 
@@ -192,7 +200,9 @@ by an explicit human `reset --i-mean-it`, never automatically.
 | Request timeout | retry (`request_timeout`) | maybe duplicated |
 | Required MCP startup failure | retry (`required_mcp_failure`) | later |
 | Active-turn conflict | retry (`active_turn_conflict`) | later |
-| Wake turn reports `turn/failed` / `turn/aborted` | retry (`turn_failed`/`turn_aborted`) | possibly duplicated; claim keeps effects single |
+| `turn/completed` reports `failed` / `interrupted` | retry (`turn_failed`/`turn_aborted`) | possibly duplicated; claim keeps effects single |
+| Completion misses the target turn id | ignored until valid completion or timeout | no acknowledgement |
+| Completion has a missing/unknown status | dead-letter (`unsupported_response_shape`) | no acknowledgement |
 | Turn not completed within budget | retry (`turn_completion_timeout`); event stays undelivered | started but unacknowledged |
 | Thread missing | dead-letter (`thread_missing`) | no; never creates a different thread |
 | Thread archived | dead-letter (`thread_archived`) | no |
@@ -237,7 +247,8 @@ entries are ignored.
   config): undelivered events simply stay pending in the outbox.
 - If the supervisor died between publishing the terminal and publishing
   its event, any later `status`/`wait` observation reconciles the
-  publication (idempotently, by event id).
+  publication (idempotently, by event id). A transient publication failure
+  is recorded for inspection but does not disable later reconciliation.
 - `cleanup` removes only settled (delivered, or dead-letter with
   `--include-dead-letter`) outbox entries; terminal evidence is never
   touched.

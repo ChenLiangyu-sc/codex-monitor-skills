@@ -15,6 +15,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 HERE = Path(__file__).resolve().parent
@@ -247,6 +248,16 @@ class SupervisorTest(unittest.TestCase):
         with self.assertRaises(FileExistsError):
             SUPERVISOR.publish_json_no_replace(path, {"value": 2})
         self.assertEqual(json.loads(path.read_text())["value"], 1)
+
+    def test_symlink_monitor_lock_is_rejected_without_touching_target(self) -> None:
+        base = SUPERVISOR.base_dir(self.state, "fakehost", "12345")
+        base.mkdir(parents=True)
+        victim = self.root / "victim.txt"
+        victim.write_text("preserve-me", encoding="utf-8")
+        (base / "monitor.lock").symlink_to(victim)
+        with self.assertRaises(OSError):
+            SUPERVISOR.open_lifetime_lock(base)
+        self.assertEqual(victim.read_text(encoding="utf-8"), "preserve-me")
 
     def test_pid_start_tick_mismatch_fails_closed(self) -> None:
         run = self.root / "run_test"
@@ -859,6 +870,48 @@ class SupervisorTest(unittest.TestCase):
         self.assertEqual(repaired["state"], "published")
         entries = semantic_events.list_outbox(self.outbox())
         self.assertEqual(len(entries), 1)
+
+    def test_transient_event_publish_failure_is_reconciled_later(self) -> None:
+        binding = self.write_binding()
+        self.run_cli("start", "--event-binding", str(binding), env={"FAKE_EXIT": "0"})
+        payload = self.wait_state("terminal")
+        run = Path(payload["run_dir"])
+        published = json.loads(self.wait_run_file(run, "semantic_event.json").read_text())
+        (run / "semantic_event.json").unlink()
+        import shutil as _shutil
+        _shutil.rmtree(semantic_events.event_dir(self.outbox(), published["event_id"]))
+        manifest = SUPERVISOR.read_json(run / "manifest.json")
+        terminal = SUPERVISOR.read_json(run / "terminal.json")
+        with mock.patch.object(semantic_events, "publish_event", side_effect=OSError("temporary")):
+            SUPERVISOR.publish_semantic_event(
+                run,
+                manifest=manifest,
+                terminal=terminal,
+                watcher_exit_code=terminal["watcher_exit_code"],
+            )
+        failure = json.loads((run / "semantic_event_failure.json").read_text())
+        self.assertTrue(failure["retryable"])
+        repaired = SUPERVISOR.reconcile_run_event(run)
+        self.assertIn(repaired, {"published", "duplicate"})
+        self.assertTrue((run / "semantic_event.json").exists())
+        self.assertFalse((run / "semantic_event_failure.json").exists())
+
+    def test_tampered_terminal_cannot_satisfy_status_or_reconcile_event(self) -> None:
+        binding = self.write_binding()
+        self.run_cli("start", "--event-binding", str(binding), env={"FAKE_EXIT": "0"})
+        payload = self.wait_state("terminal")
+        run = Path(payload["run_dir"])
+        published = json.loads(self.wait_run_file(run, "semantic_event.json").read_text())
+        (run / "semantic_event.json").unlink()
+        import shutil as _shutil
+        _shutil.rmtree(semantic_events.event_dir(self.outbox(), published["event_id"]))
+        terminal = json.loads((run / "terminal.json").read_text())
+        terminal["host"] = "wrong-host"
+        (run / "terminal.json").write_text(json.dumps(terminal) + "\n")
+        result, status = self.run_cli("status", "--require-terminal")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(status["terminal_verified"])
+        self.assertEqual(semantic_events.list_outbox(self.outbox()), [])
 
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@ guard makes that harmless.
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import json
 import os
 import selectors
@@ -32,7 +33,7 @@ import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, Optional, Tuple
 
 
 _SCRIPT_DIR = str(Path(__file__).resolve().parent)
@@ -105,6 +106,7 @@ class AppServerSession:
         self.request_timeout = request_timeout_seconds
         self._next_id = 0
         self._line_buffer = b""
+        self._notifications: Deque[Dict[str, Any]] = deque()
         self._stderr_file = tempfile.TemporaryFile()
         spawn_env = os.environ.copy()
         if env:
@@ -191,7 +193,12 @@ class AppServerSession:
             if message is None:
                 raise DeliveryError("request_timeout", f"no reply to {method}")
             if message.get("id") != request_id:
-                # Notifications or server-initiated traffic: not ours.
+                # Preserve notifications: a very short turn may complete
+                # before its turn/start response is consumed. Server-initiated
+                # requests (which carry an id) are outside this adapter's
+                # no-approval baseline and remain ignored.
+                if "id" not in message and isinstance(message.get("method"), str):
+                    self._notifications.append(message)
                 continue
             if "error" in message and message["error"] is not None:
                 error = message["error"]
@@ -267,7 +274,8 @@ class AppServerSession:
         self,
         turn_id: str,
         timeout_seconds: float,
-        on_tick: "callable | None" = None,
+        on_tick: Callable[[], None] | None = None,
+        tick_seconds: float = 1.0,
     ) -> str:
         """Read notifications until the target turn reaches a terminal state.
 
@@ -277,7 +285,10 @@ class AppServerSession:
         (retryable) instead of being acknowledged blindly.
         """
         deadline = time.monotonic() + timeout_seconds
-        tick_deadline = time.monotonic() + min(5.0, max(0.05, timeout_seconds / 10))
+        tick_interval = min(
+            5.0, max(0.01, min(tick_seconds, timeout_seconds / 10))
+        )
+        tick_deadline = time.monotonic() + tick_interval
         while True:
             now = time.monotonic()
             if now >= deadline:
@@ -285,13 +296,17 @@ class AppServerSession:
                     "turn_completion_timeout",
                     f"turn {turn_id} did not complete within {timeout_seconds}s",
                 )
-            message = self._read_line(min(deadline, now + 1.0))
+            if self._notifications:
+                message = self._notifications.popleft()
+            else:
+                # Never block beyond the next lease-renewal tick. This is
+                # essential for valid sub-second leases.
+                message = self._read_line(min(deadline, tick_deadline))
             if message is None:
-                if on_tick is not None and time.monotonic() >= tick_deadline:
-                    on_tick()
-                    tick_deadline = time.monotonic() + min(
-                        5.0, max(0.05, timeout_seconds / 10)
-                    )
+                if time.monotonic() >= tick_deadline:
+                    if on_tick is not None:
+                        on_tick()
+                    tick_deadline = time.monotonic() + tick_interval
                 continue
             if "id" in message:
                 continue  # stray response; no requests are pending
@@ -299,24 +314,37 @@ class AppServerSession:
             if not isinstance(method, str):
                 continue
             if method == "turn/completed":
-                if self._notification_turn_id(message.get("params")) in (turn_id, None):
+                if self._notification_turn_id(message.get("params")) == turn_id:
                     params = message.get("params")
                     turn = params.get("turn") if isinstance(params, dict) else {}
                     status = turn.get("status") if isinstance(turn, dict) else None
-                    return str(status or "completed")
+                    if status == "completed":
+                        return status
+                    if status == "failed":
+                        raise DeliveryError(
+                            "turn_failed", "wake turn completed with failed status"
+                        )
+                    if status == "interrupted":
+                        raise DeliveryError(
+                            "turn_aborted",
+                            "wake turn completed with interrupted status",
+                        )
+                    raise DeliveryError(
+                        "unsupported_response_shape",
+                        "turn/completed carried no supported terminal status",
+                    )
                 continue
             if method in {"turn/failed", "turn/aborted"}:
-                if self._notification_turn_id(message.get("params")) in (turn_id, None):
+                if self._notification_turn_id(message.get("params")) == turn_id:
                     raise DeliveryError(
                         "turn_failed" if method == "turn/failed" else "turn_aborted",
                         f"wake turn ended via {method}",
                     )
                 continue
-            if on_tick is not None and time.monotonic() >= tick_deadline:
-                on_tick()
-                tick_deadline = time.monotonic() + min(
-                    5.0, max(0.05, timeout_seconds / 10)
-                )
+            if time.monotonic() >= tick_deadline:
+                if on_tick is not None:
+                    on_tick()
+                tick_deadline = time.monotonic() + tick_interval
 
     def close(self) -> None:
         try:
@@ -335,6 +363,11 @@ class AppServerSession:
                     self.process.kill()
                     self.process.wait(timeout=5)
         finally:
+            if self.process.stdout is not None:
+                try:
+                    self.process.stdout.close()
+                except OSError:
+                    pass
             self._stderr_file.close()
 
 
@@ -384,15 +417,17 @@ def attempt_delivery(
 
     def renew() -> None:
         try:
-            se.renew_event(
+            outcome = se.renew_event(
                 se.outbox_root(Path(_DELIVERY_STATE_DIR[0])),
                 event["event_id"],
                 owner=_DELIVERY_OWNER[0],
                 lease_seconds=float(config["lease_seconds"]),
                 now=datetime.now(timezone.utc),
             )
-        except se.SemanticEventError:
-            pass  # fail closed later at ack time if the lease was lost
+            if outcome != "renewed":
+                raise DeliveryError("lease_lost", f"lease renewal returned {outcome}")
+        except se.SemanticEventError as exc:
+            raise DeliveryError("lease_lost", exc.reason) from exc
 
     try:
         session.initialize()
@@ -405,7 +440,9 @@ def attempt_delivery(
             turn_id,
             float(config["turn_completion_timeout_seconds"]),
             on_tick=renew,
+            tick_seconds=max(0.01, float(config["lease_seconds"]) / 3.0),
         )
+        renew()
         return turn_id, turn_status, wake_text
     finally:
         session.close()
@@ -510,18 +547,23 @@ def deliver_loop(args: argparse.Namespace) -> int:
             delivered += 1
             record.update({"state": ack, "turn_id": turn_id, "turn_status": turn_status})
         except DeliveryError as exc:
-            outcome = se.record_delivery_failure(
-                outbox,
-                event["event_id"],
-                owner=owner,
-                code=exc.code,
-                safe_message=exc.message,
-                retryable=exc.retryable,
-                now=utc_now(),
-                max_attempts=int(config["max_attempts"]),
-                backoff_initial_seconds=float(config["backoff_initial_seconds"]),
-                backoff_max_seconds=float(config["backoff_max_seconds"]),
-            )
+            if exc.code == "lease_lost":
+                # Another owner already controls the event. The stale owner
+                # must stop without mutating delivery state.
+                outcome = "lease_lost"
+            else:
+                outcome = se.record_delivery_failure(
+                    outbox,
+                    event["event_id"],
+                    owner=owner,
+                    code=exc.code,
+                    safe_message=exc.message,
+                    retryable=exc.retryable,
+                    now=utc_now(),
+                    max_attempts=int(config["max_attempts"]),
+                    backoff_initial_seconds=float(config["backoff_initial_seconds"]),
+                    backoff_max_seconds=float(config["backoff_max_seconds"]),
+                )
             record.update({"state": outcome, "error_code": exc.code})
         except (OSError, se.SemanticEventError) as exc:
             outcome = se.record_delivery_failure(

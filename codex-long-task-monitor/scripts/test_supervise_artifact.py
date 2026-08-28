@@ -443,6 +443,19 @@ class ArtifactSupervisorTests(unittest.TestCase):
         result, refused = self.start("--restart")
         self.assertEqual(result.returncode, 12)
         self.assertIn("observation window expired", refused["detail"])
+
+    def test_watcher_argv_rejects_deadline_that_expired_before_launch(self) -> None:
+        args = SUPERVISOR.parser().parse_args(self.start_command()[2:])
+        contract = SUPERVISOR.contract_from_args(args)
+        with self.assertRaisesRegex(ValueError, "expired before watcher launch"):
+            SUPERVISOR.watcher_argv(self.root / "run", contract, time.time() - 0.01)
+
+    def test_deadline_expiry_before_launch_leaves_no_orphan_run(self) -> None:
+        result, payload = self.start("--timeout-seconds", "0.000000001")
+        self.assertEqual(result.returncode, 12)
+        self.assertIn("observation window expired", payload["detail"])
+        runs = list((self.state / "artifacts").glob("*/runs/run_*"))
+        self.assertEqual(runs, [])
     def write_binding(self) -> Path:
         binding = {
             "schema": "codex-monitor.event-binding/v1",
@@ -490,6 +503,50 @@ class ArtifactSupervisorTests(unittest.TestCase):
         self.assertEqual(event["monitor"]["handle"], handle)
         terminal_sha = hashlib.sha256((run / "terminal.json").read_bytes()).hexdigest()
         self.assertEqual(event["monitor"]["terminal_digest"], f"sha256:{terminal_sha}")
+
+    def test_transient_event_publish_failure_is_reconciled_later(self) -> None:
+        binding = self.write_binding()
+        self.write_artifact()
+        _, started = self.start("--event-binding", str(binding))
+        handle = started["task_handle"]
+        terminal_status = self.wait_terminal(handle)
+        run = Path(terminal_status["run_dir"])
+        published = json.loads(self.wait_run_file(run, "semantic_event.json").read_text())
+        (run / "semantic_event.json").unlink()
+        import shutil as _shutil
+        _shutil.rmtree(semantic_events.event_dir(self.outbox(), published["event_id"]))
+        manifest = SUPERVISOR.read_json(run / "manifest.json")
+        terminal = SUPERVISOR.read_json(run / "terminal.json")
+        with mock.patch.object(semantic_events, "publish_event", side_effect=OSError("temporary")):
+            SUPERVISOR.publish_semantic_event(
+                run,
+                manifest=manifest,
+                watcher_exit_code=terminal["watcher_exit_code"],
+            )
+        failure = json.loads((run / "semantic_event_failure.json").read_text())
+        self.assertTrue(failure["retryable"])
+        repaired = SUPERVISOR.reconcile_run_event(run)
+        self.assertIn(repaired, {"published", "duplicate"})
+        self.assertTrue((run / "semantic_event.json").exists())
+        self.assertFalse((run / "semantic_event_failure.json").exists())
+
+    def test_tampered_terminal_is_not_reconciled_into_outbox(self) -> None:
+        binding = self.write_binding()
+        self.write_artifact()
+        _, started = self.start("--event-binding", str(binding))
+        handle = started["task_handle"]
+        terminal_status = self.wait_terminal(handle)
+        run = Path(terminal_status["run_dir"])
+        published = json.loads(self.wait_run_file(run, "semantic_event.json").read_text())
+        (run / "semantic_event.json").unlink()
+        import shutil as _shutil
+        _shutil.rmtree(semantic_events.event_dir(self.outbox(), published["event_id"]))
+        terminal = json.loads((run / "terminal.json").read_text())
+        terminal["task_handle"] = "artifact_" + "0" * 32
+        (run / "terminal.json").write_text(json.dumps(terminal) + "\n")
+        _, status = self.status(handle)
+        self.assertEqual(status["state"], "verification_failed")
+        self.assertEqual(semantic_events.list_outbox(self.outbox()), [])
 
     def test_failure_artifact_maps_to_transport_failure(self) -> None:
         binding = self.write_binding()

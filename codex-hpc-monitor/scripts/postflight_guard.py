@@ -4,15 +4,14 @@
 This module is vendored as a byte-identical copy into each monitor skill.
 A woken Codex turn must, before performing any postflight side effects:
 
-1. run ``check`` for the wake ``event_id`` — if already processed, report
-   that and stop; never repeat external mutations or acceptance decisions;
-2. verify the immutable terminal record whose digest the event carries;
-3. perform the postflight exactly once;
-4. run ``mark`` with the verified ``terminal_digest``.
+1. verify the immutable terminal record whose digest the event carries;
+2. atomically run ``begin`` for the wake ``event_id`` and retain its owner;
+3. only the successful claimant performs the postflight side effects;
+4. run ``complete`` with the same owner.
 
-``mark`` is idempotent for identical evidence and fails closed (exit 4)
-when the same event id was already marked against different terminal
-evidence — a digest mismatch blocks postflight.
+``mark`` remains only for a postflight that is itself one atomic action. It
+must not wrap a multi-step or external side effect because it cannot reserve
+that work before execution. Digest mismatches always fail closed.
 """
 
 from __future__ import annotations
