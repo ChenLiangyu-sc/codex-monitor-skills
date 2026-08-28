@@ -47,10 +47,26 @@ Baseline before changes: 100 tests passing (55 `codex-hpc-monitor`,
 | `codex-monitor.delivery/v1` | WP3 | Mutable outbox delivery metadata (state, lease, attempts, backoff) |
 | `codex-monitor.bridge-config/v1` | WP1/WP4 | Explicit, opt-in bridge configuration file |
 | `codex-monitor.event-binding/v1` | WP3 | Per-monitor binding (Codex home, instance, thread, workspace) |
-| `codex-monitor.postflight/v1` | WP5 | Idempotency marker for processed wake events |
+| `codex-monitor.postflight/v1` | WP5 | Idempotency marker for processed wake events (extended in review round 2 with an atomic begin/complete claim: `state`, `owner`, `started_at`, `completed_at`; legacy markers without `state` read as completed) |
 | `codex-monitor.doctor/v1` | WP1 | Capability/mode probe output |
 | `codex-monitor.list/v1` | WP6 | Monitor enumeration output |
 | `codex-monitor.attempt/v1` | WP2 | Bridge wait attempt record (timeout is an attempt, not a terminal receipt) |
+| `<skill>.event-intent/v1` | WP2 review | Run-dir record written at start when a wake binding exists; status/wait reconcile the crash window between terminal and event publication |
+| `<skill>.semantic-event/v1` | WP3 | Run-dir record of the event publication outcome |
+
+Review round 2 contract changes (all additive, validated strictly):
+
+- `codex-monitor.bridge-config/v1` gained required `codex_home` (absolute
+  path whose digest must equal `codex_home_id`) and
+  `turn_completion_timeout_seconds`; `lease_seconds` must be at least twice
+  `request_timeout_seconds`. Configs from round 1 without these fields are
+  rejected fail-closed — regenerate with `init-config`.
+- `codex-monitor.delivery/v1` gained `turn_status`, recorded together with
+  the turn id at acknowledgement; acknowledgement now requires it.
+- Delivery acknowledges only after `turn/completed`; sessions stay open
+  for the whole wake turn and renew the lease throughout.
+- `thread/resume` must return the bound thread id **and** a `cwd` equal to
+  the bound workspace; missing or wrong `cwd` dead-letters.
 
 ## 3. Migration behavior
 
@@ -85,18 +101,18 @@ Compatibility rules for this change set:
 - `inspect_watcher_owner.py` keeps matching watchers by script file name, so
   the watcher entry point file name must stay `watch_slurm_job.py`.
 
-## 5. Hard-coded companion paths (unchanged, documented)
+## 5. Companion-skill references (review round 2 cleanup)
 
-- `codex-hpc-monitor/SKILL.md`: `/share/cv/data/liangyu.chen/skills/hpc-train/SKILL.md`.
-- `codex-long-task-monitor/SKILL.md`:
-  `/home/liangyu.chen02/.codex/skills/codex-hpc-monitor/SKILL.md` and
-  `codex-task-dispatch` references.
-- `monitor_dispatch.py`: default dispatch supervisor
-  `~/.codex/skills/codex-task-dispatch/scripts/dispatch_supervisor.py`.
-- Default SSH host alias `hpc142` in help text and examples.
+- `codex-hpc-monitor/SKILL.md` previously pointed at an author-absolute
+  `hpc-train` path; both skills now reference companion skills by name and
+  instruct resolving them from the local skill installation. No
+  author-absolute paths remain in the public skills.
+- `monitor_dispatch.py` keeps a home-relative default dispatch supervisor
+  (`~/.codex/skills/codex-task-dispatch/scripts/dispatch_supervisor.py`),
+  overridable with `--dispatch-supervisor-path`.
+- Default SSH host alias `hpc142` remains in help text and examples only.
 
-None of these are runtime dependencies of the deterministic core; they are
-author-environment integration points kept for workflow compatibility.
+None of these are runtime dependencies of the deterministic core.
 
 ## 6. Vendor policy for shared code
 

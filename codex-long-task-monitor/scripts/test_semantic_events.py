@@ -52,7 +52,8 @@ def make_config() -> dict:
         "schema": se.BRIDGE_CONFIG_SCHEMA,
         "enabled": True,
         "instance_id": "workstation-1",
-        "codex_home_id": "sha256:" + "a" * 64,
+        "codex_home": "/home/user/.codex",
+        "codex_home_id": se.codex_home_digest(Path("/home/user/.codex")),
         "workspace": "/home/user/project",
         "transport": {"type": "stdio", "command": ["codex", "app-server"]},
         "request_timeout_seconds": 30,
@@ -61,6 +62,7 @@ def make_config() -> dict:
         "max_attempts": 3,
         "backoff_initial_seconds": 5,
         "backoff_max_seconds": 3600,
+        "turn_completion_timeout_seconds": 3600,
     }
 
 
@@ -158,6 +160,10 @@ class BridgeConfigTests(unittest.TestCase):
             {**make_config(), "max_attempts": 0},
             {**make_config(), "backoff_max_seconds": 1},
             {**make_config(), "extra_key": True},
+            {**make_config(), "codex_home": "relative/path"},
+            {**make_config(), "codex_home_id": "sha256:" + "b" * 64},
+            {**make_config(), "lease_seconds": 31},
+            {**make_config(), "turn_completion_timeout_seconds": 0},
         ):
             with self.assertRaises(se.SemanticEventError):
                 se.validate_bridge_config(mutation)
@@ -275,8 +281,14 @@ class OutboxTests(unittest.TestCase):
             now=NOW,
             thread_id="thr_abc123",
             turn_id="turn_1",
+            turn_status="completed",
         )
         self.assertEqual(result, "acknowledged")
+        delivery = se._read_delivery(
+            se.event_dir(self.outbox, self.event["event_id"]),
+            self.event["event_id"],
+        )
+        self.assertEqual(delivery["turn_status"], "completed")
         again = se.acknowledge_event(
             self.outbox,
             self.event["event_id"],
@@ -284,6 +296,7 @@ class OutboxTests(unittest.TestCase):
             now=NOW,
             thread_id="thr_abc123",
             turn_id="turn_1",
+            turn_status="completed",
         )
         self.assertEqual(again, "already_delivered")
 
@@ -298,6 +311,7 @@ class OutboxTests(unittest.TestCase):
                 now=NOW,
                 thread_id="t",
                 turn_id="u",
+                turn_status="completed",
             )
 
     def test_stale_lease_is_recovered_after_expiry(self) -> None:
@@ -321,6 +335,7 @@ class OutboxTests(unittest.TestCase):
                 now=later,
                 thread_id="t",
                 turn_id="u",
+                turn_status="completed",
             )
 
     def test_backoff_scheduling_and_dead_letter(self) -> None:
@@ -473,6 +488,7 @@ class OutboxTests(unittest.TestCase):
             now=NOW,
             thread_id="t",
             turn_id="u",
+            turn_status="completed",
         )
         # dead: claim + non-retryable failure
         se.publish_event(self.outbox, dead)
@@ -518,7 +534,7 @@ class OutboxTests(unittest.TestCase):
         se.claim_next_event(self.outbox, owner="d", lease_seconds=60, now=NOW)
         se.acknowledge_event(
             self.outbox, self.event["event_id"], owner="d", now=NOW,
-            thread_id="t", turn_id="u",
+            thread_id="t", turn_id="u", turn_status="completed",
         )
         soon = NOW + timedelta(days=1)
         removed = se.cleanup_outbox(
@@ -602,6 +618,215 @@ class VendorSyncTests(unittest.TestCase):
             (HERE / "semantic_events.py").read_bytes(),
             sibling.read_bytes(),
             "vendored semantic_events.py copies have diverged",
+        )
+
+
+class SecurityHardeningTests(unittest.TestCase):
+    """Regression tests for the independent-review blockers."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.state = self.root / "state"
+        self.outbox = se.outbox_root(self.state)
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def make_event(self, **overrides) -> dict:
+        values = {
+            "backend": "slurm",
+            "handle": "fakehost-12345",
+            "generation": "run_1_2_abcd1234",
+            "terminal_digest": "sha256:" + "b" * 64,
+            "event": "transport_success",
+            "exit_code": 0,
+            "binding": make_binding(),
+            "created_at": stamp(NOW),
+        }
+        values.update(overrides)
+        return se.build_event(**values)
+
+    def test_event_id_path_traversal_is_rejected(self) -> None:
+        for malicious in ("sha256:../../victim", "sha256:..", "sha256:", "sha256:xyz"):
+            with self.assertRaises(se.SemanticEventError):
+                se.event_dir(self.outbox, malicious)
+
+    def test_symlinked_outbox_entries_are_ignored(self) -> None:
+        event = self.make_event()
+        se.publish_event(self.outbox, event)
+        target = self.root / "real-dir"
+        target.mkdir()
+        (target / "event.json").write_text("{}")
+        link = self.outbox / ("f" * 64)
+        link.symlink_to(target)
+        entries = se.list_outbox(self.outbox)
+        self.assertEqual([e["event_id"] for e in entries], [event["event_id"]])
+        claimed = se.claim_next_event(
+            self.outbox, owner="d", lease_seconds=60, now=NOW
+        )
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed[0]["event_id"], event["event_id"])
+
+    def test_non_hex_directory_names_are_ignored(self) -> None:
+        event = self.make_event()
+        se.publish_event(self.outbox, event)
+        weird = self.outbox / "not-a-digest"
+        weird.mkdir()
+        (weird / "event.json").write_text("{}")
+        self.assertEqual(len(se.list_outbox(self.outbox)), 1)
+
+    def test_renew_event_extends_lease_for_owner_only(self) -> None:
+        event = self.make_event()
+        se.publish_event(self.outbox, event)
+        se.claim_next_event(self.outbox, owner="daemon-a", lease_seconds=10, now=NOW)
+        self.assertEqual(
+            se.renew_event(
+                self.outbox, event["event_id"], owner="daemon-a",
+                lease_seconds=100, now=NOW,
+            ),
+            "renewed",
+        )
+        delivery = se._read_delivery(
+            se.event_dir(self.outbox, event["event_id"]), event["event_id"]
+        )
+        self.assertEqual(
+            delivery["lease"]["expires_at"],
+            (NOW + timedelta(seconds=100)).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+        )
+        with self.assertRaises(se.SemanticEventError):
+            se.renew_event(
+                self.outbox, event["event_id"], owner="daemon-b",
+                lease_seconds=100, now=NOW,
+            )
+
+    def test_ack_requires_turn_status(self) -> None:
+        event = self.make_event()
+        se.publish_event(self.outbox, event)
+        se.claim_next_event(self.outbox, owner="d", lease_seconds=60, now=NOW)
+        with self.assertRaises(se.SemanticEventError):
+            se.acknowledge_event(
+                self.outbox, event["event_id"], owner="d", now=NOW,
+                thread_id="t", turn_id="u", turn_status="",
+            )
+
+
+class PostflightStateMachineTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.state = Path(self.temp.name) / "state"
+        self.digest = "sha256:" + "9" * 64
+        self.other_digest = "sha256:" + "8" * 64
+        self.event_id = make_event()["event_id"]
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def test_begin_perform_complete_lifecycle(self) -> None:
+        outcome = se.postflight_begin(
+            self.state, self.event_id, terminal_digest=self.digest, owner="turn-1"
+        )
+        self.assertEqual(outcome, "begun")
+        mid = se.postflight_check(self.state, self.event_id)
+        self.assertFalse(mid["processed"])
+        self.assertEqual(mid["state"], "in_progress")
+        self.assertEqual(
+            se.postflight_complete(self.state, self.event_id, owner="turn-1"),
+            "completed",
+        )
+        done = se.postflight_check(self.state, self.event_id)
+        self.assertTrue(done["processed"])
+        self.assertEqual(
+            se.postflight_complete(self.state, self.event_id, owner="turn-1"),
+            "already_completed",
+        )
+        self.assertEqual(
+            se.postflight_begin(
+                self.state, self.event_id, terminal_digest=self.digest, owner="turn-2"
+            ),
+            "already_completed",
+        )
+
+    def test_concurrent_begins_allow_exactly_one_claim(self) -> None:
+        outcomes: list[str] = []
+        barrier = threading.Barrier(4)
+
+        def worker(index: int) -> None:
+            barrier.wait()
+            outcomes.append(
+                se.postflight_begin(
+                    self.state,
+                    self.event_id,
+                    terminal_digest=self.digest,
+                    owner=f"turn-{index}",
+                )
+            )
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(outcomes.count("begun"), 1)
+        self.assertEqual(outcomes.count("already_in_progress"), 3)
+
+    def test_unknown_result_is_never_auto_taken_over(self) -> None:
+        se.postflight_begin(
+            self.state, self.event_id, terminal_digest=self.digest, owner="turn-1"
+        )
+        self.assertEqual(
+            se.postflight_complete(self.state, self.event_id, owner="turn-2"),
+            "not_owner",
+        )
+        self.assertEqual(
+            se.postflight_begin(
+                self.state, self.event_id, terminal_digest=self.digest, owner="turn-2"
+            ),
+            "already_in_progress",
+        )
+        self.assertEqual(
+            se.postflight_reset(self.state, self.event_id, confirm=False),
+            "confirmation_required",
+        )
+        self.assertEqual(
+            se.postflight_check(self.state, self.event_id)["state"], "in_progress"
+        )
+        self.assertEqual(
+            se.postflight_reset(self.state, self.event_id, confirm=True), "reset"
+        )
+        self.assertFalse(se.postflight_check(self.state, self.event_id)["processed"])
+
+    def test_begin_digest_conflict_fails_closed(self) -> None:
+        se.postflight_begin(
+            self.state, self.event_id, terminal_digest=self.digest, owner="turn-1"
+        )
+        self.assertEqual(
+            se.postflight_begin(
+                self.state, self.event_id, terminal_digest=self.other_digest,
+                owner="turn-2",
+            ),
+            "digest_conflict",
+        )
+
+    def test_legacy_marker_without_state_is_completed(self) -> None:
+        path = se.postflight_path(self.state, self.event_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "schema": se.POSTFLIGHT_SCHEMA,
+            "event_id": self.event_id,
+            "terminal_digest": self.digest,
+            "marked_at": stamp(NOW),
+        }))
+        result = se.postflight_check(self.state, self.event_id)
+        self.assertTrue(result["processed"])
+
+    def test_mark_rejects_in_progress_claim(self) -> None:
+        se.postflight_begin(
+            self.state, self.event_id, terminal_digest=self.digest, owner="turn-1"
+        )
+        self.assertEqual(
+            se.postflight_mark(self.state, self.event_id, terminal_digest=self.digest),
+            "already_in_progress",
         )
 
 

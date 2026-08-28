@@ -19,7 +19,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import socket
 import sys
+import time
 from pathlib import Path
 
 
@@ -79,6 +82,80 @@ def mark_command(args: argparse.Namespace) -> int:
     return {"marked": 0, "already_marked": 3}.get(outcome, 4)
 
 
+def begin_command(args: argparse.Namespace) -> int:
+    owner = args.owner or f"{socket.gethostname()}:{os.getpid()}:{time.time_ns():x}"
+    try:
+        outcome = se.postflight_begin(
+            Path(args.state_dir),
+            args.event_id,
+            terminal_digest=args.terminal_digest,
+            owner=owner,
+        )
+    except se.SemanticEventError as exc:
+        print(json.dumps({
+            "schema_version": f"{POSTFLIGHT_PREFIX}.begin/v1",
+            "state": "error",
+            "reason": exc.reason,
+        }, sort_keys=True))
+        return 12
+    print(json.dumps({
+        "schema_version": f"{POSTFLIGHT_PREFIX}.begin/v1",
+        "event_id": args.event_id,
+        "terminal_digest": args.terminal_digest,
+        "owner": owner,
+        "state": outcome,
+        # An unknown in_progress result must fail closed: report it and
+        # never take over; a human decides via reset.
+    }, sort_keys=True))
+    return {
+        "begun": 0,
+        "already_completed": 3,
+        "already_in_progress": 5,
+        "digest_conflict": 4,
+    }.get(outcome, 12)
+
+
+def complete_command(args: argparse.Namespace) -> int:
+    try:
+        outcome = se.postflight_complete(
+            Path(args.state_dir), args.event_id, owner=args.owner
+        )
+    except se.SemanticEventError as exc:
+        print(json.dumps({
+            "schema_version": f"{POSTFLIGHT_PREFIX}.complete/v1",
+            "state": "error",
+            "reason": exc.reason,
+        }, sort_keys=True))
+        return 12
+    print(json.dumps({
+        "schema_version": f"{POSTFLIGHT_PREFIX}.complete/v1",
+        "event_id": args.event_id,
+        "owner": args.owner,
+        "state": outcome,
+    }, sort_keys=True))
+    return {"completed": 0, "already_completed": 3}.get(outcome, 4)
+
+
+def reset_command(args: argparse.Namespace) -> int:
+    try:
+        outcome = se.postflight_reset(
+            Path(args.state_dir), args.event_id, confirm=args.i_mean_it
+        )
+    except se.SemanticEventError as exc:
+        print(json.dumps({
+            "schema_version": f"{POSTFLIGHT_PREFIX}.reset/v1",
+            "state": "error",
+            "reason": exc.reason,
+        }, sort_keys=True))
+        return 12
+    print(json.dumps({
+        "schema_version": f"{POSTFLIGHT_PREFIX}.reset/v1",
+        "event_id": args.event_id,
+        "state": outcome,
+    }, sort_keys=True))
+    return {"reset": 0}.get(outcome, 4)
+
+
 def list_command(args: argparse.Namespace) -> int:
     directory = Path(args.state_dir) / "postflight"
     records = []
@@ -108,6 +185,33 @@ def parser() -> argparse.ArgumentParser:
     mark.add_argument("--terminal-digest", required=True)
     mark.add_argument("--state-dir", type=Path, required=True)
     mark.set_defaults(func=mark_command)
+    begin = sub.add_parser(
+        "begin", help="atomically claim the postflight before side effects"
+    )
+    begin.add_argument("event_id")
+    begin.add_argument("--terminal-digest", required=True)
+    begin.add_argument("--owner", help="claim owner; defaults to this turn identity")
+    begin.add_argument("--state-dir", type=Path, required=True)
+    begin.set_defaults(func=begin_command)
+
+    complete = sub.add_parser("complete", help="record the claimed postflight done")
+    complete.add_argument("event_id")
+    complete.add_argument("--owner", required=True)
+    complete.add_argument("--state-dir", type=Path, required=True)
+    complete.set_defaults(func=complete_command)
+
+    reset = sub.add_parser(
+        "reset", help="human-only recovery for a stuck in_progress claim"
+    )
+    reset.add_argument("event_id")
+    reset.add_argument("--state-dir", type=Path, required=True)
+    reset.add_argument(
+        "--i-mean-it",
+        action="store_true",
+        help="required confirmation; an unknown postflight result fails closed",
+    )
+    reset.set_defaults(func=reset_command)
+
     listing = sub.add_parser("list", help="list recorded postflight markers")
     listing.add_argument("--state-dir", type=Path, required=True)
     listing.set_defaults(func=list_command)

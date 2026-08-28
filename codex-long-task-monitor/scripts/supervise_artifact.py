@@ -317,6 +317,31 @@ def resolved_event_binding(args: argparse.Namespace) -> dict[str, Any] | None:
     return binding
 
 
+def reconcile_run_event(run: Path | None) -> str | None:
+    """Close the crash window between terminal.json and event publication.
+
+    Any later status/wait observation republishes the event idempotently
+    when the run died between the two publications.
+    """
+    if run is None:
+        return None
+    manifest = read_json(run / "manifest.json")
+    if not isinstance(manifest.get("event_binding"), dict):
+        return None
+    if not (run / "terminal.json").exists():
+        return None
+    if (run / "semantic_event.json").exists() or (
+        run / "semantic_event_failure.json"
+    ).exists():
+        return None
+    terminal = read_json(run / "terminal.json")
+    exit_code = terminal.get("watcher_exit_code")
+    if not isinstance(exit_code, int):
+        return None
+    publish_semantic_event(run, manifest=manifest, watcher_exit_code=exit_code)
+    return read_json(run / "semantic_event.json").get("state")
+
+
 def publish_semantic_event(
     run: Path,
     *,
@@ -350,17 +375,21 @@ def publish_semantic_event(
         outcome = semantic_events.publish_event(
             semantic_events.outbox_root(Path(manifest["state_dir"])), event
         )
-        publish_json_no_replace(
-            run / "semantic_event.json",
-            {
-                "schema_version": f"{SCHEMA_PREFIX}.semantic-event/v1",
-                "run_id": run.name,
-                "event_id": event["event_id"],
-                "event": event_enum,
-                "state": outcome,
-                "published_at": utc_now(),
-            },
-        )
+        try:
+            publish_json_no_replace(
+                run / "semantic_event.json",
+                {
+                    "schema_version": f"{SCHEMA_PREFIX}.semantic-event/v1",
+                    "run_id": run.name,
+                    "event_id": event["event_id"],
+                    "event": event_enum,
+                    "state": outcome,
+                    "published_at": utc_now(),
+                },
+            )
+        except FileExistsError:
+            # A reconciling observer recorded this publication first.
+            pass
     except (OSError, ValueError, semantic_events.SemanticEventError) as exc:
         replace_json(
             run / "semantic_event_failure.json",
@@ -626,6 +655,20 @@ def start_monitor(args: argparse.Namespace) -> int:
             manifest["event_binding"] = event_binding
             manifest["event_backend"] = args.event_backend
         publish_json_no_replace(run / "manifest.json", manifest)
+        if event_binding is not None:
+            # Durable proof this run intended a wake event; used by the
+            # reconciler if the run dies before publishing the event.
+            publish_json_no_replace(
+                run / "event_intent.json",
+                {
+                    "schema_version": f"{SCHEMA_PREFIX}.event-intent/v1",
+                    "run_id": run_id,
+                    "task_handle": handle,
+                    "event_backend": args.event_backend,
+                    "binding_instance": event_binding.get("app_server_instance"),
+                    "declared_at": utc_now(),
+                },
+            )
         manifest_sha = sha256_file(run / "manifest.json")
         replace_json(
             base / "current.json",
@@ -886,7 +929,12 @@ def status_exit_code(payload: dict[str, Any], require_terminal: bool) -> int:
 def status_command(args: argparse.Namespace) -> int:
     if not HANDLE_RE.fullmatch(args.task_handle):
         raise ValueError("invalid artifact task handle")
-    payload = run_status(current_run(base_dir(args.state_dir, args.task_handle)), args.task_handle)
+    run = current_run(base_dir(args.state_dir, args.task_handle))
+    try:
+        reconcile_run_event(run)
+    except (OSError, ValueError):
+        pass
+    payload = run_status(run, args.task_handle)
     print(json.dumps(payload, sort_keys=True))
     return status_exit_code(payload, args.require_terminal)
 
@@ -901,9 +949,12 @@ def wait_command(args: argparse.Namespace) -> int:
         raise ValueError("invalid artifact task handle")
     deadline = time.monotonic() + args.timeout_seconds
     while True:
-        payload = run_status(
-            current_run(base_dir(args.state_dir, args.task_handle)), args.task_handle
-        )
+        run = current_run(base_dir(args.state_dir, args.task_handle))
+        try:
+            reconcile_run_event(run)
+        except (OSError, ValueError):
+            pass
+        payload = run_status(run, args.task_handle)
         if payload.get("state") != "active":
             print(json.dumps(payload, sort_keys=True))
             return status_exit_code(payload, True)
@@ -941,7 +992,9 @@ def probe_app_server(config: dict[str, Any]) -> dict[str, Any]:
 
     try:
         session = app_server_bridge.AppServerSession(
-            list(config["transport"]["command"]), float(config["request_timeout_seconds"])
+            list(config["transport"]["command"]),
+            float(config["request_timeout_seconds"]),
+            env=app_server_bridge.spawn_env(config),
         )
     except (OSError, ValueError) as exc:
         return {"healthy": False, "reason": f"spawn_failed: {type(exc).__name__}"}

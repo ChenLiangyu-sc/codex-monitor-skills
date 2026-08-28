@@ -51,10 +51,13 @@ Start exit codes:
 Start with `--event-binding <file>` to have each verified terminal record
 publish one durable semantic event into the local outbox. The binding names
 the exact Codex home, App Server instance, thread, and workspace that a
-separate delivery daemon may resume; nothing is published without it. See
-[app-server-bridge.md](app-server-bridge.md) for configuration, delivery,
-failure behavior, and the mandatory idempotent postflight protocol
-(`postflight_guard.py check`/`mark`). The `monitor_dispatch.py` wrapper
+separate delivery daemon may resume; nothing is published without it, and a
+supervisor crash between the terminal and the event is reconciled by any
+later `status`/`wait` observation. See
+[app-server-bridge.md](app-server-bridge.md) for configuration, delivery
+(including the awaited `turn/completed`), failure behavior, and the
+mandatory idempotent postflight claim protocol
+(`postflight_guard.py begin`/`complete`). The `monitor_dispatch.py` wrapper
 forwards `--event-binding`/`--bridge-config` and labels its events
 `backend=dispatch`.
 

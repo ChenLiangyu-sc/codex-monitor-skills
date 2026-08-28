@@ -13,37 +13,41 @@ configured, and it never becomes terminal authority.
 ## Mode contract
 
 | Mode | Model turns while unchanged | Automatic Codex resume | Long-lived agent slot |
-| --- | ---: | ---: | ---: |
+| --- | --- | ---: | ---: |
 | `unattended` (default) | 0 | No | No |
 | `external-event-bridge` | 0 | Yes, when the App Server is available | No |
 | `attached` (short commands only) | 0 during one blocking call | Same turn only | No subagent slot |
-| `goal-worker` | Runtime-dependent | Conditional | One worker slot |
+| `goal-worker` | Runtime-dependent | Conditional compatibility mode only | One worker slot |
 
 Failures of the bridge (App Server offline, overload `-32001`, connection
-loss, timeout) never authorize retry, cancellation, resubmission, mutation,
-or business approval of the monitored work. They only change local delivery
-state.
+loss, timeout, wake-turn failure) never authorize retry, cancellation,
+resubmission, mutation, or business approval of the monitored work. They
+only change local delivery state.
 
 ## Architecture
 
 ```text
 verified immutable terminal record (unchanged authority)
       |
-semantic-event publisher   (supervisor, local only)
+semantic-event publisher   (supervisor, local only; event_intent.json
+                            written at start; status/wait reconcile any
+                            crash window between terminal and event)
       |
 durable outbox             (atomic, local filesystem, at-least-once)
       |
 optional delivery daemon   (app_server_bridge.py deliver, foreground)
       |
-thread/resume -> turn/start  (one wake turn in the bound thread)
+thread/resume -> turn/start -> wait turn/completed
+      |                        (session held open; lease renewed throughout)
       |
-idempotent postflight     (postflight_guard.py, business_verdict=pending)
+idempotent postflight     (postflight_guard.py begin/complete claim)
 ```
 
 Publishing an event requires no App Server contact; a dead App Server only
-leaves events pending. Delivery is at-least-once: a crash between App
-Server acceptance and the local acknowledgement may redeliver one event,
-and the postflight guard makes that harmless.
+leaves events pending. Delivery is at-least-once — no network-level
+exactly-once delivery is claimed: a crash between App Server acceptance and
+the local acknowledgement may redeliver one event, and the postflight claim
+state machine makes the redelivered wake harmless.
 
 ## Explicit enablement
 
@@ -58,6 +62,10 @@ python3 <skill-dir>/scripts/app_server_bridge.py init-config \
   --command codex app-server \
   --enabled
 ```
+
+The configuration records both the `codex_home` path and its digest; a
+mismatch between them is rejected at load time, and every spawned App
+Server runs with `CODEX_HOME` pinned to that path.
 
 2. Create a per-monitor binding naming the exact thread to resume:
 
@@ -94,6 +102,31 @@ python3 <skill-dir>/scripts/app_server_bridge.py deliver \
   --bridge-config ~/.config/codex-monitor/bridge.json
 ```
 
+## Delivery lifecycle
+
+One delivery attempt is one App Server session:
+
+1. spawn the configured command with `CODEX_HOME` pinned;
+2. `initialize` handshake and `initialized` notification;
+3. `thread/resume {threadId}` — the returned `thread.id` **and** the
+   returned `thread.cwd` must match the bound thread and workspace
+   (missing or wrong `cwd` dead-letters as `binding_mismatch`); a
+   different thread is never created;
+4. `turn/start` with the fixed wake text;
+5. **keep the session open and read notifications until the turn reaches
+   `turn/completed`** (bounded by `turn_completion_timeout_seconds`) —
+   closing after `turn/start` would abort the wake turn mid-postflight;
+6. only after an interpretable turn outcome is the event acknowledged
+   delivered, recording `turn_id` and `turn_status` together.
+
+The delivery lease is renewed after each stage and periodically while
+waiting for turn completion. Configuration validation additionally
+requires `lease_seconds >= 2 * request_timeout_seconds` so the request
+budget always fits the lease; these two mechanisms together make
+concurrent delivery of one event require both a lease expiry and a
+stale-owner race, and the postflight claim keeps even that race harmless.
+No stronger exclusivity is claimed.
+
 ## What one wake turn receives
 
 A fixed, locally generated template — never event-controlled free text:
@@ -114,11 +147,40 @@ Do not retry, cancel, resubmit, mutate, or approve the workload solely
 because of this notification.
 ```
 
-The woken turn must then: run `postflight_guard.py check <event_id>`;
-verify the terminal record digest matches `terminal_digest`; perform the
-postflight once; run `postflight_guard.py mark <event_id> --terminal-digest
-sha256:...`. A duplicate wake reports "already handled" and repeats no side
-effects. A digest mismatch blocks postflight entirely.
+Only terminal records whose watcher result is **verified** produce
+success/failure/observability events; an unverified record publishes
+`contract_violation` instead. A Slurm pending-threshold alert (watcher
+exit 4) publishes nothing — a queue-wait alert is not a monitoring
+deadline.
+
+## Mandatory idempotent postflight protocol
+
+The woken turn must, in order:
+
+1. verify the immutable terminal record and that its digest equals the
+   event's `terminal_digest` (a mismatch blocks all postflight work);
+2. atomically claim the postflight:
+
+```bash
+python3 <skill-dir>/scripts/postflight_guard.py begin <event_id> \
+  --terminal-digest sha256:... --owner <turn-identity> --state-dir ...
+```
+
+   Exit `0` = this turn owns the postflight; `3` = already completed;
+   `5` = another turn's claim is in progress — **fail closed**, report and
+   stop (an unknown result is never auto-taken-over); `4` = digest
+   conflict. Concurrent turns cannot both win the claim.
+
+3. perform the postflight side effects exactly once;
+4. complete the claim:
+
+```bash
+python3 <skill-dir>/scripts/postflight_guard.py complete <event_id> \
+  --owner <turn-identity> --state-dir ...
+```
+
+A stuck `in_progress` claim (owner died mid-postflight) is recovered only
+by an explicit human `reset --i-mean-it`, never automatically.
 
 ## Failure matrix
 
@@ -126,16 +188,19 @@ effects. A digest mismatch blocks postflight entirely.
 | --- | --- | --- |
 | App Server offline / spawn failure | retry with backoff (`spawn_failed`) | later |
 | Overload `-32001` | retry with backoff (`overloaded`) | later |
-| Connection dropped before/after request | retry (`connection_lost`) | maybe duplicated, idempotent postflight |
+| Connection dropped before/after request | retry (`connection_lost`) | maybe duplicated; postflight claim keeps effects single |
 | Request timeout | retry (`request_timeout`) | maybe duplicated |
 | Required MCP startup failure | retry (`required_mcp_failure`) | later |
 | Active-turn conflict | retry (`active_turn_conflict`) | later |
+| Wake turn reports `turn/failed` / `turn/aborted` | retry (`turn_failed`/`turn_aborted`) | possibly duplicated; claim keeps effects single |
+| Turn not completed within budget | retry (`turn_completion_timeout`); event stays undelivered | started but unacknowledged |
 | Thread missing | dead-letter (`thread_missing`) | no; never creates a different thread |
 | Thread archived | dead-letter (`thread_archived`) | no |
+| Thread `cwd` missing or wrong | dead-letter (`binding_mismatch`) | no |
 | Unexpected response shape | dead-letter (`unsupported_response_shape`) | no |
-| Wrong workspace/instance binding | dead-letter (`binding_mismatch`) or never claimed | no |
+| Wrong workspace/instance/CODEX_HOME binding | dead-letter (`binding_mismatch`) or never claimed | no |
 
-Retries use exponential backoff with jitter and stop dead-lettering after
+Retries use exponential backoff with jitter and dead-letter after
 `max_attempts`. Inspect with `app_server_bridge.py status` and settle with
 the `cleanup` command.
 
@@ -143,9 +208,12 @@ the `cleanup` command.
 
 Each event carries its binding (`codex_home_id`, `app_server_instance`,
 `thread_id`, `workspace`). A daemon claims **only** events whose instance
-and Codex-home digests equal its configured identity; everything else stays
-pending for its owning daemon. Leases are exclusive with expiry; two
-daemons cannot deliver the same event concurrently.
+and Codex-home digests equal its configured identity; everything else
+stays pending for its owning daemon. The spawned App Server runs with the
+configured `CODEX_HOME`, and the resumed thread must report the bound
+`cwd`. Event ids are full `sha256:<64 hex>` digests, so they can never
+become path components that escape the outbox, and symlinked outbox
+entries are ignored.
 
 ## Security boundaries
 
@@ -154,8 +222,8 @@ daemons cannot deliver the same event concurrently.
 - Events contain only enums, opaque handles, and digests — never raw logs,
   prompts, responses, artifact contents, credentials, or callback text.
 - Only the stable `initialize`, `thread/resume`, and `turn/start` methods
-  over stdio are used; no shell/process methods, no experimental WebSocket,
-  no TCP.
+  plus turn notifications over stdio are used; no shell/process methods,
+  no experimental WebSocket, no TCP.
 - No tokens on command lines; `codex_home_id` is a non-secret digest of the
   CODEX_HOME path.
 - Outbox and state directories are `0700`, files `0600`, symlinks rejected,
@@ -167,6 +235,9 @@ daemons cannot deliver the same event concurrently.
   monitors fall back to pure `unattended`.
 - Stop the delivery daemon and set `"enabled": false` (or remove the
   config): undelivered events simply stay pending in the outbox.
+- If the supervisor died between publishing the terminal and publishing
+  its event, any later `status`/`wait` observation reconciles the
+  publication (idempotently, by event id).
 - `cleanup` removes only settled (delivered, or dead-letter with
   `--include-dead-letter`) outbox entries; terminal evidence is never
   touched.
@@ -178,7 +249,7 @@ daemons cannot deliver the same event concurrently.
 New schemas (`codex-monitor.event/v1`, `codex-monitor.delivery/v1`,
 `codex-monitor.bridge-config/v1`, `codex-monitor.event-binding/v1`,
 `codex-monitor.postflight/v1`, `codex-monitor.doctor/v1`,
-`codex-monitor.list/v1`, bridge attempt records) are additive; see
-`COMPATIBILITY.md` at the repository root for the full inventory and
-migration behavior. Old terminal and manifest records remain readable and
-are marked `evidence_strength: legacy` rather than rewritten.
+`codex-monitor.list/v1`, bridge attempt and event-intent records) are
+additive; see `COMPATIBILITY.md` at the repository root for the full
+inventory and migration behavior. Old terminal and manifest records remain
+readable and are marked `evidence_strength: legacy` rather than rewritten.

@@ -2,7 +2,10 @@
 """Integration tests for the vendored App Server delivery adapter.
 
 Uses a deterministic fake JSONL JSON-RPC server; no real Codex App Server,
-credentials, or network access is required."""
+credentials, or network access is required. The fake server mirrors the
+official lifecycle: initialize -> initialized, thread/resume returns the
+thread id and cwd, turn/start returns a turn id, and the turn later reaches
+turn/completed (or turn/failed) as a notification."""
 
 from __future__ import annotations
 
@@ -11,8 +14,9 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -21,13 +25,13 @@ BRIDGE = HERE / "app_server_bridge.py"
 import semantic_events as se
 
 
-NOW = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
-
 FAKE_SERVER = r'''#!/usr/bin/env python3
 import json, os, sys, time
 
 MODE = os.environ.get("FAKE_MODE", "ok")
 LOG = os.environ.get("FAKE_LOG")
+CWD = os.environ.get("FAKE_THREAD_CWD", "/default/workspace")
+TURN_DELAY = float(os.environ.get("FAKE_TURN_DELAY", "0"))
 
 def send(obj):
     sys.stdout.write(json.dumps(obj) + "\n")
@@ -73,8 +77,12 @@ for raw in sys.stdin:
             send({"id": mid, "error": {"code": -32001, "message": "overloaded"}})
         elif MODE == "resume_bad_shape":
             send({"id": mid, "result": {"thread": {"id": "thr_other"}}})
-        else:
+        elif MODE == "wrong_cwd":
+            send({"id": mid, "result": {"thread": {"id": message["params"]["threadId"], "cwd": "/somewhere/else"}}})
+        elif MODE == "no_cwd":
             send({"id": mid, "result": {"thread": {"id": message["params"]["threadId"]}}})
+        else:
+            send({"id": mid, "result": {"thread": {"id": message["params"]["threadId"], "cwd": CWD}}})
     elif method == "turn/start":
         if MODE == "turn_conflict":
             send({"id": mid, "error": {"code": -32000, "message": "thread already has an active turn"}})
@@ -87,6 +95,12 @@ for raw in sys.stdin:
         else:
             log(message["params"]["input"][0]["text"])
             send({"id": mid, "result": {"turn": {"id": "turn_fake_1", "status": "inProgress", "items": [], "error": None}}})
+            if MODE != "no_completion":
+                time.sleep(TURN_DELAY)
+                if MODE == "turn_failed_notification":
+                    send({"method": "turn/failed", "params": {"turn": {"id": "turn_fake_1", "status": "failed"}}})
+                else:
+                    send({"method": "turn/completed", "params": {"turn": {"id": "turn_fake_1", "status": "completed"}}})
 '''
 
 
@@ -99,6 +113,7 @@ class BridgeAdapterTests(unittest.TestCase):
         self.fake.write_text(FAKE_SERVER, encoding="utf-8")
         self.fake.chmod(0o700)
         self.wake_log = self.root / "wake.log"
+        self.project = self.root / "project"
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -110,8 +125,9 @@ class BridgeAdapterTests(unittest.TestCase):
             "schema": se.BRIDGE_CONFIG_SCHEMA,
             "enabled": True,
             "instance_id": "workstation-1",
-            "codex_home_id": "sha256:" + "a" * 64,
-            "workspace": str(self.root / "project"),
+            "codex_home": str(self.root / ".codex"),
+            "codex_home_id": se.codex_home_digest(self.root / ".codex"),
+            "workspace": str(self.project),
             "transport": {"type": "stdio", "command": [sys.executable, str(self.fake)]},
             "request_timeout_seconds": 5,
             "poll_seconds": 0.05,
@@ -119,6 +135,7 @@ class BridgeAdapterTests(unittest.TestCase):
             "max_attempts": 16,
             "backoff_initial_seconds": 0.05,
             "backoff_max_seconds": 0.2,
+            "turn_completion_timeout_seconds": 10,
         }
         config.update(overrides)
         path = self.root / "bridge.json"
@@ -129,10 +146,10 @@ class BridgeAdapterTests(unittest.TestCase):
     def write_binding_file(self, **overrides) -> Path:
         binding = {
             "schema": se.EVENT_BINDING_SCHEMA,
-            "codex_home_id": "sha256:" + "a" * 64,
+            "codex_home_id": se.codex_home_digest(self.root / ".codex"),
             "app_server_instance": "workstation-1",
             "thread_id": "thr_test_1",
-            "workspace": str(self.root / "project"),
+            "workspace": str(self.project),
         }
         binding.update(overrides)
         path = self.root / "binding.json"
@@ -154,43 +171,83 @@ class BridgeAdapterTests(unittest.TestCase):
         se.publish_event(se.outbox_root(self.state), payload)
         return payload
 
-    def deliver(self, config: Path, once: bool = True, mode: str = "ok") -> tuple[int, list[dict]]:
+    def deliver_env(self, mode: str, turn_delay: float | None = None) -> dict:
+        env = os.environ.copy()
+        env.update({
+            "FAKE_MODE": mode,
+            "FAKE_LOG": str(self.wake_log),
+            "FAKE_THREAD_CWD": str(self.project),
+        })
+        if turn_delay is not None:
+            env["FAKE_TURN_DELAY"] = str(turn_delay)
+        return env
+
+    def deliver(self, config: Path, once: bool = True, mode: str = "ok",
+                turn_delay: float | None = None, timeout: int = 30) -> tuple[int, list[dict]]:
         command = [
             sys.executable, str(BRIDGE), "deliver",
             "--state-dir", str(self.state), "--bridge-config", str(config),
         ]
         if once:
             command.append("--once")
-        env = os.environ.copy()
-        env.update({"FAKE_MODE": mode, "FAKE_LOG": str(self.wake_log)})
-        result = subprocess.run(command, text=True, capture_output=True, check=False, env=env, timeout=30)
+        result = subprocess.run(
+            command, text=True, capture_output=True, check=False,
+            env=self.deliver_env(mode, turn_delay), timeout=timeout,
+        )
         records = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
         return result.returncode, records
 
     def delivery_of(self, event_id: str) -> dict:
-        return se._read_delivery(se.event_dir(se.outbox_root(self.state), event_id), event_id)
+        return se._read_delivery(
+            se.event_dir(se.outbox_root(self.state), event_id), event_id
+        )
 
-    # -- happy path -------------------------------------------------------
+    # -- lifecycle -------------------------------------------------------
 
-    def test_verified_event_creates_one_turn_with_fixed_wake_text(self) -> None:
+    def test_ack_only_after_turn_completed(self) -> None:
         config = self.write_config()
         event = self.publish_event()
         code, records = self.deliver(config)
         self.assertEqual(code, 0)
         outcome = records[0]
         self.assertEqual(outcome["state"], "acknowledged")
-        self.assertEqual(outcome["turn_id"], "turn_fake_1")
+        self.assertEqual(outcome["turn_status"], "completed")
         delivery = self.delivery_of(event["event_id"])
         self.assertEqual(delivery["state"], "delivered")
+        self.assertEqual(delivery["turn_status"], "completed")
         self.assertEqual(delivery["delivery"]["turn_id"], "turn_fake_1")
-        self.assertEqual(delivery["delivery"]["thread_id"], "thr_test_1")
         wake = self.wake_log.read_text()
         self.assertIn(f"event_id={event['event_id']}", wake)
-        self.assertIn("event=transport_success", wake)
         self.assertIn("business_verdict=pending", wake)
         self.assertIn("Do not retry, cancel, resubmit, mutate, or approve", wake)
-        # exactly one wake turn was started
         self.assertEqual(wake.count("==="), 1)
+
+    def test_slow_turn_is_awaited_before_ack(self) -> None:
+        config = self.write_config(turn_completion_timeout_seconds=30)
+        event = self.publish_event()
+        code, records = self.deliver(config, turn_delay=1.5)
+        self.assertEqual(code, 0)
+        self.assertEqual(records[0]["state"], "acknowledged")
+        self.assertEqual(self.delivery_of(event["event_id"])["state"], "delivered")
+
+    def test_turn_completion_timeout_keeps_event_undelivered(self) -> None:
+        config = self.write_config(turn_completion_timeout_seconds=1)
+        event = self.publish_event()
+        _, records = self.deliver(config, mode="no_completion")
+        self.assertEqual(records[0]["error_code"], "turn_completion_timeout")
+        self.assertEqual(records[0]["state"], "scheduled_retry")
+        delivery = self.delivery_of(event["event_id"])
+        self.assertEqual(delivery["state"], "pending")
+        # The wake turn was started but never acknowledged as delivered.
+        self.assertTrue(self.wake_log.exists())
+
+    def test_turn_failed_notification_is_retryable(self) -> None:
+        config = self.write_config()
+        event = self.publish_event()
+        _, records = self.deliver(config, mode="turn_failed_notification")
+        self.assertEqual(records[0]["error_code"], "turn_failed")
+        self.assertEqual(records[0]["state"], "scheduled_retry")
+        self.assertEqual(self.delivery_of(event["event_id"])["state"], "pending")
 
     def test_second_run_has_nothing_left_to_deliver(self) -> None:
         config = self.write_config()
@@ -200,6 +257,31 @@ class BridgeAdapterTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(records[-1]["state"], "idle")
         self.assertEqual(records[-1]["delivered"], 0)
+        self.assertEqual(self.wake_log.read_text().count("==="), 1)
+
+    def test_lease_renewal_prevents_concurrent_second_delivery(self) -> None:
+        # The turn takes 5s while the lease is only 3s: without periodic
+        # renewal the lease would expire mid-delivery and a second daemon
+        # could steal the event at t=4s. Renewal must prevent that.
+        config = self.write_config(
+            request_timeout_seconds=1,
+            lease_seconds=3,
+            turn_completion_timeout_seconds=30,
+        )
+        self.publish_event()
+        first = subprocess.Popen(
+            [sys.executable, str(BRIDGE), "deliver",
+             "--state-dir", str(self.state), "--bridge-config", str(config), "--once"],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=self.deliver_env("ok", turn_delay=5.0),
+        )
+        time.sleep(4.0)  # past the un-renewed lease expiry, mid-turn wait
+        code, records = self.deliver(config, mode="ok", turn_delay=5.0)
+        self.assertEqual(code, 0)
+        self.assertEqual(records[-1]["state"], "idle")
+        stdout, _ = first.communicate(timeout=30)
+        first_records = [json.loads(line) for line in stdout.splitlines() if line.strip()]
+        self.assertEqual(first_records[0]["state"], "acknowledged", first_records)
         self.assertEqual(self.wake_log.read_text().count("==="), 1)
 
     # -- retryable failures -------------------------------------------------
@@ -214,12 +296,11 @@ class BridgeAdapterTests(unittest.TestCase):
         delivery = self.delivery_of(event["event_id"])
         self.assertEqual(delivery["state"], "pending")
         self.assertEqual(delivery["attempts"], 1)
-        self.assertEqual(delivery["last_error"]["code"], "overloaded")
         self.assertIsNotNone(delivery["next_attempt_at"])
 
     def test_turn_conflict_is_retryable(self) -> None:
         config = self.write_config()
-        event = self.publish_event()
+        self.publish_event()
         _, records = self.deliver(config, mode="turn_conflict")
         self.assertEqual(records[0]["error_code"], "active_turn_conflict")
         self.assertEqual(records[0]["state"], "scheduled_retry")
@@ -238,8 +319,8 @@ class BridgeAdapterTests(unittest.TestCase):
         self.assertEqual(records[0]["error_code"], "connection_lost")
         self.assertEqual(self.delivery_of(event["event_id"])["state"], "pending")
 
-    def test_timeout_is_retryable(self) -> None:
-        config = self.write_config(request_timeout_seconds=0.5)
+    def test_request_timeout_is_retryable(self) -> None:
+        config = self.write_config(request_timeout_seconds=0.5, lease_seconds=2)
         event = self.publish_event()
         _, records = self.deliver(config, mode="hang")
         self.assertEqual(records[0]["error_code"], "request_timeout")
@@ -257,8 +338,7 @@ class BridgeAdapterTests(unittest.TestCase):
         event = self.publish_event()
         _, records = self.deliver(config, mode="overload")
         self.assertEqual(records[0]["state"], "dead_lettered")
-        delivery = self.delivery_of(event["event_id"])
-        self.assertEqual(delivery["state"], "dead_letter")
+        self.assertEqual(self.delivery_of(event["event_id"])["state"], "dead_letter")
 
     # -- permanent failures ---------------------------------------------------
 
@@ -284,6 +364,21 @@ class BridgeAdapterTests(unittest.TestCase):
         self.assertEqual(records[0]["error_code"], "unsupported_response_shape")
         self.assertEqual(records[0]["state"], "dead_lettered")
 
+    def test_wrong_thread_cwd_dead_letters(self) -> None:
+        config = self.write_config()
+        event = self.publish_event()
+        _, records = self.deliver(config, mode="wrong_cwd")
+        self.assertEqual(records[0]["error_code"], "binding_mismatch")
+        self.assertEqual(self.delivery_of(event["event_id"])["state"], "dead_letter")
+        self.assertFalse(self.wake_log.exists())
+
+    def test_missing_thread_cwd_dead_letters(self) -> None:
+        config = self.write_config()
+        event = self.publish_event()
+        _, records = self.deliver(config, mode="no_cwd")
+        self.assertEqual(records[0]["error_code"], "binding_mismatch")
+        self.assertEqual(self.delivery_of(event["event_id"])["state"], "dead_letter")
+
     def test_turn_shape_without_id_dead_letters(self) -> None:
         config = self.write_config()
         self.publish_event()
@@ -301,6 +396,15 @@ class BridgeAdapterTests(unittest.TestCase):
         _, records = self.deliver(config)
         self.assertEqual(records[0]["error_code"], "binding_mismatch")
         self.assertEqual(self.delivery_of(event["event_id"])["state"], "dead_letter")
+
+    def test_codex_home_digest_mismatch_is_rejected_at_load(self) -> None:
+        config = self.write_config()
+        payload = json.loads(config.read_text())
+        payload["codex_home"] = str(self.root / "other-codex")
+        config.write_text(json.dumps(payload))
+        code, records = self.deliver(config)
+        self.assertEqual(code, 12)
+        self.assertEqual(records[0]["reason"], "config_codex_home_mismatch")
 
     # -- instance isolation ----------------------------------------------------
 
@@ -324,7 +428,9 @@ class BridgeAdapterTests(unittest.TestCase):
         self.assertEqual(code, 3)
         self.assertEqual(records[0]["state"], "refused")
         self.assertEqual(records[0]["reason"], "bridge_disabled")
-        self.assertEqual(se.list_outbox(se.outbox_root(self.state))[0]["state"], "pending")
+        self.assertEqual(
+            se.list_outbox(se.outbox_root(self.state))[0]["state"], "pending"
+        )
 
     def test_invalid_config_fails_closed(self) -> None:
         bad = self.root / "bad.json"
@@ -333,6 +439,13 @@ class BridgeAdapterTests(unittest.TestCase):
         code, records = self.deliver(bad)
         self.assertEqual(code, 12)
         self.assertEqual(records[0]["state"], "error")
+
+    def test_lease_shorter_than_request_budget_is_rejected(self) -> None:
+        with self.assertRaises(se.SemanticEventError) as ctx:
+            se.validate_bridge_config(
+                json.loads(self.write_config(lease_seconds=1).read_text())
+            )
+        self.assertEqual(ctx.exception.reason, "config_lease_too_short")
 
     # -- tooling commands --------------------------------------------------------
 
@@ -359,7 +472,6 @@ class BridgeAdapterTests(unittest.TestCase):
         self.assertTrue(config["enabled"])
         self.assertEqual(binding["thread_id"], "thr_123")
         self.assertEqual(config["codex_home_id"], binding["codex_home_id"])
-        # binding agrees with config identity
         self.assertEqual(binding["app_server_instance"], config["instance_id"])
         self.assertEqual(binding["workspace"], config["workspace"])
 

@@ -34,9 +34,10 @@ exists. A terminal file cannot awaken an inactive Codex turn by itself.
 When a monitor is started with `--event-binding`, each verified terminal
 record additionally publishes one durable semantic event into the local
 outbox; a foreground delivery daemon you run separately resumes the bound
-thread and starts exactly one wake turn. The woken turn must run
-`scripts/postflight_guard.py check` before any side effects and `mark` after
-verifying the terminal digest.
+thread, starts exactly one wake turn, and holds the App Server session
+open until that turn completes. The woken turn must verify the terminal
+digest, atomically claim the postflight with `scripts/postflight_guard.py
+begin`, perform its side effects once, then `complete` the claim.
 
 ## Hard invariants
 
@@ -64,8 +65,8 @@ Freeze which process owns the actual workload. A Codex dispatch terminal covers 
 
 ## Route to one backend
 
-- **Slurm:** Read and use `/home/liangyu.chen02/.codex/skills/codex-hpc-monitor/SKILL.md`. Its detached supervisor owns scheduler reconciliation.
-- **Codex dispatch:** Read and use `/home/liangyu.chen02/.codex/skills/codex-task-dispatch/SKILL.md`. Its direct-parent supervisor owns child exit and `dispatch_terminal.json`. Start observation with `scripts/monitor_dispatch.py start <dispatch-directory> --timeout-seconds <seconds>` so the fixed contract binds the handle, manifest SHA, and full dispatch verifier identity; retain the returned monitor task handle for `status` or `wait`. The wrapper reports a terminal outcome only after the dispatch supervisor verifies the complete terminal contract.
+- **Slurm:** Read and use the installed `codex-hpc-monitor` skill's `SKILL.md` (resolve it from your skill installation, not a hard-coded path). Its detached supervisor owns scheduler reconciliation.
+- **Codex dispatch:** Read and use the installed `codex-task-dispatch` skill's `SKILL.md` (resolve it from your skill installation, not a hard-coded path). Its direct-parent supervisor owns child exit and `dispatch_terminal.json`. Start observation with `scripts/monitor_dispatch.py start <dispatch-directory> --timeout-seconds <seconds>` so the fixed contract binds the handle, manifest SHA, and full dispatch verifier identity; retain the returned monitor task handle for `status` or `wait`. The wrapper reports a terminal outcome only after the dispatch supervisor verifies the complete terminal contract.
 - **Artifact or callback:** Read [references/artifact.md](references/artifact.md). For work longer than about two minutes, use `scripts/supervise_artifact.py`; it detaches, freezes the watcher, and publishes an immutable local terminal.
 - **Short synchronous command:** Read [references/process.md](references/process.md). The attached path is lifecycle-dependent and is only for predictably short work.
 - **HTTP or queue:** Prefer a documented immutable callback/result record. Provider polling must be deterministic and read-only; readiness is not task completion.

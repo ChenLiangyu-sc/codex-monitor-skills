@@ -30,13 +30,14 @@ import semantic_events
 JOB_ID_RE = re.compile(r"^[0-9]+(?:_[0-9]+)?$")
 HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 SCHEMA_PREFIX = "codex-hpc-monitor"
-# Watcher exit code -> semantic wake event. Verified scheduler outcomes only;
-# duplicate-watcher, infrastructure failures, signals, and launch failures
-# never publish (they are not scheduler terminal evidence).
+# Watcher exit code -> semantic wake event. Verified scheduler outcomes only.
+# Exit 4 (pending threshold alert) deliberately maps to nothing: a queue-wait
+# alert is not a monitoring-deadline expiry and must not wake a thread with
+# a misleading deadline_exceeded event. Duplicate-watcher, infrastructure
+# failures, signals, and launch failures also never publish.
 HPC_SEMANTIC_EVENTS = {
     0: "transport_success",
     3: "transport_failure",
-    4: "deadline_exceeded",
     5: "lost_observability",
     7: "contract_violation",
     8: "lost_observability",
@@ -390,6 +391,38 @@ def resolved_event_binding(args: argparse.Namespace) -> Optional[Dict[str, Any]]
     return binding
 
 
+def reconcile_run_event(run: Optional[Path]) -> Optional[str]:
+    """Close the crash window between terminal.json and event publication.
+
+    If the supervisor died after publishing the terminal record but before
+    publishing the semantic event, any later status/wait observation
+    republishes it (idempotently, by event id). Returns the publication
+    outcome when a repair happened, else None.
+    """
+    if run is None:
+        return None
+    manifest = read_json(run / "manifest.json")
+    if not isinstance(manifest.get("event_binding"), dict):
+        return None
+    if not (run / "terminal.json").exists():
+        return None
+    if (run / "semantic_event.json").exists() or (
+        run / "semantic_event_failure.json"
+    ).exists():
+        return None
+    terminal = read_json(run / "terminal.json")
+    exit_code = terminal.get("watcher_exit_code")
+    if not isinstance(exit_code, int):
+        return None
+    publish_semantic_event(
+        run,
+        manifest=manifest,
+        terminal=terminal,
+        watcher_exit_code=exit_code,
+    )
+    return read_json(run / "semantic_event.json").get("state")
+
+
 def publish_semantic_event(
     run: Path,
     *,
@@ -410,6 +443,15 @@ def publish_semantic_event(
     )
     if event_enum is None:
         return
+    # Only a terminal record whose watcher result is actually verified may
+    # carry a success/failure/observability event. An unverified result
+    # downgrades the event to contract_violation: the observation itself is
+    # broken and the wake turn must reconcile manually, never trust a
+    # scheduler outcome.
+    watcher_result = terminal.get("watcher_result")
+    verified = isinstance(watcher_result, dict) and watcher_result.get("verified") is True
+    if not verified:
+        event_enum = "contract_violation"
     try:
         terminal_digest = f"sha256:{sha256_file(run / 'terminal.json')}"
         event = semantic_events.build_event(
@@ -424,17 +466,21 @@ def publish_semantic_event(
         outcome = semantic_events.publish_event(
             semantic_events.outbox_root(Path(str(manifest["state_dir"]))), event
         )
-        publish_json_no_replace(
-            run / "semantic_event.json",
-            {
-                "schema_version": f"{SCHEMA_PREFIX}.semantic-event/v1",
-                "run_id": run.name,
-                "event_id": event["event_id"],
-                "event": event_enum,
-                "state": outcome,
-                "published_at": utc_now(),
-            },
-        )
+        try:
+            publish_json_no_replace(
+                run / "semantic_event.json",
+                {
+                    "schema_version": f"{SCHEMA_PREFIX}.semantic-event/v1",
+                    "run_id": run.name,
+                    "event_id": event["event_id"],
+                    "event": event_enum,
+                    "state": outcome,
+                    "published_at": utc_now(),
+                },
+            )
+        except FileExistsError:
+            # A reconciling observer recorded this publication first.
+            pass
     except (OSError, ValueError, semantic_events.SemanticEventError) as exc:
         replace_json(
             run / "semantic_event_failure.json",
@@ -512,6 +558,22 @@ def start_monitor(args: argparse.Namespace) -> int:
             manifest["event_binding"] = event_binding
             manifest["event_backend"] = "slurm"
         publish_json_no_replace(run / "manifest.json", manifest)
+        if event_binding is not None:
+            # Written before the supervisor exists: durable proof that this
+            # run intended to publish a wake event, used by the reconciler
+            # if the run dies between terminal and event publication.
+            publish_json_no_replace(
+                run / "event_intent.json",
+                {
+                    "schema_version": f"{SCHEMA_PREFIX}.event-intent/v1",
+                    "run_id": run_id,
+                    "host": args.host,
+                    "job_id": args.job_id,
+                    "event_backend": "slurm",
+                    "binding_instance": event_binding.get("app_server_instance"),
+                    "declared_at": utc_now(),
+                },
+            )
         manifest_sha = sha256_file(run / "manifest.json")
         replace_json(
             base / "current.json",
@@ -803,11 +865,14 @@ def supervise(args: argparse.Namespace) -> int:
 
 def status_command(args: argparse.Namespace) -> int:
     validate_identity(args.job_id, args.host)
-    status = run_status(
-        current_run(base_dir(args.state_dir, args.host, args.job_id)),
-        args.host,
-        args.job_id,
-    )
+    run = current_run(base_dir(args.state_dir, args.host, args.job_id))
+    # Local-only repair: if the supervisor crashed between publishing the
+    # terminal and publishing its semantic event, finish that publication.
+    try:
+        reconcile_run_event(run)
+    except (OSError, ValueError):
+        pass
+    status = run_status(run, args.host, args.job_id)
     print(json.dumps(status, sort_keys=True))
     if args.require_terminal and status["state"] != "terminal":
         return 3
@@ -892,11 +957,12 @@ def wait_command(args: argparse.Namespace) -> int:
     deadline = time.monotonic() + args.timeout_seconds
     publication_missing_since: Optional[float] = None
     while True:
-        status = run_status(
-            current_run(base_dir(args.state_dir, args.host, args.job_id)),
-            args.host,
-            args.job_id,
-        )
+        run = current_run(base_dir(args.state_dir, args.host, args.job_id))
+        try:
+            reconcile_run_event(run)
+        except (OSError, ValueError):
+            pass
+        status = run_status(run, args.host, args.job_id)
         state = status.get("state")
         if state == "terminal":
             exit_code, payload = terminal_wait_result(status)
@@ -1009,6 +1075,7 @@ def probe_app_server(config: Dict[str, Any]) -> Dict[str, Any]:
         session = app_server_bridge.AppServerSession(
             list(config["transport"]["command"]),
             float(config["request_timeout_seconds"]),
+            env=app_server_bridge.spawn_env(config),
         )
     except (OSError, ValueError) as exc:
         return {"healthy": False, "reason": f"spawn_failed: {type(exc).__name__}"}

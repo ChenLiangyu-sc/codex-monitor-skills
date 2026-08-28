@@ -97,6 +97,65 @@ class PostflightGuardTests(unittest.TestCase):
         self.assertEqual(len(payload["records"]), 1)
         self.assertEqual(payload["records"][0]["event_id"], self.event_id)
 
+    def test_begin_complete_lifecycle_and_concurrency(self) -> None:
+        proc_a = subprocess.Popen(
+            [sys.executable, str(GUARD), "begin", self.event_id,
+             "--terminal-digest", self.digest, "--owner", "turn-a",
+             "--state-dir", str(self.state)],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        proc_b = subprocess.Popen(
+            [sys.executable, str(GUARD), "begin", self.event_id,
+             "--terminal-digest", self.digest, "--owner", "turn-b",
+             "--state-dir", str(self.state)],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out_a, _ = proc_a.communicate(timeout=10)
+        out_b, _ = proc_b.communicate(timeout=10)
+        payload_a = json.loads(out_a.strip().splitlines()[-1])
+        payload_b = json.loads(out_b.strip().splitlines()[-1])
+        outcomes = sorted([payload_a["state"], payload_b["state"]])
+        self.assertEqual(outcomes, ["already_in_progress", "begun"])
+        winner, loser = (
+            (payload_a, payload_b) if payload_a["state"] == "begun" else (payload_b, payload_a)
+        )
+        owner = winner["owner"]
+        # The losing turn must not perform side effects; completing with the
+        # wrong owner fails closed.
+        code, payload = run_guard(
+            "complete", self.event_id, "--owner", loser["owner"],
+            "--state-dir", str(self.state),
+        )
+        self.assertEqual(code, 4)
+        self.assertEqual(payload["state"], "not_owner")
+        code, payload = run_guard(
+            "complete", self.event_id, "--owner", owner, "--state-dir", str(self.state)
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["state"], "completed")
+        code, _ = run_guard("check", self.event_id, "--state-dir", str(self.state))
+        self.assertEqual(code, 3)
+
+    def test_unknown_result_never_auto_taken_over_and_manual_reset(self) -> None:
+        run_guard("begin", self.event_id, "--terminal-digest", self.digest,
+                  "--owner", "turn-a", "--state-dir", str(self.state))
+        code, payload = run_guard("begin", self.event_id, "--terminal-digest",
+                                  self.digest, "--owner", "turn-b",
+                                  "--state-dir", str(self.state))
+        self.assertEqual(code, 5)
+        self.assertEqual(payload["state"], "already_in_progress")
+        # reset without confirmation changes nothing
+        code, payload = run_guard("reset", self.event_id, "--state-dir", str(self.state))
+        self.assertEqual(code, 4)
+        self.assertEqual(payload["state"], "confirmation_required")
+        code, payload = run_guard("reset", self.event_id, "--state-dir", str(self.state),
+                                  "--i-mean-it")
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["state"], "reset")
+        # after human reset a new claim may begin
+        code, payload = run_guard("begin", self.event_id, "--terminal-digest",
+                                  self.digest, "--owner", "turn-c",
+                                  "--state-dir", str(self.state))
+        self.assertEqual(code, 0)
+
 
 class VendorSyncTests(unittest.TestCase):
     SIBLING = "codex-hpc-monitor"

@@ -29,6 +29,7 @@ import semantic_events
 FAKE_APP_SERVER_OK = r'''#!/usr/bin/env python3
 import json, os, sys
 LOG = os.environ["FAKE_LOG"]
+CWD = os.environ.get("FAKE_THREAD_CWD", "/default/workspace")
 def send(obj):
     sys.stdout.write(json.dumps(obj) + "\n")
     sys.stdout.flush()
@@ -42,11 +43,12 @@ for raw in sys.stdin:
     if method == "initialize":
         send({"id": mid, "result": {"userInfo": {"id": "u"}}})
     elif method == "thread/resume":
-        send({"id": mid, "result": {"thread": {"id": message["params"]["threadId"]}}})
+        send({"id": mid, "result": {"thread": {"id": message["params"]["threadId"], "cwd": CWD}}})
     elif method == "turn/start":
         with open(LOG, "a", encoding="utf-8") as handle:
             handle.write(message["params"]["input"][0]["text"] + "\n===\n")
         send({"id": mid, "result": {"turn": {"id": "turn_chain_1", "status": "inProgress", "error": None}}})
+        send({"method": "turn/completed", "params": {"turn": {"id": "turn_chain_1", "status": "completed"}}})
 '''
 
 
@@ -444,7 +446,7 @@ class ArtifactSupervisorTests(unittest.TestCase):
     def write_binding(self) -> Path:
         binding = {
             "schema": "codex-monitor.event-binding/v1",
-            "codex_home_id": "sha256:" + "a" * 64,
+            "codex_home_id": semantic_events.codex_home_digest(self.root / ".codex"),
             "app_server_instance": "workstation-1",
             "thread_id": "thr_test_1",
             "workspace": str(self.root),
@@ -457,6 +459,20 @@ class ArtifactSupervisorTests(unittest.TestCase):
     def outbox(self) -> Path:
         return semantic_events.outbox_root(self.state)
 
+    def wait_run_file(self, run: Path, name: str, timeout: float = 8.0) -> Path:
+        deadline = time.monotonic() + timeout
+        path = run / name
+        handle_dir = run.parent.parent
+        current = json.loads((handle_dir / "current.json").read_text())
+        while time.monotonic() < deadline:
+            if path.exists():
+                return path
+            # status observations trigger the reconciler, closing any crash
+            # window between terminal and event publication.
+            self.status(current["task_handle"])
+            time.sleep(0.05)
+        self.fail(f"{name} was not published for {run}")
+
     def test_terminal_publishes_one_semantic_event_with_binding(self) -> None:
         binding = self.write_binding()
         self.write_artifact()
@@ -465,7 +481,7 @@ class ArtifactSupervisorTests(unittest.TestCase):
         handle = started["task_handle"]
         terminal = self.wait_terminal(handle)
         run = Path(terminal["run_dir"])
-        published = json.loads((run / "semantic_event.json").read_text())
+        published = json.loads(self.wait_run_file(run, "semantic_event.json").read_text())
         self.assertEqual(published["event"], "transport_success")
         entries = semantic_events.list_outbox(self.outbox())
         self.assertEqual(len(entries), 1)
@@ -519,7 +535,8 @@ class ArtifactSupervisorTests(unittest.TestCase):
             "schema": semantic_events.BRIDGE_CONFIG_SCHEMA,
             "enabled": True,
             "instance_id": "workstation-1",
-            "codex_home_id": "sha256:" + "a" * 64,
+            "codex_home": str(self.root / ".codex"),
+            "codex_home_id": semantic_events.codex_home_digest(self.root / ".codex"),
             "workspace": str(self.root),
             "transport": {"type": "stdio", "command": ["codex", "app-server"]},
             "request_timeout_seconds": 30,
@@ -528,6 +545,7 @@ class ArtifactSupervisorTests(unittest.TestCase):
             "max_attempts": 16,
             "backoff_initial_seconds": 5,
             "backoff_max_seconds": 3600,
+            "turn_completion_timeout_seconds": 3600,
         }
         path = self.root / "bridge.json"
         path.write_text(json.dumps(config), encoding="utf-8")
@@ -598,12 +616,14 @@ class ArtifactSupervisorTests(unittest.TestCase):
             "schema": semantic_events.BRIDGE_CONFIG_SCHEMA,
             "enabled": True,
             "instance_id": "workstation-1",
-            "codex_home_id": "sha256:" + "a" * 64,
+            "codex_home": str(self.root / ".codex"),
+            "codex_home_id": semantic_events.codex_home_digest(self.root / ".codex"),
             "workspace": str(self.root / "project"),
             "transport": {"type": "stdio", "command": [sys.executable, str(fake)]},
             "request_timeout_seconds": 10, "poll_seconds": 0.05,
             "lease_seconds": 60, "max_attempts": 5,
             "backoff_initial_seconds": 0.05, "backoff_max_seconds": 0.2,
+            "turn_completion_timeout_seconds": 30,
         }
         config_path = self.root / "bridge.json"
         config_path.write_text(json.dumps(config), encoding="utf-8")
@@ -611,7 +631,7 @@ class ArtifactSupervisorTests(unittest.TestCase):
         (self.root / "project").mkdir()
         binding = {
             "schema": semantic_events.EVENT_BINDING_SCHEMA,
-            "codex_home_id": "sha256:" + "a" * 64,
+            "codex_home_id": semantic_events.codex_home_digest(self.root / ".codex"),
             "app_server_instance": "workstation-1",
             "thread_id": "thr_chain",
             "workspace": str(self.root / "project"),
@@ -637,8 +657,15 @@ class ArtifactSupervisorTests(unittest.TestCase):
              "--state-dir", str(self.state), "--bridge-config", str(config_path),
              "--once"],
             text=True, capture_output=True, check=False,
-            env={**_os.environ, "FAKE_LOG": str(wake_log)}, timeout=30)
+            env={
+                **_os.environ,
+                "FAKE_LOG": str(wake_log),
+                "FAKE_THREAD_CWD": str(self.root / "project"),
+            }, timeout=30)
         self.assertEqual(delivered.returncode, 0, delivered.stdout + delivered.stderr)
+        records = [json.loads(line) for line in delivered.stdout.splitlines() if line.strip()]
+        self.assertEqual(records[0]["state"], "acknowledged", records)
+        self.assertEqual(records[0]["turn_status"], "completed")
         wake = wake_log.read_text()
         self.assertIn(f"event_id={event_id}", wake)
         self.assertEqual(wake.count("==="), 1)

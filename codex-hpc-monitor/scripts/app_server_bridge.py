@@ -56,6 +56,9 @@ RETRYABLE_CODES = {
     "server_error",
     "required_mcp_failure",
     "active_turn_conflict",
+    "turn_completion_timeout",
+    "turn_failed",
+    "turn_aborted",
 }
 DEAD_LETTER_CODES = {
     "thread_missing",
@@ -63,6 +66,11 @@ DEAD_LETTER_CODES = {
     "unsupported_response_shape",
     "binding_mismatch",
 }
+
+
+# Delivery context used by the lease-renewal callback inside one attempt.
+_DELIVERY_STATE_DIR: list[str] = [""]
+_DELIVERY_OWNER: list[str] = [""]
 
 
 class DeliveryError(RuntimeError):
@@ -81,17 +89,32 @@ def utc_now() -> datetime:
 
 
 class AppServerSession:
-    """Minimal JSONL JSON-RPC client for one delivery attempt."""
+    """Minimal JSONL JSON-RPC client for one delivery attempt.
 
-    def __init__(self, command: list[str], request_timeout_seconds: float) -> None:
+    The session must stay open until the started turn reaches
+    ``turn/completed`` (or fails): closing it right after ``turn/start``
+    would abort the wake turn before its postflight finishes.
+    """
+
+    def __init__(
+        self,
+        command: list[str],
+        request_timeout_seconds: float,
+        env: dict[str, str] | None = None,
+    ) -> None:
         self.request_timeout = request_timeout_seconds
         self._next_id = 0
+        self._line_buffer = b""
         self._stderr_file = tempfile.TemporaryFile()
+        spawn_env = os.environ.copy()
+        if env:
+            spawn_env.update(env)
         self.process = subprocess.Popen(
             list(command),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=self._stderr_file,
+            env=spawn_env,
         )
 
     # -- low-level IO ---------------------------------------------------
@@ -107,36 +130,43 @@ class AppServerSession:
             raise DeliveryError("connection_lost", f"write failed: {exc}") from exc
 
     def _read_line(self, deadline: float) -> Optional[Dict[str, Any]]:
-        assert self.process.stdout is not None
+        """Read one JSON object line by the given absolute monotonic deadline.
+
+        Raw ``os.read`` with our own line buffer: mixing a selector with
+        buffered ``readline`` would hide already-buffered lines from the
+        selector and fake a timeout while data is pending.
+        """
         fd = self.process.stdout.fileno()
-        selector = selectors.DefaultSelector()
-        selector.register(fd, selectors.EVENT_READ)
-        try:
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return None
-                for key, _ in selector.select(remaining):
-                    line = self.process.stdout.readline()
-                    if not line:
-                        raise DeliveryError(
-                            "connection_lost", "app server closed its output"
-                        )
-                    text = line.decode("utf-8", errors="replace").strip()
-                    if not text:
-                        continue
-                    try:
-                        value = json.loads(text)
-                    except json.JSONDecodeError as exc:
-                        raise DeliveryError(
-                            "protocol_error", f"non-JSON line: {exc}"
-                        ) from exc
-                    if not isinstance(value, dict):
-                        raise DeliveryError("protocol_error", "response is not an object")
-                    return value
+        while True:
+            if b"\n" in self._line_buffer:
+                line, _, self._line_buffer = self._line_buffer.partition(b"\n")
+                text = line.decode("utf-8", errors="replace").strip()
+                if not text:
+                    continue
+                try:
+                    value = json.loads(text)
+                except json.JSONDecodeError as exc:
+                    raise DeliveryError(
+                        "protocol_error", f"non-JSON line: {exc}"
+                    ) from exc
+                if not isinstance(value, dict):
+                    raise DeliveryError("protocol_error", "response is not an object")
+                return value
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 return None
-        finally:
-            selector.close()
+            selector = selectors.DefaultSelector()
+            try:
+                selector.register(fd, selectors.EVENT_READ)
+                events = selector.select(remaining)
+            finally:
+                selector.close()
+            if not events:
+                return None
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                raise DeliveryError("connection_lost", "app server closed its output")
+            self._line_buffer += chunk
 
     def _stderr_tail(self) -> str:
         try:
@@ -188,13 +218,21 @@ class AppServerSession:
             raise DeliveryError("initialize_failed", exc.message) from exc
         self.notify("initialized", {})
 
-    def resume_thread(self, thread_id: str) -> None:
+    def resume_thread(self, thread_id: str, expected_workspace: str) -> None:
         result = self.request("thread/resume", {"threadId": thread_id})
         thread = result.get("thread")
         if not isinstance(thread, dict) or thread.get("id") != thread_id:
             raise DeliveryError(
                 "unsupported_response_shape",
                 "thread/resume returned a different or malformed thread",
+            )
+        cwd = thread.get("cwd")
+        if not isinstance(cwd, str) or cwd != expected_workspace:
+            # Fail closed: a thread from another workspace/CODEX_HOME must
+            # never receive this event.
+            raise DeliveryError(
+                "binding_mismatch",
+                "thread cwd does not match the bound workspace",
             )
 
     def start_turn(self, thread_id: str, wake_text: str) -> str:
@@ -214,6 +252,71 @@ class AppServerSession:
         if isinstance(turn.get("error"), dict):
             raise DeliveryError("server_error", "turn/start reported a turn error")
         return str(turn["id"])
+
+    def _notification_turn_id(self, params: object) -> str | None:
+        if isinstance(params, dict):
+            turn = params.get("turn")
+            if isinstance(turn, dict) and isinstance(turn.get("id"), str):
+                return str(turn["id"])
+            raw = params.get("turnId")
+            if isinstance(raw, str):
+                return raw
+        return None
+
+    def wait_turn_completion(
+        self,
+        turn_id: str,
+        timeout_seconds: float,
+        on_tick: "callable | None" = None,
+    ) -> str:
+        """Read notifications until the target turn reaches a terminal state.
+
+        Returns the turn status (for ``turn/completed`` normally
+        ``"completed"``). Raises ``turn_completion_timeout`` when the turn
+        does not finish within the budget; the event then stays undelivered
+        (retryable) instead of being acknowledged blindly.
+        """
+        deadline = time.monotonic() + timeout_seconds
+        tick_deadline = time.monotonic() + min(5.0, max(0.05, timeout_seconds / 10))
+        while True:
+            now = time.monotonic()
+            if now >= deadline:
+                raise DeliveryError(
+                    "turn_completion_timeout",
+                    f"turn {turn_id} did not complete within {timeout_seconds}s",
+                )
+            message = self._read_line(min(deadline, now + 1.0))
+            if message is None:
+                if on_tick is not None and time.monotonic() >= tick_deadline:
+                    on_tick()
+                    tick_deadline = time.monotonic() + min(
+                        5.0, max(0.05, timeout_seconds / 10)
+                    )
+                continue
+            if "id" in message:
+                continue  # stray response; no requests are pending
+            method = message.get("method")
+            if not isinstance(method, str):
+                continue
+            if method == "turn/completed":
+                if self._notification_turn_id(message.get("params")) in (turn_id, None):
+                    params = message.get("params")
+                    turn = params.get("turn") if isinstance(params, dict) else {}
+                    status = turn.get("status") if isinstance(turn, dict) else None
+                    return str(status or "completed")
+                continue
+            if method in {"turn/failed", "turn/aborted"}:
+                if self._notification_turn_id(message.get("params")) in (turn_id, None):
+                    raise DeliveryError(
+                        "turn_failed" if method == "turn/failed" else "turn_aborted",
+                        f"wake turn ended via {method}",
+                    )
+                continue
+            if on_tick is not None and time.monotonic() >= tick_deadline:
+                on_tick()
+                tick_deadline = time.monotonic() + min(
+                    5.0, max(0.05, timeout_seconds / 10)
+                )
 
     def close(self) -> None:
         try:
@@ -252,10 +355,20 @@ def _classify_server_error(
     return DeliveryError("server_error", f"{method} failed: {detail}")
 
 
+def spawn_env(config: Dict[str, Any]) -> Dict[str, str]:
+    """Environment pinning the App Server to the configured CODEX_HOME."""
+    return {"CODEX_HOME": str(Path(config["codex_home"]).expanduser())}
+
+
 def attempt_delivery(
     config: Dict[str, Any], event: Dict[str, Any]
-) -> Tuple[str, str]:
-    """Deliver one wake event into its bound thread; returns (turn_id, wake)."""
+) -> Tuple[str, str, str]:
+    """Deliver one wake event into its bound thread and wait for completion.
+
+    Returns ``(turn_id, turn_status, wake_text)``. The session stays open
+    until ``turn/completed`` so the wake turn is not aborted mid-postflight,
+    and the delivery lease is renewed at every stage and during the wait.
+    """
     binding = event["binding"]
     if binding["workspace"] != config["workspace"]:
         raise DeliveryError(
@@ -264,13 +377,36 @@ def attempt_delivery(
         )
     wake_text = se.wake_message(event)
     session = AppServerSession(
-        config["transport"]["command"], float(config["request_timeout_seconds"])
+        config["transport"]["command"],
+        float(config["request_timeout_seconds"]),
+        env=spawn_env(config),
     )
+
+    def renew() -> None:
+        try:
+            se.renew_event(
+                se.outbox_root(Path(_DELIVERY_STATE_DIR[0])),
+                event["event_id"],
+                owner=_DELIVERY_OWNER[0],
+                lease_seconds=float(config["lease_seconds"]),
+                now=datetime.now(timezone.utc),
+            )
+        except se.SemanticEventError:
+            pass  # fail closed later at ack time if the lease was lost
+
     try:
         session.initialize()
-        session.resume_thread(binding["thread_id"])
+        renew()
+        session.resume_thread(binding["thread_id"], binding["workspace"])
+        renew()
         turn_id = session.start_turn(binding["thread_id"], wake_text)
-        return turn_id, wake_text
+        renew()
+        turn_status = session.wait_turn_completion(
+            turn_id,
+            float(config["turn_completion_timeout_seconds"]),
+            on_tick=renew,
+        )
+        return turn_id, turn_status, wake_text
     finally:
         session.close()
 
@@ -352,13 +488,16 @@ def deliver_loop(args: argparse.Namespace) -> int:
             continue
         event, _delivery = claimed
         held_event = event
+        _DELIVERY_STATE_DIR[0] = str(Path(args.state_dir))
+        _DELIVERY_OWNER[0] = owner
         record: Dict[str, Any] = {
             "schema_version": f"{BRIDGE_PREFIX}.delivery/v1",
             "event_id": event["event_id"],
             "event": event["event"],
         }
         try:
-            turn_id, _wake = attempt_delivery(config, event)
+            turn_id, turn_status, _wake = attempt_delivery(config, event)
+            # Acknowledge only after the turn reached an interpretable state.
             ack = se.acknowledge_event(
                 outbox,
                 event["event_id"],
@@ -366,9 +505,10 @@ def deliver_loop(args: argparse.Namespace) -> int:
                 now=utc_now(),
                 thread_id=event["binding"]["thread_id"],
                 turn_id=turn_id,
+                turn_status=turn_status,
             )
             delivered += 1
-            record.update({"state": ack, "turn_id": turn_id})
+            record.update({"state": ack, "turn_id": turn_id, "turn_status": turn_status})
         except DeliveryError as exc:
             outcome = se.record_delivery_failure(
                 outbox,
@@ -439,11 +579,13 @@ def status_command(args: argparse.Namespace) -> int:
 
 
 def init_config_command(args: argparse.Namespace) -> int:
+    codex_home = str(Path(args.codex_home).expanduser().resolve(strict=False))
     config = {
         "schema": se.BRIDGE_CONFIG_SCHEMA,
         "enabled": args.enabled,
         "instance_id": args.instance_id,
-        "codex_home_id": se.codex_home_digest(Path(args.codex_home)),
+        "codex_home": codex_home,
+        "codex_home_id": se.codex_home_digest(Path(codex_home)),
         "workspace": str(Path(args.workspace).resolve(strict=False)),
         "transport": {"type": "stdio", "command": args.command},
         "request_timeout_seconds": args.request_timeout_seconds,
@@ -452,6 +594,7 @@ def init_config_command(args: argparse.Namespace) -> int:
         "max_attempts": args.max_attempts,
         "backoff_initial_seconds": args.backoff_initial_seconds,
         "backoff_max_seconds": args.backoff_max_seconds,
+        "turn_completion_timeout_seconds": args.turn_completion_timeout_seconds,
     }
     se.validate_bridge_config(config)
     path = Path(args.output)
@@ -535,6 +678,9 @@ def parser() -> argparse.ArgumentParser:
     init_config.add_argument("--max-attempts", type=positive_int, default=16)
     init_config.add_argument("--backoff-initial-seconds", type=positive_float, default=5.0)
     init_config.add_argument("--backoff-max-seconds", type=positive_float, default=3600.0)
+    init_config.add_argument(
+        "--turn-completion-timeout-seconds", type=positive_float, default=3600.0
+    )
     init_config.set_defaults(func=init_config_command)
 
     init_binding = sub.add_parser("init-binding", help="write a validated binding file")

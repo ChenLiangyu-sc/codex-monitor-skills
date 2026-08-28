@@ -56,12 +56,19 @@ The HPC skill is the specialized Slurm backend. The general long-task skill rout
 `unattended` is the default and needs no configuration. The
 **experimental** event bridge is opt-in: each monitor started with
 `--event-binding` publishes one durable semantic event into a local outbox
-after a verified terminal record, and a delivery daemon you run separately
-resumes the exact bound Codex thread and starts one wake turn using only
-the stable `initialize`, `thread/resume`, and `turn/start` App Server
-methods over stdio. Delivery is at-least-once with leases, exponential
-backoff, dead-lettering, and instance isolation; the woken turn performs an
-idempotent postflight guarded by digest checks.
+after a **verified** terminal record (unverified records wake only as
+`contract_violation`; pending-threshold alerts publish nothing), and a
+delivery daemon you run separately resumes the exact bound Codex thread,
+starts one wake turn, holds the session open until `turn/completed`, and
+only then acknowledges delivery. It uses only the stable `initialize`,
+`thread/resume`, and `turn/start` App Server methods over stdio, pins
+`CODEX_HOME`, and requires the resumed thread's `cwd` to match the bound
+workspace. Delivery is at-least-once (no network-level exactly-once is
+claimed) with leases renewed throughout delivery, exponential backoff,
+dead-lettering, and instance isolation; the woken turn performs an
+idempotent postflight guarded by an atomic begin/complete claim plus digest
+checks. If a supervisor dies between the terminal record and the event
+publication, any later `status`/`wait` observation reconciles it.
 
 A terminal file can never awaken an inactive Codex turn by itself. The
 bridge is a notification transport only — never terminal authority — and
@@ -269,12 +276,17 @@ python3 -m unittest discover -s codex-hpc-monitor/scripts -p 'test_*.py'
 python3 -m unittest discover -s codex-long-task-monitor/scripts -p 'test_*.py'
 ```
 
-Current baseline: **261 tests passing** (146 HPC monitor tests and 115
-long-task monitor tests), including the outbox, App Server fake, postflight
-guard, doctor, vendored-copy synchronization, and per-skill start-to-wake
-end-to-end suites. No credentials or network access are required; live App
-Server end-to-end tests remain an explicit opt-in outside the default
-suite.
+Current baseline after the first independent review round: **307 tests
+passing** (171 HPC monitor tests and 136 long-task monitor tests),
+including the outbox, App Server fake, postflight claim, doctor,
+vendored-copy synchronization, and per-skill start-to-wake suites. The
+"end-to-end" suites use a deterministic fake App Server: they verify the
+full local chain (start with binding -> verified terminal -> outbox ->
+delivery daemon -> fixed wake template -> awaited turn/completed ->
+idempotent postflight claim) but **not** a real Codex App Server or a real
+model turn. No credentials or network access are required; live App Server
+end-to-end tests remain an explicit opt-in outside the default suite and
+have not been run yet.
 
 ## Contributing
 

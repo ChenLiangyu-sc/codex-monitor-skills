@@ -28,6 +28,7 @@ import semantic_events
 FAKE_APP_SERVER_OK = r'''#!/usr/bin/env python3
 import json, os, sys
 LOG = os.environ["FAKE_LOG"]
+CWD = os.environ.get("FAKE_THREAD_CWD", "/default/workspace")
 def send(obj):
     sys.stdout.write(json.dumps(obj) + "\n")
     sys.stdout.flush()
@@ -41,11 +42,12 @@ for raw in sys.stdin:
     if method == "initialize":
         send({"id": mid, "result": {"userInfo": {"id": "u"}}})
     elif method == "thread/resume":
-        send({"id": mid, "result": {"thread": {"id": message["params"]["threadId"]}}})
+        send({"id": mid, "result": {"thread": {"id": message["params"]["threadId"], "cwd": CWD}}})
     elif method == "turn/start":
         with open(LOG, "a", encoding="utf-8") as handle:
             handle.write(message["params"]["input"][0]["text"] + "\n===\n")
         send({"id": mid, "result": {"turn": {"id": "turn_chain_1", "status": "inProgress", "error": None}}})
+        send({"method": "turn/completed", "params": {"turn": {"id": "turn_chain_1", "status": "completed"}}})
 '''
 
 
@@ -485,7 +487,7 @@ class SupervisorTest(unittest.TestCase):
     def write_binding(self) -> Path:
         binding = {
             "schema": "codex-monitor.event-binding/v1",
-            "codex_home_id": "sha256:" + "a" * 64,
+            "codex_home_id": semantic_events.codex_home_digest(self.root / ".codex"),
             "app_server_instance": "workstation-1",
             "thread_id": "thr_test_1",
             "workspace": str(self.root),
@@ -500,7 +502,8 @@ class SupervisorTest(unittest.TestCase):
             "schema": "codex-monitor.bridge-config/v1",
             "enabled": True,
             "instance_id": instance,
-            "codex_home_id": "sha256:" + "a" * 64,
+            "codex_home": str(self.root / ".codex"),
+            "codex_home_id": semantic_events.codex_home_digest(self.root / ".codex"),
             "workspace": str(self.root),
             "transport": {"type": "stdio", "command": ["codex", "app-server"]},
             "request_timeout_seconds": 30,
@@ -509,6 +512,7 @@ class SupervisorTest(unittest.TestCase):
             "max_attempts": 16,
             "backoff_initial_seconds": 5,
             "backoff_max_seconds": 3600,
+            "turn_completion_timeout_seconds": 3600,
         }
         path = self.root / "bridge.json"
         path.write_text(json.dumps(config), encoding="utf-8")
@@ -518,6 +522,18 @@ class SupervisorTest(unittest.TestCase):
     def outbox(self):
         return semantic_events.outbox_root(self.state)
 
+    def wait_run_file(self, run: Path, name: str, timeout: float = 8.0) -> Path:
+        deadline = time.monotonic() + timeout
+        path = run / name
+        while time.monotonic() < deadline:
+            if path.exists():
+                return path
+            # status observations trigger the reconciler, closing any crash
+            # window between terminal and event publication.
+            self.run_cli("status")
+            time.sleep(0.05)
+        self.fail(f"{name} was not published for {run}")
+
     def test_terminal_publishes_one_semantic_event_with_binding(self) -> None:
         binding = self.write_binding()
         result, _ = self.run_cli(
@@ -526,9 +542,10 @@ class SupervisorTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         payload = self.wait_state("terminal")
         run = Path(payload["run_dir"])
-        published = json.loads((run / "semantic_event.json").read_text())
+        published = json.loads(self.wait_run_file(run, "semantic_event.json").read_text())
         self.assertEqual(published["event"], "transport_success")
-        self.assertEqual(published["state"], "published")
+        # Either the supervisor or a reconciling observer published first.
+        self.assertIn(published["state"], {"published", "duplicate"})
         entries = semantic_events.list_outbox(self.outbox())
         self.assertEqual(len(entries), 1)
         self.assertEqual(entries[0]["state"], "pending")
@@ -547,7 +564,7 @@ class SupervisorTest(unittest.TestCase):
         )
         payload = self.wait_state("terminal")
         run = Path(payload["run_dir"])
-        published = json.loads((run / "semantic_event.json").read_text())
+        published = json.loads(self.wait_run_file(run, "semantic_event.json").read_text())
         self.assertEqual(published["event"], "transport_failure")
         event = semantic_events.read_event(self.outbox(), published["event_id"])
         self.assertEqual(event["exit_code"], 3)
@@ -686,7 +703,7 @@ class SupervisorTest(unittest.TestCase):
         semantic_events.claim_next_event(self.outbox(), owner="t", lease_seconds=600, now=settle)
         semantic_events.acknowledge_event(
             self.outbox(), event["event_id"], owner="t", now=settle,
-            thread_id="thr", turn_id="turn",
+            thread_id="thr", turn_id="turn", turn_status="completed",
         )
         dry = subprocess.run(
             [sys.executable, str(SCRIPT), "cleanup", "--state-dir", str(self.state),
@@ -716,6 +733,7 @@ class SupervisorTest(unittest.TestCase):
         config["transport"]["command"] = [sys.executable, str(fake_server)]
         config_path = self.write_bridge_config()
         config_path.write_text(json.dumps(config))
+        config_path.chmod(0o600)
         binding_path = self.write_binding()
 
         result, _ = self.run_cli(
@@ -727,7 +745,7 @@ class SupervisorTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         payload = self.wait_state("terminal")
         run = Path(payload["run_dir"])
-        published = json.loads((run / "semantic_event.json").read_text())
+        published = json.loads(self.wait_run_file(run, "semantic_event.json").read_text())
         event_id = published["event_id"]
 
         delivered = subprocess.run(
@@ -735,9 +753,17 @@ class SupervisorTest(unittest.TestCase):
              "--state-dir", str(self.state), "--bridge-config", str(config_path),
              "--once"],
             text=True, capture_output=True, check=False,
-            env={**os.environ, "FAKE_LOG": str(wake_log)}, timeout=30,
+            env={
+                **os.environ,
+                "FAKE_LOG": str(wake_log),
+                "FAKE_THREAD_CWD": str(self.root),
+            },
+            timeout=30,
         )
         self.assertEqual(delivered.returncode, 0, delivered.stdout + delivered.stderr)
+        records = [json.loads(line) for line in delivered.stdout.splitlines() if line.strip()]
+        self.assertEqual(records[0]["state"], "acknowledged", records)
+        self.assertEqual(records[0]["turn_status"], "completed")
         wake = wake_log.read_text()
         self.assertIn(f"event_id={event_id}", wake)
         self.assertIn("backend=slurm", wake)
@@ -764,6 +790,75 @@ class SupervisorTest(unittest.TestCase):
             text=True, capture_output=True, check=False, timeout=10,
         )
         self.assertEqual(duplicate.returncode, 3)
+
+    def test_unverified_result_never_publishes_success(self) -> None:
+        binding = self.write_binding()
+        # Watcher exits 0 but leaves no result file: the terminal exists yet
+        # its watcher result is unverified. A success event must never be
+        # published; the observation problem is surfaced as contract_violation.
+        result, _ = self.run_cli(
+            "start",
+            "--event-binding", str(binding),
+            env={"FAKE_EXIT": "0", "FAKE_WRITE_RESULT": "0"},
+        )
+        self.assertEqual(result.returncode, 0)
+        payload = self.wait_state("terminal")
+        self.assertFalse(payload["terminal"]["watcher_result"]["verified"])
+        run = Path(payload["run_dir"])
+        published = json.loads(self.wait_run_file(run, "semantic_event.json").read_text())
+        self.assertEqual(published["event"], "contract_violation")
+        event = semantic_events.read_event(self.outbox(), published["event_id"])
+        self.assertEqual(event["event"], "contract_violation")
+        self.assertEqual(event["exit_code"], 0)
+
+    def test_pending_alert_publishes_no_semantic_event(self) -> None:
+        binding = self.write_binding()
+        result, _ = self.run_cli(
+            "start",
+            "--event-binding", str(binding),
+            env={"FAKE_EXIT": "4", "FAKE_EVENT": "pending_alert"},
+        )
+        self.assertEqual(result.returncode, 0)
+        payload = self.wait_state("terminal")
+        run = Path(payload["run_dir"])
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            self.run_cli("status")
+            time.sleep(0.05)
+        # A queue-wait alert is not a monitoring deadline: no wake event.
+        self.assertFalse((run / "semantic_event.json").exists())
+        self.assertEqual(semantic_events.list_outbox(self.outbox()), [])
+
+    def test_event_intent_is_written_at_start(self) -> None:
+        binding = self.write_binding()
+        self.run_cli("start", "--event-binding", str(binding),
+                     env={"FAKE_WATCH_SECONDS": "20"})
+        payload = self.status()
+        run = Path(payload["run_dir"])
+        intent = json.loads((run / "event_intent.json").read_text())
+        self.assertEqual(intent["event_backend"], "slurm")
+        self.assertEqual(intent["binding_instance"], "workstation-1")
+        self.assertEqual(intent["job_id"], "12345")
+
+    def test_crash_window_between_terminal_and_event_is_reconciled(self) -> None:
+        binding = self.write_binding()
+        self.run_cli("start", "--event-binding", str(binding), env={"FAKE_EXIT": "0"})
+        payload = self.wait_state("terminal")
+        run = Path(payload["run_dir"])
+        published = json.loads(self.wait_run_file(run, "semantic_event.json").read_text())
+        event_id = published["event_id"]
+        # Simulate the supervisor dying between terminal and event publish:
+        # remove the event markers and the outbox copy.
+        (run / "semantic_event.json").unlink()
+        import shutil as _shutil
+        _shutil.rmtree(semantic_events.event_dir(self.outbox(), event_id))
+        self.assertEqual(semantic_events.list_outbox(self.outbox()), [])
+        # A later status observation reconciles the lost publication.
+        self.run_cli("status")
+        repaired = json.loads((run / "semantic_event.json").read_text())
+        self.assertEqual(repaired["state"], "published")
+        entries = semantic_events.list_outbox(self.outbox())
+        self.assertEqual(len(entries), 1)
 
 
 if __name__ == "__main__":

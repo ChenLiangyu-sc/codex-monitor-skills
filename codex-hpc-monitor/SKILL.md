@@ -34,13 +34,15 @@ exists. A terminal file cannot awaken an inactive Codex turn by itself.
 When a monitor is started with `--event-binding`, each verified terminal
 record additionally publishes one durable semantic event into the local
 outbox; a foreground delivery daemon you run separately resumes the bound
-thread and starts exactly one wake turn. The woken turn must run
-`scripts/postflight_guard.py check` before any side effects and `mark` after
-verifying the terminal digest.
+thread, starts exactly one wake turn, and holds the App Server session
+open until that turn completes. The woken turn must verify the terminal
+digest, atomically claim the postflight with `scripts/postflight_guard.py
+begin`, perform its side effects once, then `complete` the claim; an
+unverified terminal record wakes the thread only as `contract_violation`.
 
 ## Apply the authority boundary
 
-Read `/share/cv/data/liangyu.chen/skills/hpc-train/SKILL.md` completely before issuing any HPC command. Read its debugging reference only after a failure, anomalous state, or prolonged pending result.
+Read the companion `hpc-train` skill's `SKILL.md` (resolved from your skill installation, not a hard-coded path) completely before issuing any HPC command. Read its debugging reference only after a failure, anomalous state, or prolonged pending result.
 
 Use this skill only after a job has already been submitted under separate authority. Perform only read-only `squeue` and `sacct` queries. Never submit, retry, cancel, reprioritize, edit files, inspect training outputs, or access protected content through this skill.
 

@@ -230,6 +230,7 @@ def validate_bridge_config(value: object) -> Dict[str, Any]:
         "schema",
         "enabled",
         "instance_id",
+        "codex_home",
         "codex_home_id",
         "workspace",
         "transport",
@@ -239,6 +240,7 @@ def validate_bridge_config(value: object) -> Dict[str, Any]:
         "max_attempts",
         "backoff_initial_seconds",
         "backoff_max_seconds",
+        "turn_completion_timeout_seconds",
     }
     if set(value) != expected:
         missing = sorted(expected - set(value))
@@ -255,10 +257,21 @@ def validate_bridge_config(value: object) -> Dict[str, Any]:
         value["instance_id"]
     ):
         raise SemanticEventError("config_instance_id_invalid")
+    codex_home = value["codex_home"]
+    if (
+        not isinstance(codex_home, str)
+        or not codex_home.startswith("/")
+        or len(codex_home) > 4096
+    ):
+        raise SemanticEventError("config_codex_home_invalid")
     if not isinstance(value["codex_home_id"], str) or not SHA256_PREFIX_RE.fullmatch(
         value["codex_home_id"]
     ):
         raise SemanticEventError("config_codex_home_id_invalid")
+    # The recorded digest must match the recorded path so a daemon cannot
+    # spawn an App Server under a different CODEX_HOME than the one bound.
+    if codex_home_digest(Path(codex_home)) != value["codex_home_id"]:
+        raise SemanticEventError("config_codex_home_mismatch")
     if not isinstance(value["workspace"], str) or not value["workspace"].startswith(
         "/"
     ):
@@ -292,9 +305,18 @@ def validate_bridge_config(value: object) -> Dict[str, Any]:
             )
         return number
 
-    positive_number("request_timeout_seconds", 0.0, 600.0)
+    request_timeout = positive_number("request_timeout_seconds", 0.0, 600.0)
     positive_number("poll_seconds", 0.0, 3600.0)
-    positive_number("lease_seconds", 0.0, 86400.0)
+    lease = positive_number("lease_seconds", 0.0, 86400.0)
+    positive_number("turn_completion_timeout_seconds", 0.0, 86400.0)
+    # A delivery performs up to three requests plus a bounded turn wait; a
+    # lease shorter than the request budget cannot be made safe even with
+    # renewal, so reject it up front.
+    if lease < 2 * request_timeout:
+        raise SemanticEventError(
+            "config_lease_too_short",
+            "lease_seconds must be at least twice request_timeout_seconds",
+        )
     attempts = value["max_attempts"]
     if isinstance(attempts, bool) or not isinstance(attempts, int) or not (
         1 <= attempts <= 1000
@@ -523,9 +545,29 @@ def outbox_root(state_dir: Path) -> Path:
 
 
 def event_dir(outbox: Path, event_id: str) -> Path:
+    """Directory for one event id.
+
+    The id must be a full ``sha256:<64 lowercase hex>`` digest; anything else
+    (including traversal payloads such as ``sha256:../../victim``) is
+    rejected before it can become a path component.
+    """
     if not isinstance(event_id, str) or not event_id.startswith("sha256:"):
         raise SemanticEventError("event_id_invalid")
-    return outbox / event_id[len("sha256:"):]
+    hex_part = event_id[len("sha256:"):]
+    if not HEX64_RE.fullmatch(hex_part):
+        raise SemanticEventError("event_id_invalid")
+    return outbox / hex_part
+
+
+def _real_outbox_child(child: Path) -> bool:
+    """True only for a real (non-symlink) directory with a digest name."""
+    if not HEX64_RE.fullmatch(child.name):
+        return False
+    try:
+        info = child.lstat()
+    except OSError:
+        return False
+    return stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode)
 
 
 def _initial_delivery(now: Optional[str]) -> Dict[str, Any]:
@@ -538,6 +580,7 @@ def _initial_delivery(now: Optional[str]) -> Dict[str, Any]:
         "finished_at": None,
         "lease": {"owner": None, "expires_at": None},
         "delivery": {"thread_id": None, "turn_id": None, "delivered_at": None},
+        "turn_status": None,
         "last_error": {"code": None, "safe_message": None},
     }
 
@@ -554,6 +597,7 @@ def _validate_delivery(value: object, event_id: str) -> Dict[str, Any]:
         "finished_at",
         "lease",
         "delivery",
+        "turn_status",
         "last_error",
     }
     if set(value) != expected:
@@ -575,7 +619,12 @@ def _validate_delivery(value: object, event_id: str) -> Dict[str, Any]:
     ):
         if stamp is not None and parse_utc(stamp) is None:
             raise SemanticEventError("delivery_timestamp_invalid")
-    for text in (value["lease"]["owner"], value["delivery"]["thread_id"], value["delivery"]["turn_id"]):
+    for text in (
+        value["lease"]["owner"],
+        value["delivery"]["thread_id"],
+        value["delivery"]["turn_id"],
+        value["turn_status"],
+    ):
         if text is not None and not isinstance(text, str):
             raise SemanticEventError("delivery_field_invalid")
     error = value["last_error"]
@@ -706,7 +755,7 @@ def claim_next_event(
         raise SemanticEventError("owner_invalid")
     with _OutboxLock(outbox):
         for child in sorted(outbox.iterdir()):
-            if not child.is_dir() or child.name.startswith("."):
+            if not _real_outbox_child(child):
                 continue
             try:
                 event = validate_event(
@@ -765,9 +814,19 @@ def acknowledge_event(
     now: datetime,
     thread_id: str,
     turn_id: str,
+    turn_status: str,
 ) -> str:
-    """Mark delivered with the returned turn id, idempotently."""
-    for value, name in ((thread_id, "thread_id"), (turn_id, "turn_id")):
+    """Mark delivered with the returned turn id and its completion status.
+
+    The caller must only acknowledge after the wake turn reached an
+    interpretable terminal state (turn/completed), never right after
+    turn/start was accepted.
+    """
+    for value, name in (
+        (thread_id, "thread_id"),
+        (turn_id, "turn_id"),
+        (turn_status, "turn_status"),
+    ):
         if not isinstance(value, str) or not value:
             raise SemanticEventError(f"{name}_invalid")
     with _OutboxLock(outbox):
@@ -786,6 +845,7 @@ def acknowledge_event(
             "turn_id": turn_id,
             "delivered_at": stamp,
         }
+        delivery["turn_status"] = turn_status
         _write_delivery(dir_path, delivery)
     return "acknowledged"
 
@@ -876,13 +936,35 @@ def release_event(outbox: Path, event_id: str, *, owner: str) -> str:
     return "released"
 
 
+def renew_event(
+    outbox: Path, event_id: str, *, owner: str, lease_seconds: float, now: datetime
+) -> str:
+    """Extend the delivery lease while its owner is still actively delivering.
+
+    Returns ``renewed`` or fail-closed ``not_leased``/``lease_not_held``;
+    an owner that lost its lease must never be able to ack afterwards.
+    """
+    with _OutboxLock(outbox):
+        dir_path, delivery = _load_for_mutation(outbox, event_id, owner)
+        if delivery["state"] != "leased":
+            return "not_leased"
+        delivery["lease"] = {
+            "owner": owner,
+            "expires_at": (
+                now + timedelta(seconds=lease_seconds)
+            ).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+        }
+        _write_delivery(dir_path, delivery)
+    return "renewed"
+
+
 def list_outbox(outbox: Path) -> List[Dict[str, Any]]:
     """Safe summary of outbox entries for inspection commands."""
     entries: List[Dict[str, Any]] = []
     if not outbox.exists():
         return entries
     for child in sorted(outbox.iterdir()):
-        if not child.is_dir() or child.name.startswith("."):
+        if not _real_outbox_child(child):
             continue
         try:
             event = validate_event(
@@ -931,7 +1013,7 @@ def cleanup_outbox(
         return removed
     with _OutboxLock(outbox):
         for child in sorted(outbox.iterdir()):
-            if not child.is_dir() or child.name.startswith("."):
+            if not _real_outbox_child(child):
                 continue
             try:
                 delivery = _read_delivery(child, f"sha256:{child.name}")
@@ -977,30 +1059,144 @@ def postflight_path(state_dir: Path, event_id: str) -> Path:
     return Path(state_dir) / "postflight" / hex_part
 
 
-def postflight_check(state_dir: Path, event_id: str) -> Dict[str, Any]:
-    path = postflight_path(state_dir, event_id)
-    record = read_json_if_present(path, MAX_POSTFLIGHT_BYTES)
+def _postflight_lock(state_dir: Path) -> Path:
+    directory = Path(state_dir) / "postflight"
+    ensure_private_directory(directory)
+    return directory / ".begin.lock"
+
+
+def _postflight_validate_record(record: Dict[str, Any], event_id: str) -> Dict[str, Any]:
+    if not isinstance(record, dict) or record.get("event_id") != event_id:
+        raise SemanticEventError("postflight_record_invalid")
+    state = record.get("state", "completed")  # legacy markers are completions
+    if state not in {"in_progress", "completed"}:
+        raise SemanticEventError("postflight_record_invalid")
+    digest = record.get("terminal_digest")
+    if not isinstance(digest, str) or not SHA256_PREFIX_RE.fullmatch(digest):
+        raise SemanticEventError("postflight_record_invalid")
+    if state == "in_progress" and not isinstance(record.get("owner"), str):
+        raise SemanticEventError("postflight_record_invalid")
+    return record
+
+
+def _postflight_read(state_dir: Path, event_id: str) -> Optional[Dict[str, Any]]:
+    record = read_json_if_present(postflight_path(state_dir, event_id), MAX_POSTFLIGHT_BYTES)
     if record is None:
-        return {"event_id": event_id, "processed": False, "record": None}
-    if (
-        record.get("schema") != POSTFLIGHT_SCHEMA
-        or record.get("event_id") != event_id
-        or not isinstance(record.get("terminal_digest"), str)
-        or not SHA256_PREFIX_RE.fullmatch(record["terminal_digest"])
+        return None
+    return _postflight_validate_record(record, event_id)
+
+
+def postflight_check(state_dir: Path, event_id: str) -> Dict[str, Any]:
+    record = _postflight_read(state_dir, event_id)
+    if record is None:
+        return {"event_id": event_id, "processed": False, "state": None, "record": None}
+    return {
+        "event_id": event_id,
+        "processed": record.get("state", "completed") == "completed",
+        "state": record.get("state", "completed"),
+        "record": record,
+    }
+
+
+def postflight_begin(
+    state_dir: Path,
+    event_id: str,
+    *,
+    terminal_digest: str,
+    owner: str,
+    now: Optional[str] = None,
+) -> str:
+    """Atomically claim the postflight for one event (none -> in_progress).
+
+    This closes the check-then-act race: two concurrent wake turns cannot
+    both pass the claim. Outcomes:
+
+    - ``begun``: caller owns the postflight and may perform side effects;
+    - ``already_in_progress``: another turn holds the claim and its result
+      is unknown; fail closed, never auto-take-over (human ``reset`` only);
+    - ``already_completed``: idempotent duplicate, no new side effects;
+    - ``digest_conflict``: the marker exists against different evidence.
+    """
+    if not isinstance(terminal_digest, str) or not SHA256_PREFIX_RE.fullmatch(
+        terminal_digest
     ):
-        raise SemanticEventError("postflight_record_invalid", str(path))
-    return {"event_id": event_id, "processed": True, "record": record}
+        raise SemanticEventError("terminal_digest_invalid")
+    if not isinstance(owner, str) or not owner:
+        raise SemanticEventError("owner_invalid")
+    path = postflight_path(state_dir, event_id)
+    record = {
+        "schema": POSTFLIGHT_SCHEMA,
+        "event_id": event_id,
+        "terminal_digest": terminal_digest,
+        "state": "in_progress",
+        "owner": owner,
+        "started_at": now or utc_now(),
+        "completed_at": None,
+    }
+    with open(_postflight_lock(state_dir), "a+") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        existing = _postflight_read(state_dir, event_id)
+        if existing is not None:
+            if existing["terminal_digest"] != terminal_digest:
+                return "digest_conflict"
+            if existing.get("state", "completed") == "completed":
+                return "already_completed"
+            return "already_in_progress"
+        ensure_private_directory(path.parent)
+        publish_json_no_replace(path, record)
+    return "begun"
+
+
+def postflight_complete(
+    state_dir: Path, event_id: str, *, owner: str, now: Optional[str] = None
+) -> str:
+    """Record the postflight as completed (in_progress -> completed).
+
+    Only the claiming owner may complete; an unknown result is never
+    silently taken over by another turn.
+    """
+    path = postflight_path(state_dir, event_id)
+    with open(_postflight_lock(state_dir), "a+") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        record = _postflight_read(state_dir, event_id)
+        if record is None:
+            return "not_begun"
+        if record.get("state", "completed") == "completed":
+            return "already_completed"
+        if record.get("owner") != owner:
+            return "not_owner"
+        completed = {
+            **record,
+            "state": "completed",
+            "completed_at": now or utc_now(),
+        }
+        atomic_replace_json(path, completed)
+    return "completed"
+
+
+def postflight_reset(state_dir: Path, event_id: str, *, confirm: bool) -> str:
+    """Human-only recovery for a stuck in_progress claim.
+
+    Never invoked automatically: an unknown postflight result must fail
+    closed until a person explicitly decides to reset the marker.
+    """
+    if not confirm:
+        return "confirmation_required"
+    path = postflight_path(state_dir, event_id)
+    record = _postflight_read(state_dir, event_id)
+    if record is None:
+        return "not_begun"
+    path.unlink()
+    return "reset"
 
 
 def postflight_mark(
     state_dir: Path, event_id: str, *, terminal_digest: str, now: Optional[str] = None
 ) -> str:
-    """Record that one event's postflight side effects have been performed.
+    """Record a completed postflight in one atomic step (no side-effect window).
 
-    Returns ``marked`` on first call, ``already_marked`` when the identical
-    marker exists (idempotent duplicate wake), and ``digest_conflict`` when
-    the same event id was already marked against different terminal evidence
-    (fail closed; the caller must not perform side effects).
+    Convenience for postflights that are themselves single atomic actions;
+    the general protocol is begin -> perform -> complete.
     """
     if not isinstance(terminal_digest, str) or not SHA256_PREFIX_RE.fullmatch(
         terminal_digest
@@ -1010,15 +1206,21 @@ def postflight_mark(
         "schema": POSTFLIGHT_SCHEMA,
         "event_id": event_id,
         "terminal_digest": terminal_digest,
-        "marked_at": now or utc_now(),
+        "state": "completed",
+        "owner": None,
+        "started_at": now or utc_now(),
+        "completed_at": now or utc_now(),
     }
     path = postflight_path(state_dir, event_id)
-    ensure_private_directory(path.parent)
-    try:
+    with open(_postflight_lock(state_dir), "a+") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        existing = _postflight_read(state_dir, event_id)
+        if existing is not None:
+            if existing["terminal_digest"] != terminal_digest:
+                return "digest_conflict"
+            if existing.get("state", "completed") == "completed":
+                return "already_marked"
+            return "already_in_progress"
+        ensure_private_directory(path.parent)
         publish_json_no_replace(path, record)
-        return "marked"
-    except FileExistsError:
-        existing = read_regular_json(path, MAX_POSTFLIGHT_BYTES)
-        if existing.get("terminal_digest") == terminal_digest:
-            return "already_marked"
-        return "digest_conflict"
+    return "marked"
