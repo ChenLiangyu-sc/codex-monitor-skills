@@ -24,6 +24,7 @@ SPEC = importlib.util.spec_from_file_location("supervise_artifact", SCRIPT)
 assert SPEC and SPEC.loader
 SUPERVISOR = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(SUPERVISOR)
+import semantic_events
 
 
 class ArtifactSupervisorTests(unittest.TestCase):
@@ -417,6 +418,68 @@ class ArtifactSupervisorTests(unittest.TestCase):
         result, refused = self.start("--restart")
         self.assertEqual(result.returncode, 12)
         self.assertIn("observation window expired", refused["detail"])
+    def write_binding(self) -> Path:
+        binding = {
+            "schema": "codex-monitor.event-binding/v1",
+            "codex_home_id": "sha256:" + "a" * 64,
+            "app_server_instance": "workstation-1",
+            "thread_id": "thr_test_1",
+            "workspace": str(self.root),
+        }
+        path = self.root / "binding.json"
+        path.write_text(json.dumps(binding), encoding="utf-8")
+        path.chmod(0o600)
+        return path
+
+    def outbox(self) -> Path:
+        return semantic_events.outbox_root(self.state)
+
+    def test_terminal_publishes_one_semantic_event_with_binding(self) -> None:
+        binding = self.write_binding()
+        self.write_artifact()
+        result, started = self.start("--event-binding", str(binding))
+        self.assertEqual(result.returncode, 0)
+        handle = started["task_handle"]
+        terminal = self.wait_terminal(handle)
+        run = Path(terminal["run_dir"])
+        published = json.loads((run / "semantic_event.json").read_text())
+        self.assertEqual(published["event"], "transport_success")
+        entries = semantic_events.list_outbox(self.outbox())
+        self.assertEqual(len(entries), 1)
+        event = semantic_events.read_event(self.outbox(), published["event_id"])
+        self.assertEqual(event["monitor"]["backend"], "artifact")
+        self.assertEqual(event["monitor"]["handle"], handle)
+        terminal_sha = hashlib.sha256((run / "terminal.json").read_bytes()).hexdigest()
+        self.assertEqual(event["monitor"]["terminal_digest"], f"sha256:{terminal_sha}")
+
+    def test_failure_artifact_maps_to_transport_failure(self) -> None:
+        binding = self.write_binding()
+        self.write_artifact(status=False)
+        result, started = self.start("--event-binding", str(binding))
+        self.assertEqual(result.returncode, 0)
+        self.wait_terminal(started["task_handle"])
+        entries = semantic_events.list_outbox(self.outbox())
+        self.assertEqual([entry["event"] for entry in entries], ["transport_failure"])
+
+    def test_no_binding_publishes_no_event(self) -> None:
+        self.write_artifact()
+        result, started = self.start()
+        self.assertEqual(result.returncode, 0)
+        terminal = self.wait_terminal(started["task_handle"])
+        run = Path(terminal["run_dir"])
+        self.assertFalse((run / "semantic_event.json").exists())
+        self.assertEqual(semantic_events.list_outbox(self.outbox()), [])
+
+    def test_custom_event_backend_is_recorded(self) -> None:
+        binding = self.write_binding()
+        self.write_artifact()
+        result, started = self.start(
+            "--event-binding", str(binding), "--event-backend", "dispatch"
+        )
+        self.assertEqual(result.returncode, 0)
+        self.wait_terminal(started["task_handle"])
+        entries = semantic_events.list_outbox(self.outbox())
+        self.assertEqual(entries[0]["backend"], "dispatch")
 
 
 def argv_index(argv: list, flag: str) -> int:

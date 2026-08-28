@@ -21,9 +21,28 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
+_SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+import semantic_events
+
+
 JOB_ID_RE = re.compile(r"^[0-9]+(?:_[0-9]+)?$")
 HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 SCHEMA_PREFIX = "codex-hpc-monitor"
+# Watcher exit code -> semantic wake event. Verified scheduler outcomes only;
+# duplicate-watcher, infrastructure failures, signals, and launch failures
+# never publish (they are not scheduler terminal evidence).
+HPC_SEMANTIC_EVENTS = {
+    0: "transport_success",
+    3: "transport_failure",
+    4: "deadline_exceeded",
+    5: "lost_observability",
+    7: "contract_violation",
+    8: "lost_observability",
+    9: "contract_violation",
+    10: "deadline_exceeded",
+}
 WATCHER_EXIT_EVENTS = {
     0: {"completed"},
     3: {"terminal_failure"},
@@ -346,8 +365,92 @@ def previous_contract_digest(run: Optional[Path]) -> Optional[str]:
     return value if isinstance(value, str) else None
 
 
+def resolved_event_binding(args: argparse.Namespace) -> Optional[Dict[str, Any]]:
+    """Load and validate the explicit opt-in wake binding for this monitor.
+
+    Without --event-binding no semantic event is ever published: unattended
+    remains the default and a terminal file alone never creates wake work.
+    When --bridge-config is also given, the binding must agree with the
+    configured instance identity, failing closed on any mismatch.
+    """
+    if args.event_binding is None:
+        return None
+    binding = semantic_events.load_event_binding(Path(args.event_binding))
+    if args.bridge_config is not None:
+        config = semantic_events.load_bridge_config(Path(args.bridge_config))
+        for key, binding_key in (
+            ("instance_id", "app_server_instance"),
+            ("codex_home_id", "codex_home_id"),
+            ("workspace", "workspace"),
+        ):
+            if config[key] != binding[binding_key]:
+                raise ValueError(
+                    f"event binding {binding_key} does not match bridge config"
+                )
+    return binding
+
+
+def publish_semantic_event(
+    run: Path,
+    *,
+    manifest: Dict[str, Any],
+    terminal: Dict[str, Any],
+    watcher_exit_code: Optional[int],
+) -> None:
+    """Best-effort publication of one durable semantic event per terminal.
+
+    Failure never alters or invalidates the terminal record, which remains
+    the sole terminal authority; the outcome is recorded beside the run.
+    """
+    binding = manifest.get("event_binding")
+    if not isinstance(binding, dict):
+        return
+    event_enum = HPC_SEMANTIC_EVENTS.get(
+        watcher_exit_code if watcher_exit_code is not None else -1
+    )
+    if event_enum is None:
+        return
+    try:
+        terminal_digest = f"sha256:{sha256_file(run / 'terminal.json')}"
+        event = semantic_events.build_event(
+            backend="slurm",
+            handle=f"{manifest['host']}-{manifest['job_id']}",
+            generation=run.name,
+            terminal_digest=terminal_digest,
+            event=event_enum,
+            exit_code=watcher_exit_code if isinstance(watcher_exit_code, int) else None,
+            binding=binding,
+        )
+        outcome = semantic_events.publish_event(
+            semantic_events.outbox_root(Path(str(manifest["state_dir"]))), event
+        )
+        publish_json_no_replace(
+            run / "semantic_event.json",
+            {
+                "schema_version": f"{SCHEMA_PREFIX}.semantic-event/v1",
+                "run_id": run.name,
+                "event_id": event["event_id"],
+                "event": event_enum,
+                "state": outcome,
+                "published_at": utc_now(),
+            },
+        )
+    except (OSError, ValueError, semantic_events.SemanticEventError) as exc:
+        replace_json(
+            run / "semantic_event_failure.json",
+            {
+                "schema_version": f"{SCHEMA_PREFIX}.semantic-event/v1",
+                "run_id": run.name,
+                "state": "publish_failed",
+                "reason": getattr(exc, "reason", type(exc).__name__),
+                "observed_at": utc_now(),
+            },
+        )
+
+
 def start_monitor(args: argparse.Namespace) -> int:
     validate_identity(args.job_id, args.host)
+    event_binding = resolved_event_binding(args)
     watcher_input = args.watcher_path.expanduser()
     if watcher_input.is_symlink():
         raise ValueError(f"watcher path must not be a symlink: {watcher_input}")
@@ -405,6 +508,9 @@ def start_monitor(args: argparse.Namespace) -> int:
             "contract": monitoring_contract(args),
             "contract_digest": digest,
         }
+        if event_binding is not None:
+            manifest["event_binding"] = event_binding
+            manifest["event_backend"] = "slurm"
         publish_json_no_replace(run / "manifest.json", manifest)
         manifest_sha = sha256_file(run / "manifest.json")
         replace_json(
@@ -654,6 +760,12 @@ def supervise(args: argparse.Namespace) -> int:
             "contract_digest": manifest.get("contract_digest"),
         }
         publish_json_no_replace(run / "terminal.json", terminal)
+        publish_semantic_event(
+            run,
+            manifest=manifest,
+            terminal=terminal,
+            watcher_exit_code=exit_code,
+        )
         return 0
     except Exception as exc:
         failure = {
@@ -881,6 +993,16 @@ def parser() -> argparse.ArgumentParser:
         "--allow-contract-change",
         action="store_true",
         help="explicitly accept a changed monitoring contract for this host/job",
+    )
+    start.add_argument(
+        "--event-binding",
+        type=Path,
+        help="opt in to semantic wake events with a validated binding file",
+    )
+    start.add_argument(
+        "--bridge-config",
+        type=Path,
+        help="bridge configuration the binding must agree with (optional)",
     )
     start.add_argument("--handshake-seconds", type=positive_float, default=10.0)
     start.set_defaults(func=start_monitor)

@@ -21,6 +21,12 @@ from pathlib import Path
 from typing import Any
 
 
+_SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+import semantic_events
+
+
 SCHEMA_PREFIX = "codex-long-task-monitor.artifact"
 HANDLE_RE = re.compile(r"^artifact_[0-9a-f]{32}$")
 RUN_RE = re.compile(r"^run_[0-9]+_[0-9]+_[0-9a-f]{8}$")
@@ -29,6 +35,14 @@ WATCHER_OUTCOMES = {
     3: "terminal_or_contract_failure",
     4: "deadline_exceeded",
     5: "artifact_invalid",
+}
+# Watcher exit code -> semantic wake event. Verified contract outcomes only;
+# signals, launch failures, and infrastructure failures never publish.
+ARTIFACT_SEMANTIC_EVENTS = {
+    0: "transport_success",
+    3: "transport_failure",
+    4: "deadline_exceeded",
+    5: "contract_violation",
 }
 NETWORK_FILESYSTEMS = {
     "9p",
@@ -279,6 +293,87 @@ def current_run(base: Path) -> Path | None:
     return base / "runs" / run_id
 
 
+def resolved_event_binding(args: argparse.Namespace) -> dict[str, Any] | None:
+    """Load and validate the explicit opt-in wake binding for this monitor.
+
+    Without --event-binding no semantic event is ever published: unattended
+    remains the default. With --bridge-config, binding and config identities
+    must agree, failing closed on any mismatch.
+    """
+    if args.event_binding is None:
+        return None
+    binding = semantic_events.load_event_binding(Path(args.event_binding))
+    if args.bridge_config is not None:
+        config = semantic_events.load_bridge_config(Path(args.bridge_config))
+        for key, binding_key in (
+            ("instance_id", "app_server_instance"),
+            ("codex_home_id", "codex_home_id"),
+            ("workspace", "workspace"),
+        ):
+            if config[key] != binding[binding_key]:
+                raise ValueError(
+                    f"event binding {binding_key} does not match bridge config"
+                )
+    return binding
+
+
+def publish_semantic_event(
+    run: Path,
+    *,
+    manifest: dict[str, Any],
+    watcher_exit_code: int | None,
+) -> None:
+    """Best-effort publication of one durable semantic event per terminal.
+
+    Failure never alters the terminal record, which remains the sole terminal
+    authority; the outcome is recorded beside the run.
+    """
+    binding = manifest.get("event_binding")
+    if not isinstance(binding, dict):
+        return
+    event_enum = ARTIFACT_SEMANTIC_EVENTS.get(
+        watcher_exit_code if watcher_exit_code is not None else -1
+    )
+    if event_enum is None:
+        return
+    try:
+        terminal_digest = f"sha256:{sha256_file(run / 'terminal.json')}"
+        event = semantic_events.build_event(
+            backend=manifest.get("event_backend", "artifact"),
+            handle=str(manifest["task_handle"]),
+            generation=run.name,
+            terminal_digest=terminal_digest,
+            event=event_enum,
+            exit_code=watcher_exit_code if isinstance(watcher_exit_code, int) else None,
+            binding=binding,
+        )
+        outcome = semantic_events.publish_event(
+            semantic_events.outbox_root(Path(manifest["state_dir"])), event
+        )
+        publish_json_no_replace(
+            run / "semantic_event.json",
+            {
+                "schema_version": f"{SCHEMA_PREFIX}.semantic-event/v1",
+                "run_id": run.name,
+                "event_id": event["event_id"],
+                "event": event_enum,
+                "state": outcome,
+                "published_at": utc_now(),
+            },
+        )
+    except (OSError, ValueError, semantic_events.SemanticEventError) as exc:
+        replace_json(
+            run / "semantic_event_failure.json",
+            {
+                "schema_version": f"{SCHEMA_PREFIX}.semantic-event/v1",
+                "run_id": run.name,
+                "state": "publish_failed",
+                "reason": getattr(exc, "reason", type(exc).__name__),
+                "observed_at": utc_now(),
+            },
+        )
+
+
 def validate_manifest(run: Path, handle: str) -> tuple[dict[str, Any], str]:
     manifest_path = run / "manifest.json"
     manifest = read_json(manifest_path)
@@ -517,6 +612,7 @@ def start_monitor(args: argparse.Namespace) -> int:
             "run_id": run_id,
             "generation": generation,
             "created_at": utc_now(),
+            "state_dir": str(args.state_dir),
             "contract": contract,
             "contract_digest": contract_digest,
             "deadline_epoch_seconds": deadline_epoch_seconds,
@@ -525,6 +621,10 @@ def start_monitor(args: argparse.Namespace) -> int:
             "scope": "artifact_observation_only",
             "business_verdict": "pending",
         }
+        event_binding = resolved_event_binding(args)
+        if event_binding is not None:
+            manifest["event_binding"] = event_binding
+            manifest["event_backend"] = args.event_backend
         publish_json_no_replace(run / "manifest.json", manifest)
         manifest_sha = sha256_file(run / "manifest.json")
         replace_json(
@@ -724,6 +824,11 @@ def supervise(args: argparse.Namespace) -> int:
             "contract_digest": manifest["contract_digest"],
         }
         publish_json_no_replace(run / "terminal.json", terminal)
+        publish_semantic_event(
+            run,
+            manifest=manifest,
+            watcher_exit_code=exit_code,
+        )
         return 0
     except Exception as exc:
         failure = {
@@ -878,6 +983,22 @@ def parser() -> argparse.ArgumentParser:
     )
     start.add_argument("--restart", action="store_true")
     start.add_argument("--handshake-seconds", type=positive_float, default=10.0)
+    start.add_argument(
+        "--event-binding",
+        type=Path,
+        help="opt in to semantic wake events with a validated binding file",
+    )
+    start.add_argument(
+        "--bridge-config",
+        type=Path,
+        help="bridge configuration the binding must agree with (optional)",
+    )
+    start.add_argument(
+        "--event-backend",
+        choices=sorted(semantic_events.BACKEND_ENUMS),
+        default="artifact",
+        help="backend label recorded on published semantic events",
+    )
     start.set_defaults(func=start_monitor)
 
     status = sub.add_parser("status", help="read local monitor state without opening the artifact")

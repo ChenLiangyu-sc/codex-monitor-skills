@@ -211,6 +211,11 @@ def helper_command(args: argparse.Namespace) -> list[str]:
             command += ["--state-dir", str(args.state_dir)]
         if args.restart:
             command.append("--restart")
+        if getattr(args, "event_binding", None) is not None:
+            command += ["--event-binding", str(args.event_binding)]
+        if getattr(args, "bridge_config", None) is not None:
+            command += ["--bridge-config", str(args.bridge_config)]
+        command += ["--event-backend", "dispatch"]
         return command
     command.append(args.monitor_task_handle)
     if args.state_dir is not None:
@@ -337,6 +342,8 @@ def parser() -> argparse.ArgumentParser:
     start.add_argument("--poll-seconds", type=positive_float, default=10.0)
     start.add_argument("--timeout-seconds", type=positive_float, required=True)
     start.add_argument("--restart", action="store_true")
+    start.add_argument("--event-binding", type=Path)
+    start.add_argument("--bridge-config", type=Path)
     status = sub.add_parser("status")
     status.add_argument("monitor_task_handle")
     status.add_argument("--state-dir", type=Path)

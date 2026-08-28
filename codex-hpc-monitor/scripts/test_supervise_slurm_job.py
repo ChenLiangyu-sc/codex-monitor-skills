@@ -22,6 +22,7 @@ SPEC = importlib.util.spec_from_file_location("supervise_slurm_job", SCRIPT)
 assert SPEC and SPEC.loader
 SUPERVISOR = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(SUPERVISOR)
+import semantic_events
 
 
 FAKE_WATCHER = r'''#!/usr/bin/env python3
@@ -456,6 +457,122 @@ class SupervisorTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 12)
         self.assertIn("terminal_contract_digest_mismatch", wait_payload["problems"])
+
+    def write_binding(self) -> Path:
+        binding = {
+            "schema": "codex-monitor.event-binding/v1",
+            "codex_home_id": "sha256:" + "a" * 64,
+            "app_server_instance": "workstation-1",
+            "thread_id": "thr_test_1",
+            "workspace": str(self.root),
+        }
+        path = self.root / "binding.json"
+        path.write_text(json.dumps(binding), encoding="utf-8")
+        path.chmod(0o600)
+        return path
+
+    def write_bridge_config(self, instance: str = "workstation-1") -> Path:
+        config = {
+            "schema": "codex-monitor.bridge-config/v1",
+            "enabled": True,
+            "instance_id": instance,
+            "codex_home_id": "sha256:" + "a" * 64,
+            "workspace": str(self.root),
+            "transport": {"type": "stdio", "command": ["codex", "app-server"]},
+            "request_timeout_seconds": 30,
+            "poll_seconds": 5,
+            "lease_seconds": 300,
+            "max_attempts": 16,
+            "backoff_initial_seconds": 5,
+            "backoff_max_seconds": 3600,
+        }
+        path = self.root / "bridge.json"
+        path.write_text(json.dumps(config), encoding="utf-8")
+        path.chmod(0o600)
+        return path
+
+    def outbox(self):
+        return semantic_events.outbox_root(self.state)
+
+    def test_terminal_publishes_one_semantic_event_with_binding(self) -> None:
+        binding = self.write_binding()
+        result, _ = self.run_cli(
+            "start", "--event-binding", str(binding), env={"FAKE_EXIT": "0"}
+        )
+        self.assertEqual(result.returncode, 0)
+        payload = self.wait_state("terminal")
+        run = Path(payload["run_dir"])
+        published = json.loads((run / "semantic_event.json").read_text())
+        self.assertEqual(published["event"], "transport_success")
+        self.assertEqual(published["state"], "published")
+        entries = semantic_events.list_outbox(self.outbox())
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["state"], "pending")
+        event = semantic_events.read_event(self.outbox(), published["event_id"])
+        terminal_sha = hashlib.sha256((run / "terminal.json").read_bytes()).hexdigest()
+        self.assertEqual(event["monitor"]["terminal_digest"], f"sha256:{terminal_sha}")
+        self.assertEqual(event["monitor"]["handle"], "fakehost-12345")
+        self.assertEqual(event["monitor"]["generation"], payload["run_id"])
+        self.assertEqual(event["exit_code"], 0)
+        self.assertEqual(event["binding"]["thread_id"], "thr_test_1")
+
+    def test_failure_terminal_maps_to_transport_failure_event(self) -> None:
+        binding = self.write_binding()
+        self.run_cli(
+            "start", "--event-binding", str(binding), env={"FAKE_EXIT": "3"}
+        )
+        payload = self.wait_state("terminal")
+        run = Path(payload["run_dir"])
+        published = json.loads((run / "semantic_event.json").read_text())
+        self.assertEqual(published["event"], "transport_failure")
+        event = semantic_events.read_event(self.outbox(), published["event_id"])
+        self.assertEqual(event["exit_code"], 3)
+
+    def test_no_binding_publishes_no_event(self) -> None:
+        self.run_cli("start", env={"FAKE_EXIT": "0"})
+        payload = self.wait_state("terminal")
+        run = Path(payload["run_dir"])
+        self.assertFalse((run / "semantic_event.json").exists())
+        self.assertEqual(semantic_events.list_outbox(self.outbox()), [])
+
+    def test_signaled_watcher_publishes_no_event(self) -> None:
+        binding = self.write_binding()
+        self.run_cli(
+            "start",
+            "--event-binding",
+            str(binding),
+            env={"FAKE_SELF_SIGNAL": str(int(signal.SIGTERM))},
+        )
+        payload = self.wait_state("terminal")
+        run = Path(payload["run_dir"])
+        self.assertEqual(payload["terminal"]["observer_outcome"], "watcher_signaled")
+        self.assertFalse((run / "semantic_event.json").exists())
+        self.assertEqual(semantic_events.list_outbox(self.outbox()), [])
+
+    def test_binding_config_mismatch_fails_closed(self) -> None:
+        binding = self.write_binding()
+        config = self.write_bridge_config(instance="other-host")
+        result, payload = self.run_cli(
+            "start", "--event-binding", str(binding), "--bridge-config", str(config)
+        )
+        self.assertEqual(result.returncode, 12)
+        self.assertIn("does not match bridge config", payload["detail"])
+        self.assertEqual(semantic_events.list_outbox(self.outbox()), [])
+
+    def test_binding_config_agreement_starts_normally(self) -> None:
+        binding = self.write_binding()
+        config = self.write_bridge_config()
+        result, _ = self.run_cli(
+            "start",
+            "--event-binding",
+            str(binding),
+            "--bridge-config",
+            str(config),
+            env={"FAKE_EXIT": "0"},
+        )
+        self.assertEqual(result.returncode, 0)
+        self.wait_state("terminal")
+        self.assertEqual(len(semantic_events.list_outbox(self.outbox())), 1)
 
 
 if __name__ == "__main__":
