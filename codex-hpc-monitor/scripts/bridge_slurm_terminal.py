@@ -13,6 +13,7 @@ import secrets
 import stat
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -143,15 +144,28 @@ def bridge_dir(args: argparse.Namespace, run_id: str) -> Path:
     return args.state_dir / "bridges" / f"{args.host}-{args.job_id}" / run_id
 
 
+def bridge_attempts(path: Path) -> list[dict[str, Any]]:
+    attempts_dir = path / "attempts"
+    records: list[dict[str, Any]] = []
+    if not attempts_dir.is_dir():
+        return records
+    for child in sorted(attempts_dir.iterdir()):
+        record = read_json(child)
+        if record:
+            records.append(record)
+    return records
+
+
 def bridge_status_for(path: Path, host: str, job_id: str, run_id: str) -> dict[str, Any]:
     receipt = read_json(path / "receipt.json")
     runtime = read_json(path / "runtime.json")
     manifest = read_json(path / "manifest.json")
+    attempts = bridge_attempts(path)
     if receipt:
         state = "terminal"
     elif process_matches(runtime):
         state = "active"
-    elif runtime or manifest:
+    elif runtime or manifest or attempts:
         state = "bridge_lost"
     else:
         state = "not_started"
@@ -164,6 +178,8 @@ def bridge_status_for(path: Path, host: str, job_id: str, run_id: str) -> dict[s
         "bridge_dir": str(path),
         "runtime": runtime or None,
         "receipt": receipt or None,
+        "attempts_total": len(attempts),
+        "last_attempt": attempts[-1] if attempts else None,
     }
 
 
@@ -259,6 +275,31 @@ def run_bridge(args: argparse.Namespace) -> int:
         for key, expected in (("host", args.host), ("job_id", args.job_id), ("run_id", run_id)):
             if wait_payload.get(key) != expected:
                 problems.append(f"wait_{key}_mismatch")
+        attempt_id = f"attempt_{int(time.time())}_{os.getpid()}_{secrets.token_hex(4)}"
+        attempt = {
+            "schema_version": f"{PREFIX}.attempt/v1",
+            "attempt_id": attempt_id,
+            "host": args.host,
+            "job_id": args.job_id,
+            "run_id": run_id,
+            "started_at": started_at,
+            "ended_at": utc_now(),
+            "wait_exit_code": wait_code,
+            "outcome": (
+                "bridge_failure"
+                if problems
+                else ("wait_timeout" if wait_code == 4 else "terminal")
+            ),
+            "wait_stderr_present": bool(wait_stderr),
+            "problems": problems,
+        }
+        publish_once(path / "attempts" / f"{attempt_id}.json", attempt)
+        if wait_code == 4 and not problems:
+            # A bridge wait timeout is one attempt outcome, never a permanent
+            # terminal notification: a later run may still deliver the genuine
+            # verified terminal event, and no receipt is published here.
+            print(json.dumps(attempt, sort_keys=True))
+            return 4
         receipt = {
             "schema_version": f"{PREFIX}.receipt/v1",
             "state": "terminal" if not problems else "bridge_failure",
@@ -267,6 +308,7 @@ def run_bridge(args: argparse.Namespace) -> int:
             "run_id": run_id,
             "started_at": started_at,
             "ended_at": utc_now(),
+            "attempt_id": attempt_id,
             "wait_exit_code": wait_code,
             "wait_payload": wait_payload,
             "wait_stderr_present": bool(wait_stderr),

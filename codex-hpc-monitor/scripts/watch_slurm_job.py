@@ -59,6 +59,10 @@ class Snapshot:
     job_name: str = ""
     partition: str = ""
     source: str = ""
+    cluster: str = ""
+    sluid: str = ""
+    original_sluid: str = ""
+    restarts: str = ""
 
 
 def normalize_state(raw_state: str) -> str:
@@ -172,11 +176,32 @@ class WatcherLock:
 
 
 class SlurmClient:
+    # Extended identity formats are tried in order; older schedulers that do
+    # not know a field make the whole call fail, and we fall back to the most
+    # complete format the remote sacct accepts. Identity evidence is then
+    # marked degraded rather than guessed.
+    SACCT_FORMATS = (
+        (
+            "JobIDRaw,State,ExitCode,Elapsed,User,Submit,JobName,Partition,"
+            "Cluster,SLUID,OriginalSLUID,Restart",
+            ("cluster", "sluid", "original_sluid", "restarts"),
+        ),
+        (
+            "JobIDRaw,State,ExitCode,Elapsed,User,Submit,JobName,Partition,Cluster",
+            ("cluster",),
+        ),
+        (
+            "JobIDRaw,State,ExitCode,Elapsed,User,Submit,JobName,Partition",
+            (),
+        ),
+    )
+
     def __init__(self, host: str, timeout_seconds: int = 30) -> None:
         if not HOST_RE.fullmatch(host):
             raise ValueError(f"invalid SSH host: {host!r}")
         self.host = host
         self.timeout_seconds = timeout_seconds
+        self._sacct_format_index = 0
 
     def _ssh(self, remote_command: str, *, missing_job_ok: bool = False) -> str:
         result = subprocess.run(
@@ -228,14 +253,15 @@ class SlurmClient:
                 source="squeue",
             )
 
-        sacct = self._ssh(
-            f"sacct -X -n -P -j {job_id} "
-            "--format=JobIDRaw,State,ExitCode,Elapsed,User,Submit,JobName,Partition"
-        )
+        sacct, extra_fields = self._sacct_query(job_id)
         for line in sacct.splitlines():
-            fields = line.strip().split("|", 7)
-            if len(fields) != 8 or fields[0] != job_id:
+            fields = line.strip().split("|")
+            if len(fields) != 8 + len(extra_fields) or fields[0] != job_id:
                 continue
+            extras = {
+                name: fields[8 + index]
+                for index, name in enumerate(extra_fields)
+            }
             return Snapshot(
                 job_id=job_id,
                 state=normalize_state(fields[1]),
@@ -246,8 +272,28 @@ class SlurmClient:
                 job_name=fields[6],
                 partition=fields[7],
                 source="sacct",
+                **extras,
             )
         return None
+
+    def _sacct_query(self, job_id: str) -> "tuple[str, tuple[str, ...]]":
+        index = self._sacct_format_index
+        while True:
+            fmt, extra_fields = self.SACCT_FORMATS[index]
+            try:
+                payload = self._ssh(
+                    f"sacct -X -n -P -j {job_id} --format={fmt}"
+                )
+            except RuntimeError as exc:
+                text = str(exc).lower()
+                if ("field" in text or "invalid option" in text) and index + 1 < len(
+                    self.SACCT_FORMATS
+                ):
+                    index += 1
+                    continue
+                raise
+            self._sacct_format_index = index
+            return payload, extra_fields
 
 
 def build_event(
@@ -329,6 +375,58 @@ def identity_mismatch(
     return None
 
 
+# Stable scheduler identity: submit time is always available; cluster and
+# SLUID fields strengthen the binding when the remote sacct supports them.
+IDENTITY_BINDING_FIELDS = (
+    "job_id",
+    "submit_time",
+    "cluster",
+    "sluid",
+    "original_sluid",
+)
+ABSENT_IDENTITY_VALUES = {"", "N/A", "n/a", "None", "Unknown", "unknown"}
+
+
+def identity_values(snapshot: Snapshot) -> Dict[str, str]:
+    candidates = {
+        "job_id": snapshot.job_id,
+        "submit_time": snapshot.submit_time,
+        "cluster": snapshot.cluster,
+        "sluid": snapshot.sluid,
+        "original_sluid": snapshot.original_sluid,
+        "restarts": snapshot.restarts,
+    }
+    return {
+        field: value
+        for field, value in candidates.items()
+        if value and value not in ABSENT_IDENTITY_VALUES
+    }
+
+
+def identity_conflict(bound: Dict[str, str], observed: Dict[str, str]) -> Optional[str]:
+    """Fail closed when a previously bound identity field changes value.
+
+    Job-ID reuse or a requeued allocation appears as the same job id with a
+    different submit time / SLUID. Only fields present on both sides are
+    comparable; `restarts` tracks the same job restarting and never conflicts.
+    """
+    for field in IDENTITY_BINDING_FIELDS:
+        if field in bound and field in observed and bound[field] != observed[field]:
+            return (
+                f"scheduler identity conflict on {field}: bound {bound[field]!r}, "
+                f"observed {observed[field]!r} (possible job id reuse or requeue)"
+            )
+    return None
+
+
+def merged_identity(bound: Dict[str, str], observed: Dict[str, str]) -> Dict[str, str]:
+    merged = dict(bound)
+    for field in (*IDENTITY_BINDING_FIELDS, "restarts"):
+        if field in observed:
+            merged[field] = observed[field]
+    return merged
+
+
 def persist_observation(
     path: Optional[Path],
     *,
@@ -340,6 +438,8 @@ def persist_observation(
     missing_exit_since_epoch: Optional[float],
     consecutive_failures: int,
     detail: str = "",
+    deadline_at_epoch: Optional[float] = None,
+    identity_binding: Optional[Dict[str, str]] = None,
 ) -> None:
     if path is None:
         return
@@ -354,6 +454,10 @@ def persist_observation(
         "consecutive_failures": consecutive_failures,
         "snapshot": asdict(snapshot) if snapshot is not None else None,
     }
+    if deadline_at_epoch is not None:
+        payload["deadline_at_epoch"] = deadline_at_epoch
+    if identity_binding is not None:
+        payload["identity_binding"] = identity_binding
     if detail:
         payload["detail"] = detail
     atomic_write_json(path, payload)
@@ -393,17 +497,51 @@ def monitor(
         float(missing_exit_value) if missing_exit_value is not None else None
     )
     consecutive_failures = 0
+    saved_identity = saved.get("identity_binding")
+    identity_binding: Dict[str, str] = (
+        {
+            field: value
+            for field, value in saved_identity.items()
+            if isinstance(field, str) and isinstance(value, str)
+        }
+        if isinstance(saved_identity, dict)
+        else {}
+    )
+
+    # Absolute observation deadline. It is derived once from the persisted
+    # monitor start and the first max-watch duration, then persisted itself;
+    # a watcher or supervisor restart can only shrink the remaining window,
+    # never extend it.
+    saved_deadline = saved.get("deadline_at_epoch")
+    if isinstance(saved_deadline, (int, float)) and not isinstance(saved_deadline, bool):
+        deadline_at_epoch = float(saved_deadline)
+    else:
+        deadline_at_epoch = (
+            monitor_started_epoch + max_watch_seconds if max_watch_seconds > 0 else None
+        )
+    if deadline_at_epoch is not None and max_watch_seconds > 0:
+        deadline_at_epoch = min(deadline_at_epoch, now_epoch + max_watch_seconds)
 
     while True:
         now_epoch = wall_clock()
-        if (
-            max_watch_seconds > 0
-            and now_epoch - monitor_started_epoch >= max_watch_seconds
-        ):
+        if deadline_at_epoch is not None and now_epoch >= deadline_at_epoch:
+            persist_observation(
+                state_path,
+                host=host,
+                snapshot=None,
+                event="watch_timeout",
+                monitor_started_epoch=monitor_started_epoch,
+                pending_since_epoch=pending_since_epoch,
+                missing_exit_since_epoch=missing_exit_since_epoch,
+                consecutive_failures=consecutive_failures,
+                detail="absolute observation deadline reached",
+                deadline_at_epoch=deadline_at_epoch,
+                identity_binding=identity_binding,
+            )
             emit(
                 "watch_timeout",
                 None,
-                "maximum watcher duration exceeded",
+                "absolute observation deadline reached",
                 result_path=result_path,
                 extra={"job_id": job_id, "host": host},
             )
@@ -426,6 +564,8 @@ def monitor(
                 missing_exit_since_epoch=missing_exit_since_epoch,
                 consecutive_failures=consecutive_failures,
                 detail=str(exc),
+                deadline_at_epoch=deadline_at_epoch,
+                identity_binding=identity_binding,
             )
             if consecutive_failures >= query_failures:
                 emit(
@@ -445,6 +585,11 @@ def monitor(
             expected_job_name=expected_job_name,
             expected_partition=expected_partition,
         )
+        if mismatch is None:
+            observed_identity = identity_values(snapshot)
+            mismatch = identity_conflict(identity_binding, observed_identity)
+            if mismatch is None:
+                identity_binding = merged_identity(identity_binding, observed_identity)
         if mismatch:
             persist_observation(
                 state_path,
@@ -456,6 +601,8 @@ def monitor(
                 missing_exit_since_epoch=missing_exit_since_epoch,
                 consecutive_failures=0,
                 detail=mismatch,
+                deadline_at_epoch=deadline_at_epoch,
+                identity_binding=identity_binding,
             )
             emit(
                 "identity_mismatch",
@@ -477,6 +624,8 @@ def monitor(
                     pending_since_epoch=pending_since_epoch,
                     missing_exit_since_epoch=None,
                     consecutive_failures=0,
+                    deadline_at_epoch=deadline_at_epoch,
+                    identity_binding=identity_binding,
                 )
                 emit("completed", snapshot, result_path=result_path)
                 return 0
@@ -490,6 +639,8 @@ def monitor(
                     pending_since_epoch=pending_since_epoch,
                     missing_exit_since_epoch=None,
                     consecutive_failures=0,
+                    deadline_at_epoch=deadline_at_epoch,
+                    identity_binding=identity_binding,
                 )
                 emit(
                     "terminal_failure",
@@ -514,6 +665,8 @@ def monitor(
                     missing_exit_since_epoch=missing_exit_since_epoch,
                     consecutive_failures=0,
                     detail="COMPLETED never produced an explicit ExitCode",
+                    deadline_at_epoch=deadline_at_epoch,
+                    identity_binding=identity_binding,
                 )
                 emit(
                     "lost_observability",
@@ -531,6 +684,8 @@ def monitor(
                 pending_since_epoch=pending_since_epoch,
                 missing_exit_since_epoch=missing_exit_since_epoch,
                 consecutive_failures=0,
+                deadline_at_epoch=deadline_at_epoch,
+                identity_binding=identity_binding,
             )
             sleep(poll_seconds)
             continue
@@ -546,6 +701,8 @@ def monitor(
                 pending_since_epoch=pending_since_epoch,
                 missing_exit_since_epoch=None,
                 consecutive_failures=0,
+                deadline_at_epoch=deadline_at_epoch,
+                identity_binding=identity_binding,
             )
             emit("terminal_failure", snapshot, result_path=result_path)
             return 3
@@ -559,6 +716,8 @@ def monitor(
                 pending_since_epoch=pending_since_epoch,
                 missing_exit_since_epoch=None,
                 consecutive_failures=0,
+                deadline_at_epoch=deadline_at_epoch,
+                identity_binding=identity_binding,
             )
             emit("anomalous_state", snapshot, result_path=result_path)
             return 7
@@ -572,6 +731,8 @@ def monitor(
                 pending_since_epoch=None,
                 missing_exit_since_epoch=None,
                 consecutive_failures=0,
+                deadline_at_epoch=deadline_at_epoch,
+                identity_binding=identity_binding,
             )
             emit("running", snapshot, result_path=result_path)
             return 6
@@ -595,6 +756,8 @@ def monitor(
                     pending_since_epoch=pending_since_epoch,
                     missing_exit_since_epoch=None,
                     consecutive_failures=0,
+                    deadline_at_epoch=deadline_at_epoch,
+                    identity_binding=identity_binding,
                 )
                 emit("pending_alert", snapshot, result_path=result_path)
                 return 4
@@ -610,6 +773,8 @@ def monitor(
             pending_since_epoch=pending_since_epoch,
             missing_exit_since_epoch=missing_exit_since_epoch,
             consecutive_failures=0,
+            deadline_at_epoch=deadline_at_epoch,
+            identity_binding=identity_binding,
         )
         sleep(poll_seconds)
 

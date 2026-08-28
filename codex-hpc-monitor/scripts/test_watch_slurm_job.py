@@ -303,3 +303,253 @@ class LockTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+QUERY_ERROR = RuntimeError("SSH query failed (255): network down")
+
+
+def identity_snapshot(state="RUNNING", submit_time="2026-01-01T00:00:00", **extras):
+    values = dict(
+        job_id="123",
+        state=state,
+        exit_code="",
+        elapsed="00:01:00",
+        reason="",
+        owner="tester",
+        submit_time=submit_time,
+        job_name="train-job",
+        partition="gpu",
+        source="sacct",
+    )
+    values.update(extras)
+    return MODULE.Snapshot(**values)
+
+
+class AbsoluteDeadlineTests(unittest.TestCase):
+    """A watcher restart must never extend the observation window."""
+
+    def run_phase(self, results, *, initial_state, clock_start, max_watch):
+        clock = FakeClock(start=clock_start)
+        output = io.StringIO()
+        self.state_dir = tempfile.TemporaryDirectory()
+        state_path = pathlib.Path(self.state_dir.name) / "state.json"
+        self.addCleanup(self.state_dir.cleanup)
+        kwargs = {
+            "client": FakeClient(results),
+            "job_id": "123",
+            "poll_seconds": 10,
+            "pending_alert_seconds": 0,
+            "query_failures": 3,
+            "notify_running": False,
+            "host": "hpc142",
+            "terminal_observability_seconds": 30,
+            "max_watch_seconds": max_watch,
+            "clock": clock,
+            "wall_clock": clock,
+            "sleep": clock.sleep,
+            "state_path": state_path,
+            "initial_state": initial_state,
+        }
+        with contextlib.redirect_stdout(output):
+            code = MODULE.monitor(**kwargs)
+        return code, json.loads(output.getvalue()), json.loads(state_path.read_text())
+
+    def test_absolute_deadline_stops_watch(self):
+        code, event, _ = self.run_phase(
+            [snapshot("RUNNING")] * 3,
+            initial_state={},
+            clock_start=1000.0,
+            max_watch=25,
+        )
+        self.assertEqual(code, 10)
+        self.assertEqual(event["event"], "watch_timeout")
+
+    def test_restart_with_larger_budget_does_not_extend_deadline(self):
+        _, _, state = self.run_phase(
+            [snapshot("RUNNING")] * 3, initial_state={}, clock_start=1000.0, max_watch=25
+        )
+        self.assertEqual(state["deadline_at_epoch"], 1025.0)
+        # Restart hours later with a much larger budget: the persisted
+        # absolute deadline still governs and fires before any query.
+        code, event, state2 = self.run_phase(
+            [], initial_state=state, clock_start=2000.0, max_watch=100000
+        )
+        self.assertEqual(code, 10)
+        self.assertEqual(event["event"], "watch_timeout")
+        self.assertEqual(state2["deadline_at_epoch"], 1025.0)
+
+    def test_restart_with_smaller_budget_shrinks_deadline(self):
+        _, _, state = self.run_phase(
+            [snapshot("RUNNING")] * 3, initial_state={}, clock_start=1000.0, max_watch=25
+        )
+        code, event, state2 = self.run_phase(
+            [snapshot("RUNNING")] * 3,
+            initial_state=state,
+            clock_start=1000.0,
+            max_watch=10,
+        )
+        self.assertEqual(code, 10)
+        self.assertEqual(state2["deadline_at_epoch"], 1010.0)
+
+    def test_legacy_state_without_deadline_preserves_original_window(self):
+        # A pre-upgrade watcher state carried only the start epoch; the new
+        # absolute deadline must honor that original start, not "now".
+        _, _, state = self.run_phase(
+            [snapshot("RUNNING")] * 3 + [QUERY_ERROR] * 3,
+            initial_state={"monitor_started_epoch": 900.0},
+            clock_start=1000.0,
+            max_watch=200,
+        )
+        # Deadline derived from the persisted start (900), not "now" (1000+200).
+        self.assertEqual(state["deadline_at_epoch"], 1100.0)
+
+
+class IdentityBindingTests(unittest.TestCase):
+    def run_phase(self, results, *, initial_state):
+        clock = FakeClock(start=1000.0)
+        output = io.StringIO()
+        self.state_dir = tempfile.TemporaryDirectory()
+        state_path = pathlib.Path(self.state_dir.name) / "state.json"
+        self.addCleanup(self.state_dir.cleanup)
+        kwargs = {
+            "client": FakeClient(results),
+            "job_id": "123",
+            "poll_seconds": 10,
+            "pending_alert_seconds": 0,
+            "query_failures": 2,
+            "notify_running": False,
+            "host": "hpc142",
+            "terminal_observability_seconds": 30,
+            "max_watch_seconds": 1000,
+            "clock": clock,
+            "wall_clock": clock,
+            "sleep": clock.sleep,
+            "state_path": state_path,
+            "initial_state": initial_state,
+        }
+        with contextlib.redirect_stdout(output):
+            code = MODULE.monitor(**kwargs)
+        return code, json.loads(output.getvalue()), json.loads(state_path.read_text())
+
+    def test_identity_binding_persists_and_detects_job_id_reuse(self):
+        _, _, state = self.run_phase(
+            [identity_snapshot(), QUERY_ERROR, QUERY_ERROR], initial_state={}
+        )
+        self.assertEqual(
+            state["identity_binding"],
+            {"job_id": "123", "submit_time": "2026-01-01T00:00:00"},
+        )
+        # A different job later reuses Job ID 123: submit time changes.
+        code, event, state2 = self.run_phase(
+            [identity_snapshot(submit_time="2026-03-04T00:00:00"), QUERY_ERROR, QUERY_ERROR],
+            initial_state=state,
+        )
+        self.assertEqual(code, 9)
+        self.assertEqual(event["event"], "identity_mismatch")
+        self.assertIn("scheduler identity conflict on submit_time", event["detail"])
+        self.assertIn("job id reuse", event["detail"])
+
+    def test_sluid_or_cluster_change_is_also_a_conflict(self):
+        base = {
+            "identity_binding": {
+                "job_id": "123",
+                "submit_time": "2026-01-01T00:00:00",
+                "cluster": "cluster-a",
+                "sluid": "111",
+            }
+        }
+        code, event, _ = self.run_phase(
+            [identity_snapshot(cluster="cluster-b"), QUERY_ERROR, QUERY_ERROR],
+            initial_state=base,
+        )
+        self.assertEqual(code, 9)
+        self.assertIn("scheduler identity conflict on cluster", event["detail"])
+
+    def test_new_identity_fields_are_adopted_without_conflict(self):
+        _, _, state = self.run_phase(
+            [identity_snapshot(cluster="cluster-a", sluid="111", restarts="0"),
+             QUERY_ERROR, QUERY_ERROR],
+            initial_state={},
+        )
+        self.assertEqual(state["identity_binding"]["cluster"], "cluster-a")
+        self.assertEqual(state["identity_binding"]["sluid"], "111")
+        self.assertEqual(state["identity_binding"]["restarts"], "0")
+        # Same job restarts (requeue accounting): restarts changes, identity holds.
+        code, _, state2 = self.run_phase(
+            [identity_snapshot(cluster="cluster-a", sluid="111", restarts="1"),
+             QUERY_ERROR, QUERY_ERROR],
+            initial_state=state,
+        )
+        self.assertEqual(code, 5)  # stopped on query errors, not identity
+        self.assertEqual(state2["identity_binding"]["restarts"], "1")
+
+    def test_absent_identity_values_are_not_bound(self):
+        _, _, state = self.run_phase(
+            [identity_snapshot(submit_time="Unknown", cluster="N/A"),
+             QUERY_ERROR, QUERY_ERROR],
+            initial_state={},
+        )
+        self.assertEqual(state["identity_binding"], {"job_id": "123"})
+
+
+class SacctIdentityFormatTests(unittest.TestCase):
+    LEGACY_LINE = "123|COMPLETED|0:0|00:01:00|tester|2026-01-01T00:00:00|train-job|gpu"
+    EXTENDED_LINE = LEGACY_LINE + "|cluster-a|12345678|12345678|2"
+    CLUSTER_LINE = LEGACY_LINE + "|cluster-a"
+
+    def client_with(self, responses):
+        client = MODULE.SlurmClient("hpc142")
+        calls = []
+
+        def fake_ssh(command, **kwargs):
+            calls.append(command)
+            result = responses[len(calls) - 1]
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        with mock.patch.object(MODULE.SlurmClient, "_ssh", side_effect=fake_ssh):
+            yield client, calls
+        self._calls = calls
+
+    def test_extended_identity_fields_are_parsed(self):
+        for client, calls in self.client_with(["", self.EXTENDED_LINE]):
+            snap = client.query("123")
+        self.assertEqual(snap.source, "sacct")
+        self.assertEqual(snap.cluster, "cluster-a")
+        self.assertEqual(snap.sluid, "12345678")
+        self.assertEqual(snap.original_sluid, "12345678")
+        self.assertEqual(snap.restarts, "2")
+        self.assertEqual(len(calls), 2)
+
+    def test_unknown_field_falls_back_and_caches(self):
+        error = RuntimeError("sacct: error: Invalid field: SLUID")
+        # call1 squeue, call2 sacct full-format error, call3 sacct cluster format
+        responses = ["", error, self.CLUSTER_LINE, "", self.CLUSTER_LINE]
+        for client, calls in self.client_with(responses):
+            first = client.query("123")
+            second = client.query("123")
+        self.assertEqual(first.cluster, "cluster-a")
+        self.assertEqual(first.sluid, "")
+        self.assertEqual(second.cluster, "cluster-a")
+        # 3 calls for the first query (with fallback), 2 for the cached second
+        self.assertEqual(len(calls), 5)
+
+    def test_all_extended_fields_unsupported_falls_back_to_legacy(self):
+        responses = [
+            "",
+            RuntimeError("sacct: error: Invalid field: SLUID"),
+            RuntimeError("sacct: error: Invalid field: Cluster"),
+            self.LEGACY_LINE,
+        ]
+        for client, calls in self.client_with(responses):
+            snap = client.query("123")
+        self.assertEqual(snap.cluster, "")
+        self.assertEqual(snap.sluid, "")
+        self.assertEqual(snap.exit_code, "0:0")
+
+    def test_transient_ssh_error_does_not_fall_back(self):
+        for client, calls in self.client_with(["", QUERY_ERROR]):
+            with self.assertRaises(RuntimeError):
+                client.query("123")
+        self.assertEqual(len(calls), 2)

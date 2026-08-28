@@ -231,6 +231,11 @@ def run_status(run: Optional[Path], host: str, job_id: str) -> Dict[str, Any]:
             "job_id": job_id,
             "run_id": run.name,
             "run_dir": str(run),
+            "evidence_strength": (
+                "full"
+                if isinstance(terminal.get("contract_digest"), str)
+                else "legacy"
+            ),
             "terminal": terminal,
             "watcher_state": watcher_state,
         }
@@ -313,6 +318,34 @@ def validate_identity(job_id: str, host: str) -> None:
         raise ValueError("host contains unsupported characters")
 
 
+def monitoring_contract(args: argparse.Namespace) -> Dict[str, Any]:
+    return {
+        "host": args.host,
+        "job_id": args.job_id,
+        "poll_seconds": args.poll_seconds,
+        "pending_alert_seconds": args.pending_alert_seconds,
+        "terminal_observability_seconds": args.terminal_observability_seconds,
+        "max_watch_seconds": args.max_watch_seconds,
+        "query_failures": args.query_failures,
+        "expected_owner": args.expected_owner,
+        "expected_job_name": args.expected_job_name,
+        "expected_partition": args.expected_partition,
+    }
+
+
+def contract_digest(contract: Dict[str, Any]) -> str:
+    digest = hashlib.sha256(canonical_json(contract)).hexdigest()
+    return f"sha256:{digest}"
+
+
+def previous_contract_digest(run: Optional[Path]) -> Optional[str]:
+    if run is None:
+        return None
+    manifest = read_json(run / "manifest.json")
+    value = manifest.get("contract_digest")
+    return value if isinstance(value, str) else None
+
+
 def start_monitor(args: argparse.Namespace) -> int:
     validate_identity(args.job_id, args.host)
     watcher_input = args.watcher_path.expanduser()
@@ -334,6 +367,21 @@ def start_monitor(args: argparse.Namespace) -> int:
 
     try:
         previous = run_status(current_run(base), args.host, args.job_id)
+        digest = contract_digest(monitoring_contract(args))
+        prior_digest = previous_contract_digest(current_run(base))
+        if (
+            prior_digest is not None
+            and prior_digest != digest
+            and not args.allow_contract_change
+        ):
+            # The frozen monitoring contract for this host/job changed; that
+            # is a conflict requiring an explicit reviewed decision, never an
+            # implicit replacement watcher.
+            previous["start_result"] = "contract_conflict"
+            previous["contract_digest"] = digest
+            previous["previous_contract_digest"] = prior_digest
+            print(json.dumps(previous, sort_keys=True))
+            return 12
         if previous["state"] != "not_started" and not args.restart:
             previous["start_result"] = "restart_required"
             print(json.dumps(previous, sort_keys=True))
@@ -354,6 +402,8 @@ def start_monitor(args: argparse.Namespace) -> int:
             "state_dir": str(args.state_dir.resolve()),
             "scope": "slurm_only",
             "project_gate_evaluated": False,
+            "contract": monitoring_contract(args),
+            "contract_digest": digest,
         }
         publish_json_no_replace(run / "manifest.json", manifest)
         manifest_sha = sha256_file(run / "manifest.json")
@@ -601,6 +651,7 @@ def supervise(args: argparse.Namespace) -> int:
             "ended_at": utc_now(),
             "duration_monotonic_ms": int((time.monotonic() - started_monotonic) * 1000),
             "manifest_sha256": args.manifest_sha256,
+            "contract_digest": manifest.get("contract_digest"),
         }
         publish_json_no_replace(run / "terminal.json", terminal)
         return 0
@@ -687,6 +738,16 @@ def terminal_wait_result(status: Dict[str, Any]) -> tuple[int, Dict[str, Any]]:
     else:
         problems.append("run_dir_missing")
 
+    # Cross-check the monitoring contract binding when the new field exists.
+    # Terminals from the initial release carry no digest; they stay readable
+    # and are marked legacy evidence instead of failing.
+    evidence_strength = "legacy"
+    if isinstance(terminal, dict) and isinstance(terminal.get("contract_digest"), str):
+        evidence_strength = "full"
+        manifest = read_json(Path(str(run_dir)) / "manifest.json") if isinstance(run_dir, str) else {}
+        if not manifest or manifest.get("contract_digest") != terminal.get("contract_digest"):
+            problems.append("terminal_contract_digest_mismatch")
+
     payload: Dict[str, Any] = {
         "schema_version": f"{SCHEMA_PREFIX}.wait/v1",
         "state": "terminal",
@@ -697,6 +758,7 @@ def terminal_wait_result(status: Dict[str, Any]) -> tuple[int, Dict[str, Any]]:
         "terminal_outcome": terminal.get("observer_outcome") if isinstance(terminal, dict) else None,
         "watcher_exit_code": watcher_exit_code,
         "terminal_sha256": terminal_sha,
+        "evidence_strength": evidence_strength,
     }
     if problems:
         payload["problems"] = problems
@@ -815,6 +877,11 @@ def parser() -> argparse.ArgumentParser:
     start.add_argument("--expected-job-name")
     start.add_argument("--expected-partition")
     start.add_argument("--restart", action="store_true", help="start a new run after a prior terminal or lost supervisor")
+    start.add_argument(
+        "--allow-contract-change",
+        action="store_true",
+        help="explicitly accept a changed monitoring contract for this host/job",
+    )
     start.add_argument("--handshake-seconds", type=positive_float, default=10.0)
     start.set_defaults(func=start_monitor)
 

@@ -111,6 +111,39 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(receipt["wait_exit_code"], 3)
         self.assertEqual(receipt["problems"], [])
 
+    def test_wait_timeout_is_an_attempt_not_a_terminal_receipt(self) -> None:
+        result, attempt = self.run_bridge({"FAKE_EXIT": "4"})
+        self.assertEqual(result.returncode, 4)
+        self.assertEqual(attempt["schema_version"], "codex-hpc-monitor.bridge.attempt/v1")
+        self.assertEqual(attempt["outcome"], "wait_timeout")
+        bridge_dir = self.state / "bridges" / "fakehost-12345" / "run_test"
+        self.assertFalse((bridge_dir / "receipt.json").exists())
+        self.assertEqual(len(list((bridge_dir / "attempts").glob("attempt_*.json"))), 1)
+        status = subprocess.run(self.command("status"), text=True, capture_output=True, check=False, timeout=3)
+        payload = json.loads(status.stdout)
+        self.assertEqual(payload["attempts_total"], 1)
+        self.assertEqual(payload["state"], "bridge_lost")
+        self.assertIsNone(payload["receipt"])
+
+    def test_genuine_terminal_after_timeout_is_still_delivered(self) -> None:
+        self.run_bridge({"FAKE_EXIT": "4"})
+        result, receipt = self.run_bridge({"FAKE_EXIT": "0"})
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(receipt["wait_exit_code"], 0)
+        self.assertTrue(receipt["attempt_id"].startswith("attempt_"))
+        bridge_dir = self.state / "bridges" / "fakehost-12345" / "run_test"
+        self.assertTrue((bridge_dir / "receipt.json").exists())
+        status = subprocess.run(self.command("status"), text=True, capture_output=True, check=False, timeout=3)
+        payload = json.loads(status.stdout)
+        self.assertEqual(payload["state"], "terminal")
+        self.assertEqual(payload["attempts_total"], 2)
+
+    def test_failure_receipt_remains_permanent(self) -> None:
+        self.run_bridge({"FAKE_EXIT": "3"})
+        result, payload = self.run_bridge({"FAKE_EXIT": "3"})
+        self.assertEqual(result.returncode, 3)
+        self.assertEqual(payload["run_result"], "receipt_exists")
+
 
 if __name__ == "__main__":
     unittest.main()

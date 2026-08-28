@@ -346,6 +346,7 @@ def run_status(run: Path | None, handle: str) -> dict[str, Any]:
             "run_id": run.name,
             "run_dir": str(run),
             "contract_digest": manifest.get("contract_digest"),
+            "deadline_epoch_seconds": manifest.get("deadline_epoch_seconds"),
             "terminal_verified": verified,
             "terminal_sha256": sha256_file(run / "terminal.json") if verified else None,
             "terminal": terminal if verified else None,
@@ -374,6 +375,7 @@ def run_status(run: Path | None, handle: str) -> dict[str, Any]:
         "run_id": run.name,
         "run_dir": str(run),
         "contract_digest": manifest.get("contract_digest"),
+        "deadline_epoch_seconds": manifest.get("deadline_epoch_seconds"),
         "supervisor_alive": supervisor_alive,
         "watcher_alive": watcher_alive,
         "supervisor": started or None,
@@ -401,7 +403,11 @@ def open_lifetime_lock(base: Path) -> int:
     return fd
 
 
-def watcher_argv(run: Path, contract: dict[str, Any]) -> list[str]:
+def watcher_argv(run: Path, contract: dict[str, Any], deadline_epoch_seconds: float) -> list[str]:
+    # The watcher's relative timeout is capped so a restart generation can
+    # never extend the frozen absolute observation window.
+    remaining = deadline_epoch_seconds - time.time()
+    timeout_seconds = min(float(contract["timeout_seconds"]), max(remaining, 0.0))
     command = [
         sys.executable,
         str(run / "watch_artifact_frozen.py"),
@@ -409,7 +415,7 @@ def watcher_argv(run: Path, contract: dict[str, Any]) -> list[str]:
         "--poll-seconds",
         str(contract["poll_seconds"]),
         "--timeout-seconds",
-        str(contract["timeout_seconds"]),
+        str(timeout_seconds),
         "--invalid-grace-seconds",
         str(contract["invalid_grace_seconds"]),
         "--min-bytes",
@@ -482,13 +488,29 @@ def start_monitor(args: argparse.Namespace) -> int:
 
         previous_current = read_json(base / "current.json")
         generation = int(previous_current.get("generation", 0)) + 1
+        # Absolute observation deadline: frozen at the first generation and
+        # never extended by a restart; a legacy pointer without one adopts
+        # now + the contract timeout.
+        previous_deadline = previous_current.get("deadline_epoch_seconds")
+        now_epoch = time.time()
+        if isinstance(previous_deadline, (int, float)) and not isinstance(
+            previous_deadline, bool
+        ):
+            deadline_epoch_seconds = float(previous_deadline)
+        else:
+            deadline_epoch_seconds = now_epoch + float(contract["timeout_seconds"])
+        if deadline_epoch_seconds <= now_epoch:
+            raise ValueError(
+                "observation window expired: restart cannot extend the frozen "
+                "deadline; start a new contract instead"
+            )
         run_id = f"run_{int(time.time())}_{os.getpid()}_{secrets.token_hex(4)}"
         run = base / "runs" / run_id
         ensure_private_directory(run)
         watcher_bytes = read_regular_bytes_no_follow(watcher)
         frozen = run / "watch_artifact_frozen.py"
         write_bytes_exclusive(frozen, watcher_bytes, 0o500)
-        command = watcher_argv(run, contract)
+        command = watcher_argv(run, contract, deadline_epoch_seconds)
         manifest = {
             "schema_version": f"{SCHEMA_PREFIX}.manifest/v1",
             "task_handle": handle,
@@ -497,6 +519,7 @@ def start_monitor(args: argparse.Namespace) -> int:
             "created_at": utc_now(),
             "contract": contract,
             "contract_digest": contract_digest,
+            "deadline_epoch_seconds": deadline_epoch_seconds,
             "watcher_argv": command,
             "watcher_sha256": sha256_bytes(watcher_bytes),
             "scope": "artifact_observation_only",
@@ -512,6 +535,7 @@ def start_monitor(args: argparse.Namespace) -> int:
                 "run_id": run_id,
                 "generation": generation,
                 "contract_digest": contract_digest,
+                "deadline_epoch_seconds": deadline_epoch_seconds,
                 "manifest_sha256": manifest_sha,
                 "updated_at": utc_now(),
             },

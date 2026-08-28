@@ -384,6 +384,44 @@ class ArtifactSupervisorTests(unittest.TestCase):
         self.assertEqual(result.returncode, 12)
         self.assertIn("must not overlap", payload["detail"])
 
+    def test_deadline_is_frozen_across_restart_generations(self) -> None:
+        self.write_artifact()
+        _, started = self.start()
+        handle = started["task_handle"]
+        terminal = self.wait_terminal(handle)
+        deadline = terminal["deadline_epoch_seconds"]
+        self.assertIsNotNone(deadline)
+        # Restart uses the same absolute deadline; the frozen watcher argv is
+        # capped to the remaining window rather than a fresh full timeout.
+        self.write_artifact(status=False)
+        restart_result, restarted = self.start("--restart")
+        self.assertEqual(restart_result.returncode, 0)
+        manifest = json.loads(
+            (Path(restarted["run_dir"]) / "manifest.json").read_text()
+        )
+        self.assertEqual(manifest["deadline_epoch_seconds"], deadline)
+        argv_timeout = float(manifest["watcher_argv"][argv_index(manifest["watcher_argv"], "--timeout-seconds") + 1])
+        self.assertLess(argv_timeout, 5.0)
+
+    def test_expired_window_refuses_restart(self) -> None:
+        self.write_artifact()
+        _, started = self.start()
+        handle = started["task_handle"]
+        self.wait_terminal(handle)
+        current_path = None
+        for current in (self.state / "artifacts").glob("*/current.json"):
+            current_path = current
+        payload = json.loads(current_path.read_text())
+        payload["deadline_epoch_seconds"] = time.time() - 10
+        current_path.write_text(json.dumps(payload))
+        result, refused = self.start("--restart")
+        self.assertEqual(result.returncode, 12)
+        self.assertIn("observation window expired", refused["detail"])
+
+
+def argv_index(argv: list, flag: str) -> int:
+    return argv.index(flag)
+
 
 if __name__ == "__main__":
     unittest.main()

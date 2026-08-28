@@ -381,6 +381,82 @@ class SupervisorTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "hash mismatch"):
             SUPERVISOR.validate_manifest_watcher(manifest)
 
+    def test_contract_conflict_requires_explicit_allowance(self) -> None:
+        self.run_cli("start", env={"FAKE_WATCH_SECONDS": "0.1"})
+        self.wait_state("terminal")
+        # Same host/job with a changed contract is a conflict, not an
+        # implicit replacement watcher, even with --restart.
+        result, payload = self.run_cli("start", "--restart", "--poll-seconds", "2")
+        self.assertEqual(result.returncode, 12)
+        self.assertEqual(payload["start_result"], "contract_conflict")
+        self.assertNotEqual(
+            payload["contract_digest"], payload["previous_contract_digest"]
+        )
+        allowed, _ = self.run_cli(
+            "start", "--restart", "--poll-seconds", "2", "--allow-contract-change"
+        )
+        self.assertEqual(allowed.returncode, 0)
+        terminal = self.wait_state("terminal")["terminal"]
+        self.assertTrue(str(terminal["contract_digest"]).startswith("sha256:"))
+
+    def test_same_contract_restart_is_not_a_conflict(self) -> None:
+        self.run_cli("start", env={"FAKE_WATCH_SECONDS": "0.1"})
+        self.wait_state("terminal")
+        result, _ = self.run_cli("start", "--restart")
+        self.assertEqual(result.returncode, 0)
+
+    def test_terminal_evidence_strength_is_full_for_new_runs(self) -> None:
+        self.run_cli("start", env={"FAKE_WATCH_SECONDS": "0.1"})
+        payload = self.wait_state("terminal")
+        self.assertEqual(payload["evidence_strength"], "full")
+        wait_payload = self.run_cli(
+            "wait", "--timeout-seconds", "2", "--poll-seconds", "0.01"
+        )[1]
+        self.assertEqual(wait_payload["evidence_strength"], "full")
+        self.assertTrue(wait_payload["terminal_verified"])
+
+    def test_legacy_terminal_without_digest_stays_readable(self) -> None:
+        base = SUPERVISOR.base_dir(self.state, "fakehost", "12345")
+        run = base / "runs" / "run_1000_1_abcd1234"
+        run.mkdir(parents=True)
+        SUPERVISOR.replace_json(base / "current.json", {"run_id": run.name})
+        SUPERVISOR.replace_json(
+            run / "terminal.json",
+            {
+                "schema_version": "codex-hpc-monitor.terminal/v1",
+                "host": "fakehost",
+                "job_id": "12345",
+                "scope": "slurm_only",
+                "project_gate_evaluated": False,
+                "observer_outcome": "watcher_exit_zero",
+                "watcher_exit_code": 0,
+                "watcher_result": {"verified": True, "payload": {}},
+            },
+        )
+        status = self.status()
+        self.assertEqual(status["state"], "terminal")
+        self.assertEqual(status["evidence_strength"], "legacy")
+        wait_payload = self.run_cli(
+            "wait", "--timeout-seconds", "2", "--poll-seconds", "0.01"
+        )[1]
+        self.assertEqual(wait_payload["evidence_strength"], "legacy")
+        self.assertEqual(wait_payload["terminal_verified"], True)
+
+    def test_tampered_contract_digest_fails_closed(self) -> None:
+        self.run_cli("start", env={"FAKE_WATCH_SECONDS": "0.1"})
+        payload = self.wait_state("terminal")
+        run = Path(payload["run_dir"])
+        terminal = json.loads((run / "terminal.json").read_text())
+        terminal["contract_digest"] = "sha256:" + "0" * 64
+        # terminal.json is immutable in real flows; direct rewrite simulates
+        # corruption so verification must reject it.
+        (run / "terminal.json").write_text(json.dumps(terminal, sort_keys=True) + "\n")
+        result, wait_payload = self.run_cli(
+            "wait", "--timeout-seconds", "2", "--poll-seconds", "0.01"
+        )
+        self.assertEqual(result.returncode, 12)
+        self.assertIn("terminal_contract_digest_mismatch", wait_payload["problems"])
+
 
 if __name__ == "__main__":
     unittest.main()
