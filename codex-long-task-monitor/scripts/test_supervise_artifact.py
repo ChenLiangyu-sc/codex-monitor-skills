@@ -485,6 +485,91 @@ class ArtifactSupervisorTests(unittest.TestCase):
 def argv_index(argv: list, flag: str) -> int:
     return argv.index(flag)
 
+    def run_doctor(self, *extra: str):
+        command = [
+            sys.executable, str(SCRIPT), "doctor",
+            "--state-dir", str(self.state), *extra,
+        ]
+        result = subprocess.run(command, text=True, capture_output=True, check=False, timeout=15)
+        if "--format" in extra and extra[extra.index("--format") + 1] == "text":
+            return result, result.stdout
+        return result, json.loads(result.stdout)
+
+    def write_bridge_config(self) -> Path:
+        config = {
+            "schema": semantic_events.BRIDGE_CONFIG_SCHEMA,
+            "enabled": True,
+            "instance_id": "workstation-1",
+            "codex_home_id": "sha256:" + "a" * 64,
+            "workspace": str(self.root),
+            "transport": {"type": "stdio", "command": ["codex", "app-server"]},
+            "request_timeout_seconds": 30,
+            "poll_seconds": 5,
+            "lease_seconds": 300,
+            "max_attempts": 16,
+            "backoff_initial_seconds": 5,
+            "backoff_max_seconds": 3600,
+        }
+        path = self.root / "bridge.json"
+        path.write_text(json.dumps(config), encoding="utf-8")
+        path.chmod(0o600)
+        return path
+
+    def test_doctor_defaults_to_unattended_and_formats_agree(self) -> None:
+        result, payload = self.run_doctor()
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(payload["mode"]["selected"], "unattended")
+        self.assertEqual(payload["mode"]["reason"], "bridge_not_configured")
+        self.assertFalse(payload["auto_resume_available"])
+        self.assertTrue(payload["state_root"]["suitable"])
+        _, text = self.run_doctor("--format", "text")
+        self.assertIn("mode: unattended (requested auto; reason: bridge_not_configured)", text)
+        self.assertIn("auto-resume available: no", text)
+
+    def test_doctor_selects_bridge_with_enabled_config(self) -> None:
+        config = self.write_bridge_config()
+        _, payload = self.run_doctor("--bridge-config", str(config))
+        self.assertEqual(payload["mode"]["selected"], "external-event-bridge")
+        self.assertTrue(payload["auto_resume_available"])
+        _, payload = self.run_doctor(
+            "--bridge-config", str(config), "--mode", "unattended"
+        )
+        self.assertEqual(payload["mode"]["selected"], "unattended")
+        self.assertEqual(payload["mode"]["requested"], "unattended")
+
+    def test_doctor_invalid_config_falls_back_safely(self) -> None:
+        bad = self.root / "bad.json"
+        bad.write_text(json.dumps({"enabled": true_json()}) if False else '{"schema": "x"}', encoding="utf-8")
+        bad.chmod(0o600)
+        _, payload = self.run_doctor("--bridge-config", str(bad))
+        self.assertEqual(payload["mode"]["selected"], "unattended")
+        self.assertTrue(payload["mode"]["reason"].startswith("bridge_config_invalid"))
+
+    def test_list_explain_cleanup(self) -> None:
+        self.write_artifact()
+        result, started = self.start()
+        handle = started["task_handle"]
+        terminal = self.wait_terminal(handle)
+        listing = subprocess.run(
+            [sys.executable, str(SCRIPT), "list", "--state-dir", str(self.state)],
+            text=True, capture_output=True, check=False, timeout=15)
+        entries = json.loads(listing.stdout)["monitors"]
+        self.assertEqual(entries[0]["task_handle"], handle)
+        self.assertEqual(entries[0]["state"], "terminal")
+        self.assertEqual(entries[0]["generation"], terminal["terminal"]["generation"])
+        explain = subprocess.run(
+            [sys.executable, str(SCRIPT), "explain", handle, "--state-dir", str(self.state)],
+            text=True, capture_output=True, check=False, timeout=15)
+        self.assertIn("state=terminal", explain.stdout)
+        self.assertIn("wake events enabled: no", explain.stdout)
+        self.assertIn("cannot wake", explain.stdout)
+        cleanup = subprocess.run(
+            [sys.executable, str(SCRIPT), "cleanup", "--state-dir", str(self.state)],
+            text=True, capture_output=True, check=False, timeout=15)
+        payload = json.loads(cleanup.stdout)
+        self.assertEqual(payload["mode"], "dry_run")
+        self.assertEqual(payload["removed_count"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

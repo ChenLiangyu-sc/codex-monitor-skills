@@ -929,6 +929,279 @@ def positive_float(value: str) -> float:
     return parsed
 
 
+# ---------------------------------------------------------------------------
+# Capability probe (doctor), listing, explanation, and safe outbox cleanup
+# ---------------------------------------------------------------------------
+
+DOCTOR_SCHEMA = "codex-monitor.doctor/v1"
+
+
+def probe_app_server(config: dict[str, Any]) -> dict[str, Any]:
+    import app_server_bridge
+
+    try:
+        session = app_server_bridge.AppServerSession(
+            list(config["transport"]["command"]), float(config["request_timeout_seconds"])
+        )
+    except (OSError, ValueError) as exc:
+        return {"healthy": False, "reason": f"spawn_failed: {type(exc).__name__}"}
+    try:
+        session.initialize()
+    except app_server_bridge.DeliveryError as exc:
+        return {"healthy": False, "reason": exc.code}
+    except Exception as exc:  # defensive: probe must never crash doctor
+        return {"healthy": False, "reason": type(exc).__name__}
+    finally:
+        session.close()
+    return {"healthy": True, "reason": None}
+
+
+def build_doctor_payload(args: argparse.Namespace) -> dict[str, Any]:
+    requested = args.mode
+    checks: list[dict[str, Any]] = []
+    state_dir = Path(args.state_dir).expanduser().resolve()
+    kind = filesystem_type(state_dir)
+    suitable = kind is not None and kind.lower() not in NETWORK_FILESYSTEMS
+    checks.append({
+        "name": "state_root_filesystem",
+        "state": "pass" if suitable else "warn",
+        "detail": f"{state_dir} is on {kind or 'unknown filesystem'}",
+    })
+    app_server: dict[str, Any] = {"configured": False}
+    reason = "bridge_not_configured"
+    if args.bridge_config is not None:
+        try:
+            config = semantic_events.load_bridge_config(Path(args.bridge_config))
+            app_server = {
+                "configured": True,
+                "transport": config["transport"]["type"],
+                "instance_id": config["instance_id"],
+                "enabled": config["enabled"],
+            }
+            if not config["enabled"]:
+                reason = "bridge_disabled"
+                checks.append({"name": "bridge_config", "state": "warn",
+                               "detail": "configuration present but disabled"})
+            elif args.probe_app_server:
+                health = probe_app_server(config)
+                app_server.update(health)
+                if health["healthy"]:
+                    reason = "bridge_configured_and_healthy"
+                    checks.append({"name": "app_server_probe", "state": "pass",
+                                   "detail": "initialize handshake succeeded"})
+                else:
+                    reason = f"bridge_probe_failed:{health['reason']}"
+                    checks.append({"name": "app_server_probe", "state": "warn",
+                                   "detail": health["reason"] or "unhealthy"})
+            else:
+                reason = "bridge_configured"
+                checks.append({"name": "bridge_config", "state": "pass",
+                               "detail": "valid and enabled (no live probe requested)"})
+        except semantic_events.SemanticEventError as exc:
+            reason = f"bridge_config_invalid:{exc.reason}"
+            checks.append({"name": "bridge_config", "state": "warn",
+                           "detail": exc.reason})
+    else:
+        checks.append({"name": "bridge_config", "state": "pass",
+                       "detail": "no configuration file supplied"})
+
+    selected = requested
+    if requested == "external-event-bridge":
+        if not reason.startswith("bridge_configured"):
+            selected = "unattended"
+    elif requested == "auto":
+        selected = (
+            "external-event-bridge"
+            if reason.startswith("bridge_configured")
+            else "unattended"
+        )
+
+    outbox_root = semantic_events.outbox_root(state_dir)
+    entries = semantic_events.list_outbox(outbox_root) if outbox_root.exists() else []
+    auto_resume = selected == "external-event-bridge"
+    return {
+        "schema_version": DOCTOR_SCHEMA,
+        "skill": "codex-long-task-monitor",
+        "mode": {"selected": selected, "requested": requested, "reason": reason},
+        "zero_turns_while_unchanged": True,
+        "agent_slot_occupied": False,
+        "auto_resume_available": auto_resume,
+        "notification_available": auto_resume,
+        "state_root": {
+            "path": str(state_dir),
+            "filesystem": kind,
+            "suitable": suitable,
+            "reason": None if suitable else "network or unknown filesystem",
+        },
+        "outbox": {
+            "present": outbox_root.exists(),
+            "pending": sum(1 for e in entries if e.get("state") == "pending"),
+            "delivered": sum(1 for e in entries if e.get("state") == "delivered"),
+            "dead_letter": sum(1 for e in entries if e.get("state") == "dead_letter"),
+        },
+        "app_server": app_server,
+        "goal_worker": {
+            "available": False,
+            "reason": "runtime_capability_not_provable_deterministically",
+        },
+        "recovery_command": (
+            f"python3 {Path(__file__).resolve()} status <task-handle> "
+            f"--state-dir {state_dir}"
+        ),
+        "checks": checks,
+    }
+
+
+def render_doctor_text(payload: dict[str, Any]) -> str:
+    app_server = payload["app_server"]
+    if app_server["configured"]:
+        app_line = (
+            f"app server: transport={app_server.get('transport')} "
+            f"instance={app_server.get('instance_id')} "
+            f"enabled={app_server.get('enabled')} healthy={app_server.get('healthy')}"
+        )
+    else:
+        app_line = "app server: not configured"
+    return "\n".join([
+        f"{payload['skill']} doctor",
+        "mode: {selected} (requested {requested}; reason: {reason})".format(
+            **payload["mode"]
+        ),
+        "zero model turns while unchanged: yes",
+        f"agent slot occupied: {'yes' if payload['agent_slot_occupied'] else 'no'}",
+        f"auto-resume available: {'yes' if payload['auto_resume_available'] else 'no'}",
+        f"notification available: {'yes' if payload['notification_available'] else 'no'}",
+        "state root: {path} ({filesystem}, {suitability})".format(
+            path=payload["state_root"]["path"],
+            filesystem=payload["state_root"]["filesystem"] or "unknown",
+            suitability="suitable" if payload["state_root"]["suitable"] else "unsuitable",
+        ),
+        "outbox: present={present} pending={pending} delivered={delivered} "
+        "dead_letter={dead_letter}".format(**payload["outbox"]),
+        app_line,
+        "goal worker: not available ({reason})".format(reason=payload["goal_worker"]["reason"]),
+        f"recovery: {payload['recovery_command']}",
+    ])
+
+
+def doctor_command(args: argparse.Namespace) -> int:
+    payload = build_doctor_payload(args)
+    if args.format == "text":
+        print(render_doctor_text(payload))
+    else:
+        print(json.dumps(payload, sort_keys=True))
+    failed = [c for c in payload["checks"] if c["state"] == "fail"]
+    return 1 if failed else 0
+
+
+def list_command(args: argparse.Namespace) -> int:
+    artifacts = Path(args.state_dir) / "artifacts"
+    entries = []
+    if artifacts.is_dir():
+        for child in sorted(artifacts.iterdir()):
+            if not child.is_dir() or not HANDLE_RE.fullmatch(child.name):
+                continue
+            status = run_status(current_run(child), child.name)
+            terminal = status.get("terminal") or {}
+            entries.append({
+                "task_handle": child.name,
+                "state": status.get("state"),
+                "run_id": status.get("run_id"),
+                "generation": terminal.get("generation"),
+                "observer_outcome": terminal.get("observer_outcome"),
+            })
+    print(json.dumps({
+        "schema_version": "codex-monitor.list/v1",
+        "skill": "codex-long-task-monitor",
+        "monitors": entries,
+    }, sort_keys=True))
+    return 0
+
+
+EXPLAIN_GUIDANCE = {
+    "not_started": "no monitor recorded for this handle",
+    "active": (
+        "the detached supervisor is alive; end the turn now and read status "
+        "once on a later genuine event - a terminal file cannot wake an "
+        "inactive Codex turn"
+    ),
+    "terminal": (
+        "read the verified terminal record and perform business acceptance "
+        "independently; it is observation evidence only, and a terminal "
+        "file cannot wake an inactive Codex turn by itself"
+    ),
+    "launch_unconfirmed": "handshake never observed; inspect ownership before restarting",
+    "supervisor_lost": (
+        "the recorded supervisor identity is no longer live and no terminal is "
+        "established; fail closed and review the run evidence"
+    ),
+    "exit_observed_terminal_missing": (
+        "the watcher exited but terminal publication is incomplete; fail closed"
+    ),
+    "verification_failed": (
+        "local evidence failed verification; do not restart blindly and never "
+        "treat the record as success"
+    ),
+}
+
+
+def explain_command(args: argparse.Namespace) -> int:
+    if not HANDLE_RE.fullmatch(args.task_handle):
+        raise ValueError("invalid artifact task handle")
+    state_dir = Path(args.state_dir).expanduser().resolve()
+    status = run_status(current_run(base_dir(state_dir, args.task_handle)), args.task_handle)
+    state = status.get("state", "unknown")
+    run = current_run(base_dir(state_dir, args.task_handle))
+    wake_events_enabled = False
+    if run is not None:
+        manifest = read_json(run / "manifest.json")
+        wake_events_enabled = isinstance(manifest.get("event_binding"), dict)
+    script = Path(__file__).resolve()
+    payload = {
+        "schema_version": "codex-monitor.explain/v1",
+        "skill": "codex-long-task-monitor",
+        "task_handle": args.task_handle,
+        "state": state,
+        "guidance": EXPLAIN_GUIDANCE.get(
+            state, "unknown state; inspect the run directory before acting"
+        ),
+        "wake_events_enabled": wake_events_enabled,
+        "deadline_epoch_seconds": status.get("deadline_epoch_seconds"),
+        "next_commands": [
+            f"python3 {script} status {args.task_handle} --state-dir {state_dir}",
+        ],
+    }
+    if args.format == "text":
+        print(f"{args.task_handle}: state={state}")
+        print(f"wake events enabled: {'yes' if wake_events_enabled else 'no'}")
+        print(f"guidance: {payload['guidance']}")
+        for command in payload["next_commands"]:
+            print(f"next: {command}")
+    else:
+        print(json.dumps(payload, sort_keys=True))
+    return 0
+
+
+def cleanup_command(args: argparse.Namespace) -> int:
+    outbox = semantic_events.outbox_root(Path(args.state_dir))
+    removed = semantic_events.cleanup_outbox(
+        outbox,
+        now=datetime.now(timezone.utc),
+        older_than_seconds=max(0.0, args.older_than_days) * 86400.0,
+        include_dead_letter=args.include_dead_letter,
+        apply=args.yes,
+    )
+    print(json.dumps({
+        "schema_version": "codex-monitor.cleanup/v1",
+        "skill": "codex-long-task-monitor",
+        "mode": "applied" if args.yes else "dry_run",
+        "scope": "outbox only; run directories and terminal evidence are never touched",
+        "removed_event_ids": removed,
+        "removed_count": len(removed),
+    }, sort_keys=True))
+    return 0
+
+
 def nonnegative_float(value: str) -> float:
     parsed = float(value)
     if parsed < 0:
@@ -1028,6 +1301,45 @@ def parser() -> argparse.ArgumentParser:
     internal.add_argument("--manifest-sha256", required=True)
     internal.add_argument("--lock-fd", type=int, required=True)
     internal.set_defaults(func=supervise)
+
+    doctor = sub.add_parser("doctor", help="report mode capability and health")
+    doctor.add_argument(
+        "--state-dir", type=Path,
+        default=Path.home() / ".cache" / "codex-long-task-monitor",
+    )
+    doctor.add_argument("--bridge-config", type=Path)
+    doctor.add_argument(
+        "--mode", choices=("auto", "unattended", "external-event-bridge"), default="auto"
+    )
+    doctor.add_argument("--probe-app-server", action="store_true")
+    doctor.add_argument("--format", choices=("text", "json"), default="json")
+    doctor.set_defaults(func=doctor_command)
+
+    listing = sub.add_parser("list", help="enumerate local monitors")
+    listing.add_argument(
+        "--state-dir", type=Path,
+        default=Path.home() / ".cache" / "codex-long-task-monitor",
+    )
+    listing.set_defaults(func=list_command)
+
+    explain = sub.add_parser("explain", help="explain one monitor in plain language")
+    explain.add_argument("task_handle")
+    explain.add_argument(
+        "--state-dir", type=Path,
+        default=Path.home() / ".cache" / "codex-long-task-monitor",
+    )
+    explain.add_argument("--format", choices=("text", "json"), default="text")
+    explain.set_defaults(func=explain_command)
+
+    cleanup = sub.add_parser("cleanup", help="inspect or remove settled outbox events")
+    cleanup.add_argument(
+        "--state-dir", type=Path,
+        default=Path.home() / ".cache" / "codex-long-task-monitor",
+    )
+    cleanup.add_argument("--older-than-days", type=float, default=7.0)
+    cleanup.add_argument("--include-dead-letter", action="store_true")
+    cleanup.add_argument("--yes", action="store_true", help="actually remove (default is dry-run)")
+    cleanup.set_defaults(func=cleanup_command)
     return result
 
 
@@ -1090,7 +1402,9 @@ def main() -> int:
     try:
         if hasattr(args, "state_dir"):
             args.state_dir = args.state_dir.expanduser().resolve()
-            validate_local_state_root(args.state_dir)
+            # doctor reports filesystem suitability instead of refusing.
+            if args.command != "doctor":
+                validate_local_state_root(args.state_dir)
         if args.command == "start":
             validate_start_contract(args)
         return int(args.func(args))

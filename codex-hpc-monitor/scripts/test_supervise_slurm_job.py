@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+from datetime import datetime, timezone
 import json
 import os
 import signal
@@ -573,6 +574,115 @@ class SupervisorTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.wait_state("terminal")
         self.assertEqual(len(semantic_events.list_outbox(self.outbox())), 1)
+
+    def run_doctor(self, *extra: str) -> tuple[subprocess.CompletedProcess[str], dict | str]:
+        command = [
+            sys.executable, str(SCRIPT), "doctor",
+            "--state-dir", str(self.state), *extra,
+        ]
+        result = subprocess.run(command, text=True, capture_output=True, check=False, timeout=15)
+        if "--format" in extra and extra[extra.index("--format") + 1] == "text":
+            return result, result.stdout
+        return result, json.loads(result.stdout)
+
+    def test_doctor_defaults_to_unattended_and_formats_agree(self) -> None:
+        result, payload = self.run_doctor()
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(payload["mode"]["selected"], "unattended")
+        self.assertEqual(payload["mode"]["reason"], "bridge_not_configured")
+        self.assertFalse(payload["auto_resume_available"])
+        self.assertTrue(payload["zero_turns_while_unchanged"])
+        self.assertFalse(payload["agent_slot_occupied"])
+        self.assertTrue(payload["state_root"]["suitable"])
+        self.assertFalse(payload["app_server"]["configured"])
+        _, text = self.run_doctor("--format", "text")
+        self.assertIn("mode: unattended (requested auto; reason: bridge_not_configured)", text)
+        self.assertIn("auto-resume available: no", text)
+        self.assertIn("zero model turns while unchanged: yes", text)
+
+    def test_doctor_selects_bridge_with_enabled_config(self) -> None:
+        config = self.write_bridge_config()
+        result, payload = self.run_doctor("--bridge-config", str(config))
+        self.assertEqual(payload["mode"]["selected"], "external-event-bridge")
+        self.assertTrue(payload["auto_resume_available"])
+        self.assertTrue(payload["notification_available"])
+        _, text = self.run_doctor("--bridge-config", str(config), "--format", "text")
+        self.assertIn("mode: external-event-bridge", text)
+        self.assertIn("auto-resume available: yes", text)
+
+    def test_doctor_invalid_or_disabled_config_falls_back_to_unattended(self) -> None:
+        bad = self.root / "bad.json"
+        bad.write_text(json.dumps({"schema": "wrong"}), encoding="utf-8")
+        bad.chmod(0o600)
+        _, payload = self.run_doctor("--bridge-config", str(bad))
+        self.assertEqual(payload["mode"]["selected"], "unattended")
+        self.assertTrue(payload["mode"]["reason"].startswith("bridge_config_invalid"))
+        disabled = self.write_bridge_config()
+        config = json.loads(disabled.read_text())
+        config["enabled"] = False
+        disabled.write_text(json.dumps(config))
+        _, payload = self.run_doctor("--bridge-config", str(disabled))
+        self.assertEqual(payload["mode"]["selected"], "unattended")
+        self.assertEqual(payload["mode"]["reason"], "bridge_disabled")
+
+    def test_doctor_explicit_bridge_without_healthy_config_falls_back(self) -> None:
+        _, payload = self.run_doctor("--mode", "external-event-bridge")
+        self.assertEqual(payload["mode"]["selected"], "unattended")
+        self.assertEqual(payload["mode"]["requested"], "external-event-bridge")
+
+    def test_list_explain_and_cleanup(self) -> None:
+        self.run_cli("start", env={"FAKE_EXIT": "0"})
+        terminal = self.wait_state("terminal")
+        listing = subprocess.run(
+            [sys.executable, str(SCRIPT), "list", "--state-dir", str(self.state)],
+            text=True, capture_output=True, check=False, timeout=15,
+        )
+        entries = json.loads(listing.stdout)["monitors"]
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["job_id"], "12345")
+        self.assertEqual(entries[0]["state"], "terminal")
+        self.assertEqual(entries[0]["evidence_strength"], "full")
+        explain = subprocess.run(
+            [sys.executable, str(SCRIPT), "explain", "12345", "--host", "fakehost",
+             "--state-dir", str(self.state)],
+            text=True, capture_output=True, check=False, timeout=15,
+        )
+        self.assertIn("state=terminal", explain.stdout)
+        self.assertIn("cannot wake", explain.stdout)
+        self.assertIn("wake events enabled: no", explain.stdout)
+        # cleanup: settle one outbox event in the past, then dry-run and apply
+        binding = json.loads(self.write_binding().read_text())
+        event = semantic_events.build_event(
+            backend="slurm", handle="fakehost-12345",
+            generation=terminal["run_id"],
+            terminal_digest="sha256:" + "c" * 64,
+            event="transport_success", exit_code=0, binding=binding,
+        )
+        semantic_events.publish_event(self.outbox(), event)
+        settle = datetime.now(timezone.utc)
+        semantic_events.claim_next_event(self.outbox(), owner="t", lease_seconds=600, now=settle)
+        semantic_events.acknowledge_event(
+            self.outbox(), event["event_id"], owner="t", now=settle,
+            thread_id="thr", turn_id="turn",
+        )
+        dry = subprocess.run(
+            [sys.executable, str(SCRIPT), "cleanup", "--state-dir", str(self.state),
+             "--older-than-days", "0"],
+            text=True, capture_output=True, check=False, timeout=15,
+        )
+        dry_payload = json.loads(dry.stdout)
+        self.assertEqual(dry_payload["mode"], "dry_run")
+        self.assertEqual(dry_payload["removed_count"], 1)
+        self.assertEqual(len(semantic_events.list_outbox(self.outbox())), 1)
+        applied = subprocess.run(
+            [sys.executable, str(SCRIPT), "cleanup", "--state-dir", str(self.state),
+             "--older-than-days", "0", "--yes"],
+            text=True, capture_output=True, check=False, timeout=15,
+        )
+        applied_payload = json.loads(applied.stdout)
+        self.assertEqual(applied_payload["mode"], "applied")
+        self.assertEqual(applied_payload["removed_count"], 1)
+        self.assertEqual(semantic_events.list_outbox(self.outbox()), [])
 
 
 if __name__ == "__main__":

@@ -971,7 +971,10 @@ def cleanup_outbox(
 def postflight_path(state_dir: Path, event_id: str) -> Path:
     if not isinstance(event_id, str) or not event_id.startswith("sha256:"):
         raise SemanticEventError("event_id_invalid")
-    return Path(state_dir) / "postflight" / event_id[len("sha256:"):]
+    hex_part = event_id[len("sha256:"):]
+    if not HEX64_RE.fullmatch(hex_part):
+        raise SemanticEventError("event_id_invalid")
+    return Path(state_dir) / "postflight" / hex_part
 
 
 def postflight_check(state_dir: Path, event_id: str) -> Dict[str, Any]:

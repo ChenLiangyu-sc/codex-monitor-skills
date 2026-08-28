@@ -1,0 +1,402 @@
+#!/usr/bin/env python3
+"""Integration tests for the vendored App Server delivery adapter.
+
+Uses a deterministic fake JSONL JSON-RPC server; no real Codex App Server,
+credentials, or network access is required."""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+
+HERE = Path(__file__).resolve().parent
+BRIDGE = HERE / "app_server_bridge.py"
+import semantic_events as se
+
+
+NOW = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+FAKE_SERVER = r'''#!/usr/bin/env python3
+import json, os, sys, time
+
+MODE = os.environ.get("FAKE_MODE", "ok")
+LOG = os.environ.get("FAKE_LOG")
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+def log(text):
+    if LOG:
+        with open(LOG, "a", encoding="utf-8") as handle:
+            handle.write(text + "\n===\n")
+
+for raw in sys.stdin:
+    line = raw.strip()
+    if not line:
+        continue
+    try:
+        message = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    method = message.get("method")
+    mid = message.get("id")
+    if MODE == "garbage":
+        sys.stdout.write("this is not json\n")
+        sys.stdout.flush()
+        continue
+    if method == "initialize":
+        if MODE == "overload_init":
+            send({"id": mid, "error": {"code": -32001, "message": "overloaded"}})
+            continue
+        if MODE == "drop_before_init":
+            sys.exit(0)
+        send({"id": mid, "result": {"userInfo": {"id": "u"}, "supportedCommands": []}})
+    elif method == "initialized":
+        if MODE == "drop_after_init":
+            sys.exit(1)
+    elif method == "thread/resume":
+        if MODE == "thread_missing":
+            send({"id": mid, "error": {"code": -32602, "message": "thread thr_x not found"}})
+        elif MODE == "thread_archived":
+            send({"id": mid, "error": {"code": -32602, "message": "thread is archived"}})
+        elif MODE == "mcp_required":
+            send({"id": mid, "error": {"code": -32000, "message": "required MCP server failed to initialize"}})
+        elif MODE == "overload":
+            send({"id": mid, "error": {"code": -32001, "message": "overloaded"}})
+        elif MODE == "resume_bad_shape":
+            send({"id": mid, "result": {"thread": {"id": "thr_other"}}})
+        else:
+            send({"id": mid, "result": {"thread": {"id": message["params"]["threadId"]}}})
+    elif method == "turn/start":
+        if MODE == "turn_conflict":
+            send({"id": mid, "error": {"code": -32000, "message": "thread already has an active turn"}})
+        elif MODE == "turn_bad_shape":
+            send({"id": mid, "result": {"turn": {"status": "inProgress"}}})
+        elif MODE == "hang":
+            time.sleep(30)
+        elif MODE == "drop_before_turn_reply":
+            sys.exit(0)
+        else:
+            log(message["params"]["input"][0]["text"])
+            send({"id": mid, "result": {"turn": {"id": "turn_fake_1", "status": "inProgress", "items": [], "error": None}}})
+'''
+
+
+class BridgeAdapterTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.state = self.root / "state"
+        self.fake = self.root / "fake_app_server.py"
+        self.fake.write_text(FAKE_SERVER, encoding="utf-8")
+        self.fake.chmod(0o700)
+        self.wake_log = self.root / "wake.log"
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    # -- fixtures ---------------------------------------------------------
+
+    def write_config(self, **overrides) -> Path:
+        config = {
+            "schema": se.BRIDGE_CONFIG_SCHEMA,
+            "enabled": True,
+            "instance_id": "workstation-1",
+            "codex_home_id": "sha256:" + "a" * 64,
+            "workspace": str(self.root / "project"),
+            "transport": {"type": "stdio", "command": [sys.executable, str(self.fake)]},
+            "request_timeout_seconds": 5,
+            "poll_seconds": 0.05,
+            "lease_seconds": 60,
+            "max_attempts": 16,
+            "backoff_initial_seconds": 0.05,
+            "backoff_max_seconds": 0.2,
+        }
+        config.update(overrides)
+        path = self.root / "bridge.json"
+        path.write_text(json.dumps(config), encoding="utf-8")
+        path.chmod(0o600)
+        return path
+
+    def write_binding_file(self, **overrides) -> Path:
+        binding = {
+            "schema": se.EVENT_BINDING_SCHEMA,
+            "codex_home_id": "sha256:" + "a" * 64,
+            "app_server_instance": "workstation-1",
+            "thread_id": "thr_test_1",
+            "workspace": str(self.root / "project"),
+        }
+        binding.update(overrides)
+        path = self.root / "binding.json"
+        path.write_text(json.dumps(binding), encoding="utf-8")
+        path.chmod(0o600)
+        return path
+
+    def publish_event(self, *, event: str = "transport_success", exit_code: int | None = 0,
+                      binding: dict | None = None) -> dict:
+        payload = se.build_event(
+            backend="slurm",
+            handle="fakehost-12345",
+            generation="run_1_2_abcd1234",
+            terminal_digest="sha256:" + "b" * 64,
+            event=event,
+            exit_code=exit_code,
+            binding=binding or json.loads(self.write_binding_file().read_text()),
+        )
+        se.publish_event(se.outbox_root(self.state), payload)
+        return payload
+
+    def deliver(self, config: Path, once: bool = True, mode: str = "ok") -> tuple[int, list[dict]]:
+        command = [
+            sys.executable, str(BRIDGE), "deliver",
+            "--state-dir", str(self.state), "--bridge-config", str(config),
+        ]
+        if once:
+            command.append("--once")
+        env = os.environ.copy()
+        env.update({"FAKE_MODE": mode, "FAKE_LOG": str(self.wake_log)})
+        result = subprocess.run(command, text=True, capture_output=True, check=False, env=env, timeout=30)
+        records = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+        return result.returncode, records
+
+    def delivery_of(self, event_id: str) -> dict:
+        return se._read_delivery(se.event_dir(se.outbox_root(self.state), event_id), event_id)
+
+    # -- happy path -------------------------------------------------------
+
+    def test_verified_event_creates_one_turn_with_fixed_wake_text(self) -> None:
+        config = self.write_config()
+        event = self.publish_event()
+        code, records = self.deliver(config)
+        self.assertEqual(code, 0)
+        outcome = records[0]
+        self.assertEqual(outcome["state"], "acknowledged")
+        self.assertEqual(outcome["turn_id"], "turn_fake_1")
+        delivery = self.delivery_of(event["event_id"])
+        self.assertEqual(delivery["state"], "delivered")
+        self.assertEqual(delivery["delivery"]["turn_id"], "turn_fake_1")
+        self.assertEqual(delivery["delivery"]["thread_id"], "thr_test_1")
+        wake = self.wake_log.read_text()
+        self.assertIn(f"event_id={event['event_id']}", wake)
+        self.assertIn("event=transport_success", wake)
+        self.assertIn("business_verdict=pending", wake)
+        self.assertIn("Do not retry, cancel, resubmit, mutate, or approve", wake)
+        # exactly one wake turn was started
+        self.assertEqual(wake.count("==="), 1)
+
+    def test_second_run_has_nothing_left_to_deliver(self) -> None:
+        config = self.write_config()
+        self.publish_event()
+        self.deliver(config)
+        code, records = self.deliver(config)
+        self.assertEqual(code, 0)
+        self.assertEqual(records[-1]["state"], "idle")
+        self.assertEqual(records[-1]["delivered"], 0)
+        self.assertEqual(self.wake_log.read_text().count("==="), 1)
+
+    # -- retryable failures -------------------------------------------------
+
+    def test_overload_is_retryable_with_backoff(self) -> None:
+        config = self.write_config()
+        event = self.publish_event()
+        code, records = self.deliver(config, mode="overload")
+        self.assertEqual(code, 0)
+        self.assertEqual(records[0]["state"], "scheduled_retry")
+        self.assertEqual(records[0]["error_code"], "overloaded")
+        delivery = self.delivery_of(event["event_id"])
+        self.assertEqual(delivery["state"], "pending")
+        self.assertEqual(delivery["attempts"], 1)
+        self.assertEqual(delivery["last_error"]["code"], "overloaded")
+        self.assertIsNotNone(delivery["next_attempt_at"])
+
+    def test_turn_conflict_is_retryable(self) -> None:
+        config = self.write_config()
+        event = self.publish_event()
+        _, records = self.deliver(config, mode="turn_conflict")
+        self.assertEqual(records[0]["error_code"], "active_turn_conflict")
+        self.assertEqual(records[0]["state"], "scheduled_retry")
+
+    def test_connection_drop_is_retryable(self) -> None:
+        config = self.write_config()
+        event = self.publish_event()
+        _, records = self.deliver(config, mode="drop_after_init")
+        self.assertEqual(records[0]["error_code"], "connection_lost")
+        self.assertEqual(self.delivery_of(event["event_id"])["state"], "pending")
+
+    def test_drop_before_turn_reply_is_retryable(self) -> None:
+        config = self.write_config()
+        event = self.publish_event()
+        _, records = self.deliver(config, mode="drop_before_turn_reply")
+        self.assertEqual(records[0]["error_code"], "connection_lost")
+        self.assertEqual(self.delivery_of(event["event_id"])["state"], "pending")
+
+    def test_timeout_is_retryable(self) -> None:
+        config = self.write_config(request_timeout_seconds=0.5)
+        event = self.publish_event()
+        _, records = self.deliver(config, mode="hang")
+        self.assertEqual(records[0]["error_code"], "request_timeout")
+        self.assertEqual(self.delivery_of(event["event_id"])["state"], "pending")
+
+    def test_mcp_required_failure_is_retryable(self) -> None:
+        config = self.write_config()
+        self.publish_event()
+        _, records = self.deliver(config, mode="mcp_required")
+        self.assertEqual(records[0]["error_code"], "required_mcp_failure")
+        self.assertEqual(records[0]["state"], "scheduled_retry")
+
+    def test_retryable_failure_exhausts_into_dead_letter(self) -> None:
+        config = self.write_config(max_attempts=1)
+        event = self.publish_event()
+        _, records = self.deliver(config, mode="overload")
+        self.assertEqual(records[0]["state"], "dead_lettered")
+        delivery = self.delivery_of(event["event_id"])
+        self.assertEqual(delivery["state"], "dead_letter")
+
+    # -- permanent failures ---------------------------------------------------
+
+    def test_missing_thread_dead_letters_without_new_thread(self) -> None:
+        config = self.write_config()
+        event = self.publish_event()
+        _, records = self.deliver(config, mode="thread_missing")
+        self.assertEqual(records[0]["error_code"], "thread_missing")
+        self.assertEqual(records[0]["state"], "dead_lettered")
+        self.assertFalse(self.wake_log.exists())
+
+    def test_archived_thread_dead_letters(self) -> None:
+        config = self.write_config()
+        self.publish_event()
+        _, records = self.deliver(config, mode="thread_archived")
+        self.assertEqual(records[0]["error_code"], "thread_archived")
+        self.assertEqual(records[0]["state"], "dead_lettered")
+
+    def test_resume_shape_mismatch_dead_letters(self) -> None:
+        config = self.write_config()
+        self.publish_event()
+        _, records = self.deliver(config, mode="resume_bad_shape")
+        self.assertEqual(records[0]["error_code"], "unsupported_response_shape")
+        self.assertEqual(records[0]["state"], "dead_lettered")
+
+    def test_turn_shape_without_id_dead_letters(self) -> None:
+        config = self.write_config()
+        self.publish_event()
+        _, records = self.deliver(config, mode="turn_bad_shape")
+        self.assertEqual(records[0]["error_code"], "unsupported_response_shape")
+        self.assertEqual(records[0]["state"], "dead_lettered")
+
+    def test_workspace_mismatch_dead_letters(self) -> None:
+        config = self.write_config()
+        event = self.publish_event(
+            binding=json.loads(
+                self.write_binding_file(workspace="/somewhere/else").read_text()
+            )
+        )
+        _, records = self.deliver(config)
+        self.assertEqual(records[0]["error_code"], "binding_mismatch")
+        self.assertEqual(self.delivery_of(event["event_id"])["state"], "dead_letter")
+
+    # -- instance isolation ----------------------------------------------------
+
+    def test_foreign_instance_event_is_never_claimed(self) -> None:
+        config = self.write_config()
+        self.publish_event(
+            binding=json.loads(
+                self.write_binding_file(app_server_instance="other-host").read_text()
+            )
+        )
+        code, records = self.deliver(config)
+        self.assertEqual(code, 0)
+        self.assertEqual(records[-1]["state"], "idle")
+        entries = se.list_outbox(se.outbox_root(self.state))
+        self.assertEqual(entries[0]["state"], "pending")
+
+    def test_disabled_config_is_refused(self) -> None:
+        config = self.write_config(enabled=False)
+        self.publish_event()
+        code, records = self.deliver(config)
+        self.assertEqual(code, 3)
+        self.assertEqual(records[0]["state"], "refused")
+        self.assertEqual(records[0]["reason"], "bridge_disabled")
+        self.assertEqual(se.list_outbox(se.outbox_root(self.state))[0]["state"], "pending")
+
+    def test_invalid_config_fails_closed(self) -> None:
+        bad = self.root / "bad.json"
+        bad.write_text(json.dumps({"schema": "nope"}), encoding="utf-8")
+        bad.chmod(0o600)
+        code, records = self.deliver(bad)
+        self.assertEqual(code, 12)
+        self.assertEqual(records[0]["state"], "error")
+
+    # -- tooling commands --------------------------------------------------------
+
+    def test_init_commands_write_valid_files(self) -> None:
+        config_path = self.root / "cfg.json"
+        binding_path = self.root / "bnd.json"
+        codex_home = self.root / ".codex"
+        codex_home.mkdir()
+        workspace = self.root / "project"
+        result = subprocess.run(
+            [sys.executable, str(BRIDGE), "init-config", "--output", str(config_path),
+             "--instance-id", "workstation-1", "--workspace", str(workspace),
+             "--codex-home", str(codex_home), "--enabled"],
+            text=True, capture_output=True, check=False, timeout=10)
+        self.assertEqual(result.returncode, 0)
+        result = subprocess.run(
+            [sys.executable, str(BRIDGE), "init-binding", "--output", str(binding_path),
+             "--thread-id", "thr_123", "--instance-id", "workstation-1",
+             "--workspace", str(workspace), "--codex-home", str(codex_home)],
+            text=True, capture_output=True, check=False, timeout=10)
+        self.assertEqual(result.returncode, 0)
+        config = se.load_bridge_config(config_path)
+        binding = se.load_event_binding(binding_path)
+        self.assertTrue(config["enabled"])
+        self.assertEqual(binding["thread_id"], "thr_123")
+        self.assertEqual(config["codex_home_id"], binding["codex_home_id"])
+        # binding agrees with config identity
+        self.assertEqual(binding["app_server_instance"], config["instance_id"])
+        self.assertEqual(binding["workspace"], config["workspace"])
+
+    def test_status_reports_mode_and_outbox(self) -> None:
+        config = self.write_config()
+        self.publish_event()
+        result = subprocess.run(
+            [sys.executable, str(BRIDGE), "status", "--state-dir", str(self.state),
+             "--bridge-config", str(config)],
+            text=True, capture_output=True, check=False, timeout=10)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["mode"], "external-event-bridge")
+        self.assertEqual(payload["pending"], 1)
+
+    def test_status_reports_unattended_without_config(self) -> None:
+        result = subprocess.run(
+            [sys.executable, str(BRIDGE), "status", "--state-dir", str(self.state),
+             "--bridge-config", str(self.root / "absent.json")],
+            text=True, capture_output=True, check=False, timeout=10)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["mode"], "unattended")
+        self.assertEqual(payload["config"]["reason"], "config_missing")
+
+
+class VendorSyncTests(unittest.TestCase):
+    SIBLING = "codex-long-task-monitor"
+
+    def test_vendored_copies_are_identical(self) -> None:
+        sibling = HERE.parent.parent / self.SIBLING / "scripts" / "app_server_bridge.py"
+        if not sibling.exists():
+            self.skipTest(f"sibling skill not installed: {self.SIBLING}")
+        self.assertEqual(
+            (HERE / "app_server_bridge.py").read_bytes(),
+            sibling.read_bytes(),
+            "vendored app_server_bridge.py copies have diverged",
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

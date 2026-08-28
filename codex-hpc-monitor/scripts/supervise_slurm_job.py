@@ -960,6 +960,343 @@ def positive_float(value: str) -> float:
     return parsed
 
 
+# ---------------------------------------------------------------------------
+# Capability probe (doctor), listing, explanation, and safe outbox cleanup
+# ---------------------------------------------------------------------------
+
+DOCTOR_SCHEMA = "codex-monitor.doctor/v1"
+NETWORK_FILESYSTEMS = {
+    "9p", "afs", "ceph", "cifs", "fuse.ceph", "fuse.glusterfs", "fuse.sshfs",
+    "glusterfs", "lustre", "nfs", "nfs4", "smb3",
+}
+
+
+def decode_mount_field(value: str) -> str:
+    replacements = {"\\040": " ", "\\011": "\t", "\\012": "\n", "\\134": "\\"}
+    for encoded, decoded in replacements.items():
+        value = value.replace(encoded, decoded)
+    return value
+
+
+def filesystem_type(path: Path) -> Optional[str]:
+    probe = path
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    try:
+        resolved = probe.resolve(strict=True)
+        lines = Path("/proc/self/mountinfo").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    best: Optional[tuple] = None
+    for line in lines:
+        before, separator, after = line.partition(" - ")
+        fields = before.split()
+        after_fields = after.split()
+        if not separator or len(fields) < 5 or not after_fields:
+            continue
+        mount_point = Path(decode_mount_field(fields[4]))
+        if resolved == mount_point or mount_point in resolved.parents:
+            candidate = (len(str(mount_point)), after_fields[0])
+            if best is None or candidate[0] > best[0]:
+                best = candidate
+    return best[1] if best else None
+
+
+def probe_app_server(config: Dict[str, Any]) -> Dict[str, Any]:
+    import app_server_bridge
+
+    try:
+        session = app_server_bridge.AppServerSession(
+            list(config["transport"]["command"]),
+            float(config["request_timeout_seconds"]),
+        )
+    except (OSError, ValueError) as exc:
+        return {"healthy": False, "reason": f"spawn_failed: {type(exc).__name__}"}
+    try:
+        session.initialize()
+    except app_server_bridge.DeliveryError as exc:
+        return {"healthy": False, "reason": exc.code}
+    except Exception as exc:  # defensive: probe must never crash doctor
+        return {"healthy": False, "reason": type(exc).__name__}
+    finally:
+        session.close()
+    return {"healthy": True, "reason": None}
+
+
+def build_doctor_payload(args: argparse.Namespace) -> Dict[str, Any]:
+    requested = args.mode
+    checks: List[Dict[str, Any]] = []
+    kind = filesystem_type(args.state_dir)
+    suitable = kind is not None and kind.lower() not in NETWORK_FILESYSTEMS
+    checks.append({
+        "name": "state_root_filesystem",
+        "state": "pass" if suitable else "warn",
+        "detail": f"{args.state_dir} is on {kind or 'unknown filesystem'}",
+    })
+    app_server: Dict[str, Any] = {"configured": False}
+    reason = "bridge_not_configured"
+    if args.bridge_config is not None:
+        try:
+            config = semantic_events.load_bridge_config(args.bridge_config)
+            app_server = {
+                "configured": True,
+                "transport": config["transport"]["type"],
+                "instance_id": config["instance_id"],
+                "enabled": config["enabled"],
+            }
+            if not config["enabled"]:
+                reason = "bridge_disabled"
+                checks.append({"name": "bridge_config", "state": "warn",
+                               "detail": "configuration present but disabled"})
+            elif args.probe_app_server:
+                health = probe_app_server(config)
+                app_server.update(health)
+                if health["healthy"]:
+                    reason = "bridge_configured_and_healthy"
+                    checks.append({"name": "app_server_probe", "state": "pass",
+                                   "detail": "initialize handshake succeeded"})
+                else:
+                    reason = f"bridge_probe_failed:{health['reason']}"
+                    checks.append({"name": "app_server_probe", "state": "warn",
+                                   "detail": health["reason"] or "unhealthy"})
+            else:
+                reason = "bridge_configured"
+                checks.append({"name": "bridge_config", "state": "pass",
+                               "detail": "valid and enabled (no live probe requested)"})
+        except semantic_events.SemanticEventError as exc:
+            reason = f"bridge_config_invalid:{exc.reason}"
+            checks.append({"name": "bridge_config", "state": "warn",
+                           "detail": exc.reason})
+    else:
+        checks.append({"name": "bridge_config", "state": "pass",
+                       "detail": "no configuration file supplied"})
+
+    selected = requested
+    if requested == "external-event-bridge":
+        if not reason.startswith("bridge_configured"):
+            selected = "unattended"
+    elif requested == "auto":
+        selected = (
+            "external-event-bridge"
+            if reason.startswith("bridge_configured")
+            else "unattended"
+        )
+
+    outbox_root = semantic_events.outbox_root(args.state_dir)
+    entries = semantic_events.list_outbox(outbox_root) if outbox_root.exists() else []
+    outbox_summary = {
+        "present": outbox_root.exists(),
+        "pending": sum(1 for e in entries if e.get("state") == "pending"),
+        "delivered": sum(1 for e in entries if e.get("state") == "delivered"),
+        "dead_letter": sum(1 for e in entries if e.get("state") == "dead_letter"),
+    }
+    auto_resume = selected == "external-event-bridge"
+    return {
+        "schema_version": DOCTOR_SCHEMA,
+        "skill": "codex-hpc-monitor",
+        "mode": {
+            "selected": selected,
+            "requested": requested,
+            "reason": reason if selected == "unattended" else reason,
+        },
+        "zero_turns_while_unchanged": True,
+        "agent_slot_occupied": False,
+        "auto_resume_available": auto_resume,
+        "notification_available": auto_resume,
+        "state_root": {
+            "path": str(args.state_dir),
+            "filesystem": kind,
+            "suitable": suitable,
+            "reason": None if suitable else "network or unknown filesystem",
+        },
+        "outbox": outbox_summary,
+        "app_server": app_server,
+        "goal_worker": {
+            "available": False,
+            "reason": "runtime_capability_not_provable_deterministically",
+        },
+        "recovery_command": (
+            f"python3 {Path(__file__).resolve()} status <job-id> "
+            f"--host {args.host} --state-dir {args.state_dir}"
+        ),
+        "checks": checks,
+    }
+
+
+def render_doctor_text(payload: Dict[str, Any]) -> str:
+    mode = payload["mode"]
+    lines = [
+        f"{payload['skill']} doctor",
+        f"mode: {mode['selected']} (requested {mode['requested']}; reason: {mode['reason']})",
+        f"zero model turns while unchanged: yes"
+        if payload["zero_turns_while_unchanged"]
+        else "zero model turns while unchanged: no",
+        f"agent slot occupied: {'yes' if payload['agent_slot_occupied'] else 'no'}",
+        f"auto-resume available: {'yes' if payload['auto_resume_available'] else 'no'}",
+        "notification available: "
+        f"{'yes' if payload['notification_available'] else 'no'}",
+        "state root: {path} ({filesystem}, {suitability})".format(
+            path=payload["state_root"]["path"],
+            filesystem=payload["state_root"]["filesystem"] or "unknown",
+            suitability="suitable" if payload["state_root"]["suitable"] else "unsuitable",
+        ),
+        "outbox: present={present} pending={pending} delivered={delivered} dead_letter={dead_letter}".format(
+            **payload["outbox"]
+        ),
+        "app server: "
+        + (
+            "not configured"
+            if not payload["app_server"]["configured"]
+            else "transport={transport} instance={instance_id} enabled={enabled} healthy={healthy}".format(
+                **{
+                    "transport": payload["app_server"].get("transport"),
+                    "instance_id": payload["app_server"].get("instance_id"),
+                    "enabled": payload["app_server"].get("enabled"),
+                    "healthy": payload["app_server"].get("healthy"),
+                }
+            )
+        ),
+        "goal worker: not available ({reason})".format(
+            reason=payload["goal_worker"]["reason"]
+        ),
+        f"recovery: {payload['recovery_command']}",
+    ]
+    return "\n".join(lines)
+
+
+def doctor_command(args: argparse.Namespace) -> int:
+    payload = build_doctor_payload(args)
+    if args.format == "text":
+        print(render_doctor_text(payload))
+    else:
+        print(json.dumps(payload, sort_keys=True))
+    failed = [c for c in payload["checks"] if c["state"] == "fail"]
+    return 1 if failed else 0
+
+
+def list_command(args: argparse.Namespace) -> int:
+    supervisors = args.state_dir / "supervisors"
+    entries = []
+    if supervisors.is_dir():
+        for child in sorted(supervisors.iterdir()):
+            if not child.is_dir():
+                continue
+            host, separator, job_id = child.name.rpartition("-")
+            if not separator or not JOB_ID_RE.fullmatch(job_id):
+                continue
+            status = run_status(current_run(child), host, job_id)
+            entries.append({
+                "host": host,
+                "job_id": job_id,
+                "state": status.get("state"),
+                "run_id": status.get("run_id"),
+                "evidence_strength": status.get("evidence_strength"),
+                "observer_outcome": (status.get("terminal") or {}).get("observer_outcome"),
+            })
+    print(json.dumps({
+        "schema_version": "codex-monitor.list/v1",
+        "skill": "codex-hpc-monitor",
+        "monitors": entries,
+    }, sort_keys=True))
+    return 0
+
+
+EXPLAIN_GUIDANCE = {
+    "not_started": "no supervisor run is recorded; start one if monitoring is intended",
+    "active": (
+        "the detached supervisor is alive; end the turn now and read status "
+        "once on a later genuine event - a terminal file cannot wake an "
+        "inactive Codex turn"
+    ),
+    "terminal": (
+        "read the verified terminal record and perform business acceptance "
+        "independently; the record is scheduler evidence only, and a "
+        "terminal file cannot wake an inactive Codex turn by itself"
+    ),
+    "launch_unconfirmed": "handshake never observed; inspect ownership before restarting",
+    "supervisor_lost": (
+        "the recorded supervisor identity is no longer live and no terminal is "
+        "established; fail closed and review the run evidence"
+    ),
+    "exit_observed_terminal_missing": (
+        "the watcher exited but terminal publication is incomplete; fail closed"
+    ),
+}
+
+
+def explain_command(args: argparse.Namespace) -> int:
+    validate_identity(args.job_id, args.host)
+    status = run_status(
+        current_run(base_dir(args.state_dir, args.host, args.job_id)),
+        args.host,
+        args.job_id,
+    )
+    state = status.get("state", "unknown")
+    payload = {
+        "schema_version": "codex-monitor.explain/v1",
+        "skill": "codex-hpc-monitor",
+        "host": args.host,
+        "job_id": args.job_id,
+        "state": state,
+        "guidance": EXPLAIN_GUIDANCE.get(
+            state, "unknown state; inspect the run directory before acting"
+        ),
+        "evidence_strength": status.get("evidence_strength"),
+        "run_dir": status.get("run_dir"),
+        "wake_events_enabled": False,
+        "next_commands": [],
+    }
+    run = current_run(base_dir(args.state_dir, args.host, args.job_id))
+    if run is not None:
+        manifest = read_json(run / "manifest.json")
+        payload["wake_events_enabled"] = isinstance(
+            manifest.get("event_binding"), dict
+        )
+    script = Path(__file__).resolve()
+    payload["next_commands"] = [
+        f"python3 {script} status {args.job_id} --host {args.host} --state-dir {args.state_dir}",
+    ]
+    if state == "terminal":
+        payload["next_commands"].append(
+            f"python3 {script} wait {args.job_id} --host {args.host} "
+            f"--state-dir {args.state_dir} --timeout-seconds 5 --notification-worker-ack"
+        )
+    if args.format == "text":
+        print(f"{args.host}/{args.job_id}: state={state}")
+        print(f"evidence: {payload['evidence_strength'] or 'none'}")
+        print(f"wake events enabled: {'yes' if payload['wake_events_enabled'] else 'no'}")
+        print(f"guidance: {payload['guidance']}")
+        for command in payload["next_commands"]:
+            print(f"next: {command}")
+    else:
+        print(json.dumps(payload, sort_keys=True))
+    return 0
+
+
+def cleanup_command(args: argparse.Namespace) -> int:
+    outbox = semantic_events.outbox_root(args.state_dir)
+    older_than_seconds = max(0.0, args.older_than_days) * 86400.0
+    from datetime import datetime, timezone
+
+    removed = semantic_events.cleanup_outbox(
+        outbox,
+        now=datetime.now(timezone.utc),
+        older_than_seconds=older_than_seconds,
+        include_dead_letter=args.include_dead_letter,
+        apply=args.yes,
+    )
+    payload = {
+        "schema_version": "codex-monitor.cleanup/v1",
+        "skill": "codex-hpc-monitor",
+        "mode": "applied" if args.yes else "dry_run",
+        "scope": "outbox only; run directories and terminal evidence are never touched",
+        "removed_event_ids": removed,
+        "removed_count": len(removed),
+    }
+    print(json.dumps(payload, sort_keys=True))
+    return 0
+
+
 def nonnegative_float(value: str) -> float:
     parsed = float(value)
     if parsed < 0:
@@ -1029,6 +1366,33 @@ def parser() -> argparse.ArgumentParser:
     internal.add_argument("--manifest-sha256", required=True)
     internal.add_argument("--lock-fd", type=int, required=True)
     internal.set_defaults(func=supervise)
+
+    doctor = sub.add_parser("doctor", help="report mode capability and health")
+    doctor.add_argument("--state-dir", type=Path, default=Path.home() / ".cache" / "codex-hpc-monitor")
+    doctor.add_argument("--host", default="hpc142")
+    doctor.add_argument("--bridge-config", type=Path)
+    doctor.add_argument("--mode", choices=("auto", "unattended", "external-event-bridge"), default="auto")
+    doctor.add_argument("--probe-app-server", action="store_true")
+    doctor.add_argument("--format", choices=("text", "json"), default="json")
+    doctor.set_defaults(func=doctor_command)
+
+    listing = sub.add_parser("list", help="enumerate local monitors")
+    listing.add_argument("--state-dir", type=Path, default=Path.home() / ".cache" / "codex-hpc-monitor")
+    listing.set_defaults(func=list_command)
+
+    explain = sub.add_parser("explain", help="explain one monitor in plain language")
+    explain.add_argument("job_id")
+    explain.add_argument("--host", default="hpc142")
+    explain.add_argument("--state-dir", type=Path, default=Path.home() / ".cache" / "codex-hpc-monitor")
+    explain.add_argument("--format", choices=("text", "json"), default="text")
+    explain.set_defaults(func=explain_command)
+
+    cleanup = sub.add_parser("cleanup", help="inspect or remove settled outbox events")
+    cleanup.add_argument("--state-dir", type=Path, default=Path.home() / ".cache" / "codex-hpc-monitor")
+    cleanup.add_argument("--older-than-days", type=float, default=7.0)
+    cleanup.add_argument("--include-dead-letter", action="store_true")
+    cleanup.add_argument("--yes", action="store_true", help="actually remove (default is dry-run)")
+    cleanup.set_defaults(func=cleanup_command)
     return result
 
 
