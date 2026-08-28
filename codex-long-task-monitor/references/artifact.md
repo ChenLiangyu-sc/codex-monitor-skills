@@ -44,7 +44,19 @@ Start exit codes:
 - `4`: launch handshake not confirmed;
 - `12`: invalid contract, contract conflict, or infrastructure failure.
 
-`--restart` starts only a new read-only watcher generation with the exact same contract. It never restarts the underlying task. Review prior terminal/lost state before using it.
+`--restart` starts only a new read-only watcher generation with the exact same contract. It never restarts the underlying task. Review prior terminal/lost state before using it. The observation deadline is absolute and frozen at the first generation; a restart generation is capped to the remaining window and an expired window refuses to restart with exit `12`.
+
+## Optional wake events (experimental, opt-in)
+
+Start with `--event-binding <file>` to have each verified terminal record
+publish one durable semantic event into the local outbox. The binding names
+the exact Codex home, App Server instance, thread, and workspace that a
+separate delivery daemon may resume; nothing is published without it. See
+[app-server-bridge.md](app-server-bridge.md) for configuration, delivery,
+failure behavior, and the mandatory idempotent postflight protocol
+(`postflight_guard.py check`/`mark`). The `monitor_dispatch.py` wrapper
+forwards `--event-binding`/`--bridge-config` and labels its events
+`backend=dispatch`.
 
 ## Read local state
 

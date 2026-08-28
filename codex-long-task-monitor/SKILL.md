@@ -7,6 +7,37 @@ description: Monitor long-running commands, asynchronous artifacts, callbacks, d
 
 Make deterministic software own observation. Use a model only to freeze the contract, handle a meaningful event, and perform business acceptance.
 
+## Negotiate the mode first
+
+Run once per environment; it reads local state only:
+
+```bash
+python3 <skill-dir>/scripts/supervise_artifact.py doctor --state-dir ~/.cache/codex-long-task-monitor
+```
+
+Default installations select `unattended`; any probe failure falls back to
+`unattended` with a safe reason code.
+
+| Mode | Model turns while unchanged | Automatic Codex resume | Long-lived agent slot |
+| --- | ---: | ---: | ---: |
+| `unattended` (default) | 0 | No | No |
+| `external-event-bridge` | 0 | Yes, when an explicitly configured App Server bridge is available | No |
+| `attached` (short synchronous commands only) | 0 during one blocking call | Same turn only | No subagent slot |
+| `goal-worker` | Runtime-dependent | Conditional compatibility mode only | One worker slot |
+
+Auto-resume exists **only** through the explicitly configured event bridge
+(experimental, disabled by default; see
+[references/app-server-bridge.md](references/app-server-bridge.md)). Never
+infer auto-resume merely because a terminal file, worker script, or Goal
+exists. A terminal file cannot awaken an inactive Codex turn by itself.
+
+When a monitor is started with `--event-binding`, each verified terminal
+record additionally publishes one durable semantic event into the local
+outbox; a foreground delivery daemon you run separately resumes the bound
+thread and starts exactly one wake turn. The woken turn must run
+`scripts/postflight_guard.py check` before any side effects and `mark` after
+verifying the terminal digest.
+
 ## Hard invariants
 
 - Unchanged task state produces zero model turns.
@@ -45,11 +76,17 @@ For a custody-transfer workflow, this means one dispatch artifact monitor for th
 
 ## Prefer unattended monitoring
 
-For work expected to exceed about two minutes, start or reuse one detached supervisor, verify its handshake once, retain its opaque handle, and end the Codex turn while work remains active. Read `status` once only when the user returns or another genuine semantic event activates a later turn. A terminal file cannot awaken an inactive Codex turn; never claim background notification.
+For work expected to exceed about two minutes, start or reuse one detached supervisor, verify its handshake once, retain its opaque handle, and end the Codex turn while work remains active. Read `status` once only when the user returns or another genuine semantic event activates a later turn. A terminal file cannot awaken an inactive Codex turn; never claim background notification. The observation deadline is absolute and frozen at the first generation: restarting a watcher never extends the window, and an expired window refuses to restart.
 
 Never let the main agent run a foreground bridge or local monitor `wait`, repeatedly call `write_stdin`, monitor `status`, query the backend, read logs, emit heartbeat commentary, or enter a periodic model-driven wait loop.
 
-For an active Goal, use automatic continuation by default; Goal activation itself supplies the continuation request, so do not ask the user to repeat it. Also use it for a non-Goal task when the user explicitly requests same-turn continuation. After verifying the detached supervisor, let `codex-task-routing` create at most one bounded Luna/low notification worker. Let it run exactly one backend-provided deterministic local bridge wait with `--notification-worker-ack` and publish exactly one fixed-schema semantic event. The acknowledgement records intent and discourages accidental main-agent use; it does not authenticate a model role.
+The durable automatic-resume path is the explicitly configured event bridge
+(see [references/app-server-bridge.md](references/app-server-bridge.md)).
+The Goal/notification-worker path below remains available only as a
+conditional compatibility mode when the runtime provides an eligible
+worker; it is not the preferred durable path.
+
+For an active Goal with a proven eligible worker, Goal activation itself supplies the continuation request, so do not ask the user to repeat it. Also use it for a non-Goal task when the user explicitly requests same-turn continuation. After verifying the detached supervisor, let `codex-task-routing` create at most one bounded Luna/low notification worker. Let it run exactly one backend-provided deterministic local bridge wait with `--notification-worker-ack` and publish exactly one fixed-schema semantic event. The acknowledgement records intent and discourages accidental main-agent use; it does not authenticate a model role.
 
 Let the main agent make at most one long `wait_agent` call per Goal activation. If that call times out before the event, end the current activation while preserving the Goal, detached monitor, and existing bridge. Do not start another wait in that activation, enter a polling loop, or create a second bridge. Use unattended monitoring when the user opts out, pauses the Goal, or no suitable notification worker exists.
 

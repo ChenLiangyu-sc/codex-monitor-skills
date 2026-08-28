@@ -26,6 +26,29 @@ SUPERVISOR = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(SUPERVISOR)
 import semantic_events
 
+FAKE_APP_SERVER_OK = r'''#!/usr/bin/env python3
+import json, os, sys
+LOG = os.environ["FAKE_LOG"]
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+for raw in sys.stdin:
+    line = raw.strip()
+    if not line:
+        continue
+    message = json.loads(line)
+    method = message.get("method")
+    mid = message.get("id")
+    if method == "initialize":
+        send({"id": mid, "result": {"userInfo": {"id": "u"}}})
+    elif method == "thread/resume":
+        send({"id": mid, "result": {"thread": {"id": message["params"]["threadId"]}}})
+    elif method == "turn/start":
+        with open(LOG, "a", encoding="utf-8") as handle:
+            handle.write(message["params"]["input"][0]["text"] + "\n===\n")
+        send({"id": mid, "result": {"turn": {"id": "turn_chain_1", "status": "inProgress", "error": None}}})
+'''
+
 
 class ArtifactSupervisorTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -481,10 +504,6 @@ class ArtifactSupervisorTests(unittest.TestCase):
         entries = semantic_events.list_outbox(self.outbox())
         self.assertEqual(entries[0]["backend"], "dispatch")
 
-
-def argv_index(argv: list, flag: str) -> int:
-    return argv.index(flag)
-
     def run_doctor(self, *extra: str):
         command = [
             sys.executable, str(SCRIPT), "doctor",
@@ -570,6 +589,81 @@ def argv_index(argv: list, flag: str) -> int:
         self.assertEqual(payload["mode"], "dry_run")
         self.assertEqual(payload["removed_count"], 0)
 
+    def test_full_chain_start_to_wake_and_idempotent_postflight(self) -> None:
+        fake = self.root / "fake_app_server.py"
+        fake.write_text(FAKE_APP_SERVER_OK, encoding="utf-8")
+        fake.chmod(0o700)
+        wake_log = self.root / "wake.log"
+        config = {
+            "schema": semantic_events.BRIDGE_CONFIG_SCHEMA,
+            "enabled": True,
+            "instance_id": "workstation-1",
+            "codex_home_id": "sha256:" + "a" * 64,
+            "workspace": str(self.root / "project"),
+            "transport": {"type": "stdio", "command": [sys.executable, str(fake)]},
+            "request_timeout_seconds": 10, "poll_seconds": 0.05,
+            "lease_seconds": 60, "max_attempts": 5,
+            "backoff_initial_seconds": 0.05, "backoff_max_seconds": 0.2,
+        }
+        config_path = self.root / "bridge.json"
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        config_path.chmod(0o600)
+        (self.root / "project").mkdir()
+        binding = {
+            "schema": semantic_events.EVENT_BINDING_SCHEMA,
+            "codex_home_id": "sha256:" + "a" * 64,
+            "app_server_instance": "workstation-1",
+            "thread_id": "thr_chain",
+            "workspace": str(self.root / "project"),
+        }
+        binding_path = self.root / "binding.json"
+        binding_path.write_text(json.dumps(binding), encoding="utf-8")
+        binding_path.chmod(0o600)
+
+        self.write_artifact()
+        result, started = self.start(
+            "--event-binding", str(binding_path), "--bridge-config", str(config_path)
+        )
+        self.assertEqual(result.returncode, 0)
+        handle = started["task_handle"]
+        terminal = self.wait_terminal(handle)
+        run = Path(terminal["run_dir"])
+        published = json.loads((run / "semantic_event.json").read_text())
+        event_id = published["event_id"]
+
+        import os as _os
+        delivered = subprocess.run(
+            [sys.executable, str(HERE / "app_server_bridge.py"), "deliver",
+             "--state-dir", str(self.state), "--bridge-config", str(config_path),
+             "--once"],
+            text=True, capture_output=True, check=False,
+            env={**_os.environ, "FAKE_LOG": str(wake_log)}, timeout=30)
+        self.assertEqual(delivered.returncode, 0, delivered.stdout + delivered.stderr)
+        wake = wake_log.read_text()
+        self.assertIn(f"event_id={event_id}", wake)
+        self.assertEqual(wake.count("==="), 1)
+
+        guard = str(HERE / "postflight_guard.py")
+        check = subprocess.run([sys.executable, guard, "check", event_id,
+                                "--state-dir", str(self.state)],
+                               text=True, capture_output=True, check=False, timeout=10)
+        self.assertEqual(check.returncode, 0)
+        terminal_digest = "sha256:" + hashlib.sha256(
+            (run / "terminal.json").read_bytes()
+        ).hexdigest()
+        mark = subprocess.run([sys.executable, guard, "mark", event_id,
+                               "--terminal-digest", terminal_digest,
+                               "--state-dir", str(self.state)],
+                              text=True, capture_output=True, check=False, timeout=10)
+        self.assertEqual(mark.returncode, 0)
+        duplicate = subprocess.run([sys.executable, guard, "mark", event_id,
+                                    "--terminal-digest", terminal_digest,
+                                    "--state-dir", str(self.state)],
+                                   text=True, capture_output=True, check=False, timeout=10)
+        self.assertEqual(duplicate.returncode, 3)
+        self.assertEqual(json.loads(duplicate.stdout)["state"], "already_marked")
+def argv_index(argv: list, flag: str) -> int:
+    return argv.index(flag)
 
 if __name__ == "__main__":
     unittest.main()

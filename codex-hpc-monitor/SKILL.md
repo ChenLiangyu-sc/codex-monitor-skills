@@ -7,6 +7,37 @@ description: Monitor long-running Slurm jobs from Codex with a detached determin
 
 Let the detached Python supervisor poll Slurm. Keep the main agent out of polling loops.
 
+## Negotiate the mode first
+
+Run once per environment; it reads local state only and never queries Slurm:
+
+```bash
+python3 <skill-dir>/scripts/supervise_slurm_job.py doctor --state-dir ~/.cache/codex-hpc-monitor
+```
+
+The doctor reports the negotiated mode with a reason. Default installations
+select `unattended`; any probe failure falls back to `unattended` with a
+safe reason code.
+
+| Mode | Model turns while unchanged | Automatic Codex resume | Long-lived agent slot |
+| --- | ---: | ---: | ---: |
+| `unattended` (default) | 0 | No | No |
+| `external-event-bridge` | 0 | Yes, when an explicitly configured App Server bridge is available | No |
+| `goal-worker` | Runtime-dependent | Conditional compatibility mode only | One worker slot |
+
+Auto-resume exists **only** through the explicitly configured event bridge
+(experimental, disabled by default; see
+[references/app-server-bridge.md](references/app-server-bridge.md)). Never
+infer auto-resume merely because a terminal file, worker script, or Goal
+exists. A terminal file cannot awaken an inactive Codex turn by itself.
+
+When a monitor is started with `--event-binding`, each verified terminal
+record additionally publishes one durable semantic event into the local
+outbox; a foreground delivery daemon you run separately resumes the bound
+thread and starts exactly one wake turn. The woken turn must run
+`scripts/postflight_guard.py check` before any side effects and `mark` after
+verifying the terminal digest.
+
 ## Apply the authority boundary
 
 Read `/share/cv/data/liangyu.chen/skills/hpc-train/SKILL.md` completely before issuing any HPC command. Read its debugging reference only after a failure, anomalous state, or prolonged pending result.
@@ -38,6 +69,14 @@ python3 <skill-dir>/scripts/supervise_slurm_job.py start <job-id> \
 
 Include every known identity constraint. Omit unknown optional fields; never guess them. The launcher returns after a bounded handshake while the supervisor and watcher continue independently.
 
+The monitoring contract (identity constraints and timing parameters) is
+frozen with a digest in the manifest; restarting with a changed contract
+fails with `contract_conflict` unless you explicitly pass
+`--allow-contract-change`. The observation deadline is absolute and cannot
+be extended by restarting. The watcher binds the scheduler identity it
+observes (submit time, and cluster/SLUID where available) and fails closed
+on job-id reuse or requeue identity conflicts.
+
 Do not add `--notify-running`: one supervisor invocation follows the job until an important stopping event. The existing watcher lock and the supervisor lock ensure one query stream per host/job.
 
 Keep `--pending-alert-seconds 0` for unattended monitoring so a long queue wait does not end observation before the job runs. Set a positive threshold only when a pending alert is intentionally terminal and a human will read it promptly.
@@ -62,9 +101,20 @@ python3 <skill-dir>/scripts/supervise_slurm_job.py status <job-id> --host hpc142
 
 Add `--require-terminal` for machine use; it returns `3` while the run is nonterminal. This command reads local JSON only and must not poll, wait, or open SSH.
 
-## Continue active Goals automatically
+## Continue active Goals automatically (conditional compatibility mode)
 
-For an active Goal, use the low-cost automatic-continuation path by default; Goal activation itself supplies the continuation request, so do not ask the user to repeat it. Also allow this path for a non-Goal task when the user explicitly requests same-turn automatic continuation. Use unattended monitoring when the user opts out, pauses the Goal, or `codex-task-routing` cannot provide a suitable notification worker. Never emulate notification with main-agent polling.
+The durable automatic-resume path is the explicitly configured event bridge
+above. The Goal/notification-worker path below remains available only as a
+conditional compatibility mode when the runtime provides an eligible worker;
+it is not the preferred durable path, and unattended monitoring is always
+correct when no worker is proven. Never emulate notification with
+main-agent polling.
+
+For an active Goal with a proven eligible worker, Goal activation itself
+supplies the continuation request, so do not ask the user to repeat it.
+Also allow this path for a non-Goal task when the user explicitly requests
+same-turn automatic continuation. Use unattended monitoring when the user
+opts out, pauses the Goal, or no suitable notification worker exists.
 
 Create at most one bounded low-cost notification worker after verifying the detached supervisor handshake. Give it exactly one operation: run the following deterministic local bridge wait once and publish one fixed-schema semantic event. Do not give it backend monitoring, logs, raw output, retries, cancellation, project checks, or acceptance work.
 
@@ -76,7 +126,7 @@ python3 <skill-dir>/scripts/bridge_slurm_terminal.py run <job-id> \
   --notification-worker-ack
 ```
 
-The acknowledgement is a deterministic misuse guard and records caller intent; it does not authenticate or cryptographically identify a model role. The wrapper holds one per-run lease, invokes local supervisor `wait` exactly once, and writes one immutable receipt. It returns `0` for verified scheduler success, `3` for a verified non-success terminal, `4` for bridge timeout, `11` for supervisor loss, and `12` for missing or unverifiable evidence. Exit `2` means another bridge owns the lease; exit `3` with `run_result=receipt_exists` means a receipt already exists.
+The acknowledgement is a deterministic misuse guard and records caller intent; it does not authenticate or cryptographically identify a model role. The wrapper holds one per-run lease, invokes local supervisor `wait` exactly once, and writes one immutable receipt. It returns `0` for verified scheduler success, `3` for a verified non-success terminal, `4` for bridge timeout, `11` for supervisor loss, and `12` for missing or unverifiable evidence. Exit `2` means another bridge owns the lease; exit `3` with `run_result=receipt_exists` means a receipt already exists. A bridge wait timeout (`4`) records one attempt record instead of a receipt: it never permanently blocks a later run from delivering the genuine verified terminal event.
 
 Require the worker to publish exactly one mailbox message with this schema and no other commentary:
 

@@ -25,6 +25,29 @@ SUPERVISOR = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(SUPERVISOR)
 import semantic_events
 
+FAKE_APP_SERVER_OK = r'''#!/usr/bin/env python3
+import json, os, sys
+LOG = os.environ["FAKE_LOG"]
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+for raw in sys.stdin:
+    line = raw.strip()
+    if not line:
+        continue
+    message = json.loads(line)
+    method = message.get("method")
+    mid = message.get("id")
+    if method == "initialize":
+        send({"id": mid, "result": {"userInfo": {"id": "u"}}})
+    elif method == "thread/resume":
+        send({"id": mid, "result": {"thread": {"id": message["params"]["threadId"]}}})
+    elif method == "turn/start":
+        with open(LOG, "a", encoding="utf-8") as handle:
+            handle.write(message["params"]["input"][0]["text"] + "\n===\n")
+        send({"id": mid, "result": {"turn": {"id": "turn_chain_1", "status": "inProgress", "error": None}}})
+'''
+
 
 FAKE_WATCHER = r'''#!/usr/bin/env python3
 import argparse
@@ -683,6 +706,64 @@ class SupervisorTest(unittest.TestCase):
         self.assertEqual(applied_payload["mode"], "applied")
         self.assertEqual(applied_payload["removed_count"], 1)
         self.assertEqual(semantic_events.list_outbox(self.outbox()), [])
+
+    def test_full_chain_start_to_wake_and_idempotent_postflight(self) -> None:
+        fake_server = self.root / "fake_app_server.py"
+        fake_server.write_text(FAKE_APP_SERVER_OK, encoding="utf-8")
+        fake_server.chmod(0o700)
+        wake_log = self.root / "wake.log"
+        config = json.loads(self.write_bridge_config().read_text())
+        config["transport"]["command"] = [sys.executable, str(fake_server)]
+        config_path = self.write_bridge_config()
+        config_path.write_text(json.dumps(config))
+        binding_path = self.write_binding()
+
+        result, _ = self.run_cli(
+            "start",
+            "--event-binding", str(binding_path),
+            "--bridge-config", str(config_path),
+            env={"FAKE_EXIT": "0"},
+        )
+        self.assertEqual(result.returncode, 0)
+        payload = self.wait_state("terminal")
+        run = Path(payload["run_dir"])
+        published = json.loads((run / "semantic_event.json").read_text())
+        event_id = published["event_id"]
+
+        delivered = subprocess.run(
+            [sys.executable, str(HERE / "app_server_bridge.py"), "deliver",
+             "--state-dir", str(self.state), "--bridge-config", str(config_path),
+             "--once"],
+            text=True, capture_output=True, check=False,
+            env={**os.environ, "FAKE_LOG": str(wake_log)}, timeout=30,
+        )
+        self.assertEqual(delivered.returncode, 0, delivered.stdout + delivered.stderr)
+        wake = wake_log.read_text()
+        self.assertIn(f"event_id={event_id}", wake)
+        self.assertIn("backend=slurm", wake)
+        self.assertEqual(wake.count("==="), 1)
+
+        guard = str(HERE / "postflight_guard.py")
+        check = subprocess.run(
+            [sys.executable, guard, "check", event_id, "--state-dir", str(self.state)],
+            text=True, capture_output=True, check=False, timeout=10,
+        )
+        self.assertEqual(check.returncode, 0)
+        terminal_digest = "sha256:" + hashlib.sha256(
+            (run / "terminal.json").read_bytes()
+        ).hexdigest()
+        mark = subprocess.run(
+            [sys.executable, guard, "mark", event_id,
+             "--terminal-digest", terminal_digest, "--state-dir", str(self.state)],
+            text=True, capture_output=True, check=False, timeout=10,
+        )
+        self.assertEqual(mark.returncode, 0)
+        duplicate = subprocess.run(
+            [sys.executable, guard, "mark", event_id,
+             "--terminal-digest", terminal_digest, "--state-dir", str(self.state)],
+            text=True, capture_output=True, check=False, timeout=10,
+        )
+        self.assertEqual(duplicate.returncode, 3)
 
 
 if __name__ == "__main__":

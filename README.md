@@ -38,19 +38,76 @@ The HPC skill is the specialized Slurm backend. The general long-task skill rout
 - Zero model polling turns while state is unchanged.
 - Detached supervisors survive ordinary tool-session or agent-turn exit.
 - Atomic, machine-readable local status and terminal records.
-- One effective monitor per stable task identity.
+- One effective monitor per stable task identity, with a frozen per-monitor contract digest and absolute observation deadlines that restarts cannot extend.
 - Explicit separation of transport completion from business success.
-- Fail-closed handling for stale PIDs, missing terminal evidence, identity mismatch, timeout, and lost observability.
+- Fail-closed handling for stale PIDs, missing terminal evidence, identity mismatch (including Slurm job-id reuse via submit-time/cluster/SLUID binding), timeout, and lost observability.
 - No raw logs, prompts, responses, callbacks, or artifact contents in notification messages.
 - Monitoring does not grant authority to start, retry, cancel, mutate, or approve the underlying work.
+
+## Modes and automatic resume
+
+| Mode | Model turns while unchanged | Automatic Codex resume | Long-lived agent slot |
+| --- | ---: | ---: | ---: |
+| `unattended` (default) | 0 | No | No |
+| `external-event-bridge` | 0 | Yes, when an explicitly configured App Server bridge is available | No |
+| `attached` (short commands only) | 0 during one blocking call | Same turn only | No subagent slot |
+| `goal-worker` | Runtime-dependent | Conditional compatibility mode only | One worker slot |
+
+`unattended` is the default and needs no configuration. The
+**experimental** event bridge is opt-in: each monitor started with
+`--event-binding` publishes one durable semantic event into a local outbox
+after a verified terminal record, and a delivery daemon you run separately
+resumes the exact bound Codex thread and starts one wake turn using only
+the stable `initialize`, `thread/resume`, and `turn/start` App Server
+methods over stdio. Delivery is at-least-once with leases, exponential
+backoff, dead-lettering, and instance isolation; the woken turn performs an
+idempotent postflight guarded by digest checks.
+
+A terminal file can never awaken an inactive Codex turn by itself. The
+bridge is a notification transport only — never terminal authority — and
+until the release gates below are met it stays disabled by default and
+labeled experimental. Full setup, failure matrix, and disable procedure:
+[`codex-hpc-monitor/references/app-server-bridge.md`](codex-hpc-monitor/references/app-server-bridge.md).
+
+Bridge release gates (not yet met): all tests green on supported Pythons,
+skill validation for both skills, one opt-in live end-to-end test against a
+real Codex App Server, offline/duplicate-delivery and multi-instance
+isolation tests, no secrets in fixtures, and an independent review with no
+high-severity findings. Default CI uses a deterministic fake App Server and
+needs no credentials.
+
+## Command surface
+
+Both supervisors expose `start`, `status`, `wait`, plus:
+
+- `doctor` — one command that reports the negotiated mode, zero-turn
+  semantics, agent-slot usage, auto-resume availability, state-root
+  filesystem suitability, outbox summary, and (optionally) a live App
+  Server probe. `--format text` and `--format json` agree.
+- `list` — enumerate local monitors and their states.
+- `explain` — plain-language interpretation of one monitor with safe next
+  actions.
+- `cleanup` — inspect (dry-run by default) and remove settled outbox
+  events only; terminal evidence is never touched.
+
+Bridge tooling lives in `scripts/app_server_bridge.py`
+(`init-config`, `init-binding`, `status`, `deliver`) and the idempotent
+postflight marker in `scripts/postflight_guard.py`
+(`check`, `mark`, `list`). Shared runtime code
+(`semantic_events.py`, `app_server_bridge.py`, `postflight_guard.py`) is
+vendored as byte-identical copies in each skill so both remain
+independently installable; a synchronization test enforces this whenever
+both skill directories are present.
 
 ## Repository layout
 
 ```text
 codex-monitor-skills/
+├── COMPATIBILITY.md
 ├── codex-hpc-monitor/
 │   ├── SKILL.md
 │   ├── agents/openai.yaml
+│   ├── references/app-server-bridge.md
 │   └── scripts/
 ├── codex-long-task-monitor/
 │   ├── SKILL.md
@@ -212,7 +269,12 @@ python3 -m unittest discover -s codex-hpc-monitor/scripts -p 'test_*.py'
 python3 -m unittest discover -s codex-long-task-monitor/scripts -p 'test_*.py'
 ```
 
-Current baseline: **100 tests passing** (55 HPC monitor tests and 45 long-task monitor tests).
+Current baseline: **261 tests passing** (146 HPC monitor tests and 115
+long-task monitor tests), including the outbox, App Server fake, postflight
+guard, doctor, vendored-copy synchronization, and per-skill start-to-wake
+end-to-end suites. No credentials or network access are required; live App
+Server end-to-end tests remain an explicit opt-in outside the default
+suite.
 
 ## Contributing
 
