@@ -75,6 +75,13 @@ publication, any later `status`/`wait` observation reconciles it; transient
 publication failures remain retryable instead of permanently suppressing
 that repair.
 
+If the App Server asks for command, file, permission, MCP, or user-input
+approval during the wake turn, the bridge never answers it. The attempt
+fails closed as `operator_interaction_required` for human diagnosis instead
+of appearing as an unexplained completion timeout. Optional stdout, private
+JSONL, and desktop notification sinks consume the same semantic events
+without touching App Server delivery state or starting model turns.
+
 A terminal file can never awaken an inactive Codex turn by itself. The
 bridge is a notification transport only — never terminal authority — and
 until the release gates below are met it stays disabled by default and
@@ -103,12 +110,20 @@ Both supervisors expose `start`, `status`, `wait`, plus:
   events only; terminal evidence is never touched.
 
 Bridge tooling lives in `scripts/app_server_bridge.py`
-(`init-config`, `init-binding`, `status`, `deliver`) and the idempotent
+(`init-config`, `init-binding`, `status`, `deliver`, `protocol-check`) and the idempotent
 postflight state machine in `scripts/postflight_guard.py` (`begin` → perform
 side effects → `complete`; `reset --i-mean-it` only clears an in-progress
 claim and never a completed marker; `mark` is only for a single atomic
-action). Shared runtime code
-(`semantic_events.py`, `app_server_bridge.py`, `postflight_guard.py`) is
+action). `scripts/bridge_service.py` provides explicit, reversible
+`install/status/logs/start/stop/restart/repair/uninstall` management for a
+systemd user service or macOS LaunchAgent. `scripts/monitor_events.py`
+provides local event timelines, independent non-model notification sinks,
+and human-confirmed dead-letter retry. See
+[`references/operations.md`](codex-hpc-monitor/references/operations.md).
+
+Shared runtime code
+(`semantic_events.py`, `app_server_bridge.py`, `postflight_guard.py`,
+`monitor_events.py`, `bridge_service.py`) is
 vendored as byte-identical copies in each skill so both remain
 independently installable; a synchronization test enforces this whenever
 both skill directories are present.
@@ -122,6 +137,7 @@ codex-monitor-skills/
 │   ├── SKILL.md
 │   ├── agents/openai.yaml
 │   ├── references/app-server-bridge.md
+│   ├── references/operations.md
 │   └── scripts/
 ├── codex-long-task-monitor/
 │   ├── SKILL.md
@@ -283,17 +299,33 @@ python3 -m unittest discover -s codex-hpc-monitor/scripts -p 'test_*.py'
 python3 -m unittest discover -s codex-long-task-monitor/scripts -p 'test_*.py'
 ```
 
-Current baseline after the second independent review round: **330 tests
-passing** (182 HPC monitor tests and 148 long-task monitor tests),
+Check the installed Codex App Server protocol without credentials or a model
+turn:
+
+```bash
+python3 codex-hpc-monitor/scripts/app_server_bridge.py protocol-check \
+  --experimental --require-verified-version
+```
+
+GitHub Actions runs both skill suites on Python 3.10 and 3.12, checks every
+vendored runtime copy, validates the generated schema against the recorded
+real-smoke Codex version, and runs a non-blocking scheduled advisory check
+against the latest Codex CLI.
+
+Current operations-hardening baseline after independent review:
+**392 tests passing** (213 HPC monitor tests and 179 long-task monitor tests),
 including the outbox, App Server fake, postflight claim, doctor,
-vendored-copy synchronization, and per-skill start-to-wake suites. The
+protocol contract check, approval-request fail-closed behavior, service
+definition lifecycle, independent notification receipts, event timeline,
+dead-letter retry, vendored-copy synchronization, and per-skill
+start-to-wake suites. The
 "end-to-end" suites use a deterministic fake App Server: they verify the
 full local chain (start with binding -> verified terminal -> outbox ->
 delivery daemon -> fixed wake template -> awaited turn/completed ->
 idempotent postflight claim) but **not** a real Codex App Server or a real
 model turn. No credentials or network access are required. An opt-in live
 lifecycle smoke was also run successfully with Codex CLI 0.150.1 on
-2026-08-28 (real thread resume, wake turn, strict `turn/completed`, and
+2026-08-29 (real thread resume, wake turn, strict `turn/completed`, and
 outbox acknowledgement); it is not part of default CI and does not by
 itself prove the woken model performed a business postflight correctly.
 

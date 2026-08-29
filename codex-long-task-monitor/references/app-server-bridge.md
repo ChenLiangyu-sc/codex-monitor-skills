@@ -35,7 +35,7 @@ semantic-event publisher   (supervisor, local only; event_intent.json
       |
 durable outbox             (atomic, local filesystem, at-least-once)
       |
-optional delivery daemon   (app_server_bridge.py deliver, foreground)
+optional delivery daemon   (foreground, or explicit user service)
       |
 thread/resume -> turn/start -> wait turn/completed
       |                        (session held open; lease renewed throughout)
@@ -76,10 +76,13 @@ python3 <skill-dir>/scripts/app_server_bridge.py init-binding \
   --workspace /absolute/project/path --codex-home ~/.codex
 ```
 
-3. Verify capability with one command; it must agree in `--format text`
+3. Check the installed App Server schema, then verify capability; doctor
+   must agree in `--format text`
    and `--format json`:
 
 ```bash
+python3 <skill-dir>/scripts/app_server_bridge.py protocol-check --experimental
+
 python3 <skill-dir>/scripts/supervise_<backend>.py doctor \
   --bridge-config ~/.config/codex-monitor/bridge.json \
   --state-dir ~/.cache/<skill-state>
@@ -93,8 +96,9 @@ python3 <skill-dir>/scripts/supervise_<backend>.py start ... \
   --event-binding ~/.config/codex-monitor/binding-<task>.json
 ```
 
-5. Run the delivery daemon in the foreground (you own its lifecycle; the
-   skill never installs or starts services automatically):
+5. Run the delivery daemon in the foreground, or explicitly install the user
+   service described in [operations.md](operations.md). You own its lifecycle;
+   the skill never installs or starts services merely by being invoked:
 
 ```bash
 python3 <skill-dir>/scripts/app_server_bridge.py deliver \
@@ -199,6 +203,7 @@ race with `complete` and reopen an already-recorded side effect.
 | Connection dropped before/after request | retry (`connection_lost`) | maybe duplicated; postflight claim keeps effects single |
 | Request timeout | retry (`request_timeout`) | maybe duplicated |
 | Required MCP startup failure | retry (`required_mcp_failure`) | later |
+| App Server requests command/file/permission/MCP/user-input approval | dead-letter (`operator_interaction_required`); never answers or auto-approves | possibly started, never acknowledged |
 | Active-turn conflict | retry (`active_turn_conflict`) | later |
 | `turn/completed` reports `failed` / `interrupted` | retry (`turn_failed`/`turn_aborted`) | possibly duplicated; claim keeps effects single |
 | Completion misses the target turn id | ignored until valid completion or timeout | no acknowledgement |
@@ -211,8 +216,10 @@ race with `complete` and reopen an already-recorded side effect.
 | Wrong workspace/instance/CODEX_HOME binding | dead-letter (`binding_mismatch`) or never claimed | no |
 
 Retries use exponential backoff with jitter and dead-letter after
-`max_attempts`. Inspect with `app_server_bridge.py status` and settle with
-the `cleanup` command.
+`max_attempts`. Inspect with `app_server_bridge.py status` or
+`monitor_events.py timeline`. A human may explicitly requeue one corrected
+dead-letter with `monitor_events.py retry ... --i-mean-it`; this never changes
+the immutable event or terminal evidence.
 
 ## Multiple Codex instance isolation
 
@@ -238,6 +245,13 @@ entries are ignored.
   CODEX_HOME path.
 - Outbox and state directories are `0700`, files `0600`, symlinks rejected,
   sizes bounded.
+- Server-initiated requests are treated as untrusted operator interaction.
+  The bridge records only their method name, never request parameters, and
+  never sends an approval response.
+
+Protocol checks, service management, event timelines, non-model sinks, and
+explicit dead-letter retry are documented in
+[operations.md](operations.md).
 
 ## Recovery and disable
 

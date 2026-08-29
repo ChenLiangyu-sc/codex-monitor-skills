@@ -31,6 +31,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Deque, Dict, Optional, Tuple
@@ -44,6 +45,14 @@ import semantic_events as se
 
 BRIDGE_PREFIX = "codex-monitor.bridge"
 CLIENT_INFO = {"name": "codex-monitor-skills", "title": "monitor bridge", "version": "1"}
+REAL_SMOKE_TESTED_CODEX_VERSIONS = {"0.150.1"}
+REQUIRED_PROTOCOL_METHODS = {
+    "initialize",
+    "initialized",
+    "thread/resume",
+    "turn/start",
+    "turn/completed",
+}
 
 # Delivery failure reason codes. retryable failures back off and retry;
 # the rest dead-letter immediately for human inspection.
@@ -66,6 +75,7 @@ DEAD_LETTER_CODES = {
     "thread_archived",
     "unsupported_response_shape",
     "binding_mismatch",
+    "operator_interaction_required",
 }
 
 
@@ -192,11 +202,21 @@ class AppServerSession:
             message = self._read_line(deadline)
             if message is None:
                 raise DeliveryError("request_timeout", f"no reply to {method}")
+            # JSON-RPC request ids are scoped independently in each direction,
+            # so a server request may legally reuse our current client id.
+            # Method presence distinguishes it from a response; check this
+            # before comparing ids and never answer it automatically.
+            if "id" in message and isinstance(message.get("method"), str):
+                raise DeliveryError(
+                    "operator_interaction_required",
+                    f"app server requested operator interaction via {message['method']}",
+                )
             if message.get("id") != request_id:
                 # Preserve notifications: a very short turn may complete
                 # before its turn/start response is consumed. Server-initiated
                 # requests (which carry an id) are outside this adapter's
-                # no-approval baseline and remain ignored.
+                # no-approval baseline. Fail closed immediately instead of
+                # making an approval look like an unexplained turn timeout.
                 if "id" not in message and isinstance(message.get("method"), str):
                     self._notifications.append(message)
                 continue
@@ -216,14 +236,20 @@ class AppServerSession:
     def notify(self, method: str, params: Dict[str, Any]) -> None:
         self._write({"method": method, "params": params})
 
-    def initialize(self) -> None:
+    def initialize(self) -> Dict[str, Any]:
         try:
-            self.request("initialize", {"clientInfo": CLIENT_INFO})
+            result = self.request("initialize", {"clientInfo": CLIENT_INFO})
         except DeliveryError as exc:
-            if exc.code in {"connection_lost", "request_timeout", "protocol_error"}:
+            if exc.code in {
+                "connection_lost",
+                "request_timeout",
+                "protocol_error",
+                "operator_interaction_required",
+            }:
                 raise
             raise DeliveryError("initialize_failed", exc.message) from exc
         self.notify("initialized", {})
+        return result
 
     def resume_thread(self, thread_id: str, expected_workspace: str) -> None:
         result = self.request("thread/resume", {"threadId": thread_id})
@@ -309,6 +335,11 @@ class AppServerSession:
                     tick_deadline = time.monotonic() + tick_interval
                 continue
             if "id" in message:
+                if isinstance(message.get("method"), str):
+                    raise DeliveryError(
+                        "operator_interaction_required",
+                        f"app server requested operator interaction via {message['method']}",
+                    )
                 continue  # stray response; no requests are pending
             method = message.get("method")
             if not isinstance(method, str):
@@ -475,7 +506,7 @@ def deliver_loop(args: argparse.Namespace) -> int:
                 sort_keys=True,
             )
         )
-        return 3
+        return 0 if getattr(args, "exit_zero_if_disabled", False) else 3
     outbox = se.outbox_root(Path(args.state_dir))
     owner = owner_identity(config)
 
@@ -620,6 +651,301 @@ def status_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _method_variant(schema: Dict[str, Any], method: str) -> Optional[Dict[str, Any]]:
+    for variant in schema.get("oneOf", []):
+        if not isinstance(variant, dict):
+            continue
+        properties = variant.get("properties")
+        if not isinstance(properties, dict):
+            continue
+        method_schema = properties.get("method")
+        if (
+            isinstance(method_schema, dict)
+            and method_schema.get("enum") == [method]
+        ):
+            return variant
+    return None
+
+
+def _required_fields(schema: Dict[str, Any], *fields: str) -> bool:
+    required = schema.get("required")
+    properties = schema.get("properties")
+    return (
+        isinstance(required, list)
+        and isinstance(properties, dict)
+        and all(field in required and field in properties for field in fields)
+    )
+
+
+def _definition_has_fields(
+    schema: Dict[str, Any], definition: str, *fields: str
+) -> bool:
+    definitions = schema.get("definitions")
+    if not isinstance(definitions, dict):
+        return False
+    value = definitions.get(definition)
+    return isinstance(value, dict) and _required_fields(value, *fields)
+
+
+def _property_refs_definition(
+    schema: Dict[str, Any], property_name: str, definition: str
+) -> bool:
+    properties = schema.get("properties")
+    value = properties.get(property_name) if isinstance(properties, dict) else None
+    return (
+        isinstance(value, dict)
+        and value.get("$ref") == f"#/definitions/{definition}"
+    )
+
+
+def _schema_candidates(root: Path, name: str) -> list[Dict[str, Any]]:
+    candidates = []
+    for path in sorted(root.rglob(name)):
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(value, dict):
+            candidates.append(value)
+    return candidates
+
+
+def _protocol_contract_failures(root: Path) -> list[str]:
+    """Validate only the exact schema locations and fields the bridge uses."""
+    failures: list[str] = []
+
+    client_requests = _schema_candidates(root, "ClientRequest.json")
+    for method, params_ref in (
+        ("initialize", "InitializeParams"),
+        ("thread/resume", "ThreadResumeParams"),
+        ("turn/start", "TurnStartParams"),
+    ):
+        matched = False
+        for schema in client_requests:
+            variant = _method_variant(schema, method)
+            if variant is None or not _required_fields(variant, "id", "method", "params"):
+                continue
+            params = variant["properties"]["params"]
+            if isinstance(params, dict) and str(params.get("$ref", "")).endswith(
+                f"/{params_ref}"
+            ):
+                matched = True
+                break
+        if not matched:
+            failures.append(f"client_request:{method}")
+
+    notifications = _schema_candidates(root, "ClientNotification.json")
+    if not any(
+        (variant := _method_variant(schema, "initialized")) is not None
+        and _required_fields(variant, "method")
+        for schema in notifications
+    ):
+        failures.append("client_notification:initialized")
+
+    server_notifications = _schema_candidates(root, "ServerNotification.json")
+    matched_completion = False
+    for schema in server_notifications:
+        variant = _method_variant(schema, "turn/completed")
+        if variant is None or not _required_fields(variant, "method", "params"):
+            continue
+        params = variant["properties"]["params"]
+        if isinstance(params, dict) and str(params.get("$ref", "")).endswith(
+            "/TurnCompletedNotification"
+        ):
+            matched_completion = True
+            break
+    if not matched_completion:
+        failures.append("server_notification:turn/completed")
+
+    initialize_params = _schema_candidates(root, "InitializeParams.json")
+    if not any(
+        _required_fields(schema, "clientInfo")
+        and _property_refs_definition(schema, "clientInfo", "ClientInfo")
+        and _definition_has_fields(schema, "ClientInfo", "name", "version")
+        for schema in initialize_params
+    ):
+        failures.append("initialize_params:clientInfo[name,version]")
+
+    resume_params = _schema_candidates(root, "ThreadResumeParams.json")
+    if not any(
+        _required_fields(schema, "threadId")
+        and isinstance(schema["properties"]["threadId"], dict)
+        and schema["properties"]["threadId"].get("type") == "string"
+        for schema in resume_params
+    ):
+        failures.append("thread_resume_params:threadId")
+
+    start_params = _schema_candidates(root, "TurnStartParams.json")
+    valid_start_params = False
+    for schema in start_params:
+        if not _required_fields(schema, "threadId", "input"):
+            continue
+        properties = schema["properties"]
+        if (
+            not isinstance(properties["threadId"], dict)
+            or properties["threadId"].get("type") != "string"
+            or not isinstance(properties["input"], dict)
+        ):
+            continue
+        input_schema = properties["input"]
+        definitions = schema.get("definitions")
+        user_input = (
+            definitions.get("UserInput", {})
+            if isinstance(definitions, dict)
+            else {}
+        )
+        text_variant = any(
+            isinstance(item, dict)
+            and _required_fields(item, "type", "text")
+            and isinstance(item["properties"]["type"], dict)
+            and item["properties"]["type"].get("enum") == ["text"]
+            for item in user_input.get("oneOf", [])
+            if isinstance(user_input, dict)
+        )
+        input_items = input_schema.get("items")
+        if (
+            input_schema.get("type") == "array"
+            and isinstance(input_items, dict)
+            and input_items.get("$ref") == "#/definitions/UserInput"
+            and text_variant
+        ):
+            valid_start_params = True
+            break
+    if not valid_start_params:
+        failures.append("turn_start_params:threadId,input[text]")
+
+    resume_responses = _schema_candidates(root, "ThreadResumeResponse.json")
+    if not any(
+        _required_fields(schema, "thread")
+        and _property_refs_definition(schema, "thread", "Thread")
+        and _definition_has_fields(schema, "Thread", "id", "cwd")
+        for schema in resume_responses
+    ):
+        failures.append("thread_resume_response:thread.id,cwd")
+
+    start_responses = _schema_candidates(root, "TurnStartResponse.json")
+    if not any(
+        _required_fields(schema, "turn")
+        and _property_refs_definition(schema, "turn", "Turn")
+        and _definition_has_fields(schema, "Turn", "id")
+        for schema in start_responses
+    ):
+        failures.append("turn_start_response:turn.id")
+
+    completion_params = _schema_candidates(root, "TurnCompletedNotification.json")
+    valid_completion = False
+    for schema in completion_params:
+        definitions = schema.get("definitions")
+        status_schema = (
+            definitions.get("TurnStatus", {})
+            if isinstance(definitions, dict)
+            else {}
+        )
+        statuses = status_schema.get("enum", []) if isinstance(status_schema, dict) else []
+        if (
+            _required_fields(schema, "turn")
+            and _property_refs_definition(schema, "turn", "Turn")
+            and _definition_has_fields(schema, "Turn", "id", "status")
+            and {"completed", "failed", "interrupted"}.issubset(set(statuses))
+        ):
+            valid_completion = True
+            break
+    if not valid_completion:
+        failures.append("turn_completed:turn.id,status")
+    return failures
+
+
+def protocol_check_command(args: argparse.Namespace) -> int:
+    """Generate the installed Codex protocol schema and check our baseline.
+
+    A successful structural check means the installed binary still exposes
+    the minimal methods used by this bridge. It is distinct from a recorded
+    real lifecycle smoke, which is version-specific.
+    """
+    codex_bin = str(args.codex_bin)
+    payload: Dict[str, Any] = {
+        "schema_version": f"{BRIDGE_PREFIX}.protocol-check/v1",
+        "codex_bin": codex_bin,
+        "required_methods": sorted(REQUIRED_PROTOCOL_METHODS),
+    }
+    try:
+        version_run = subprocess.run(
+            [codex_bin, "--version"], text=True, capture_output=True,
+            check=False, timeout=float(args.timeout_seconds),
+        )
+        if version_run.returncode != 0:
+            raise DeliveryError("version_probe_failed", "codex --version failed")
+        version_text = version_run.stdout.strip()
+        match = re.search(r"(?:codex-cli\s+)?(\d+\.\d+\.\d+)", version_text)
+        version = match.group(1) if match else None
+        payload["codex_version"] = version
+        payload["version_output"] = version_text[:160]
+        with tempfile.TemporaryDirectory(prefix="codex-monitor-schema-") as schema_dir:
+            command = [
+                codex_bin, "app-server", "generate-json-schema",
+                "--out", schema_dir,
+            ]
+            if args.experimental:
+                command.append("--experimental")
+            generated = subprocess.run(
+                command, text=True, capture_output=True, check=False,
+                timeout=float(args.timeout_seconds),
+            )
+            if generated.returncode != 0:
+                raise DeliveryError(
+                    "schema_generation_failed",
+                    "codex app-server generate-json-schema failed",
+                )
+            schema_path = Path(schema_dir) / "codex_app_server_protocol.schemas.json"
+            if not schema_path.is_file():
+                raise DeliveryError(
+                    "schema_bundle_missing", "generated schema bundle is missing"
+                )
+            json.loads(schema_path.read_text(encoding="utf-8"))
+            required_files = {
+                "ClientRequest.json", "ServerNotification.json", "ServerRequest.json",
+                "InitializeResponse.json", "ThreadResumeResponse.json",
+                "TurnStartResponse.json", "TurnCompletedNotification.json",
+            }
+            missing_files = sorted(
+                name for name in required_files
+                if not any(Path(schema_dir).rglob(name))
+            )
+            contract_failures = _protocol_contract_failures(Path(schema_dir))
+        payload["contract_failures"] = contract_failures
+        payload["missing_schema_files"] = missing_files
+        payload["schema_compatible"] = not contract_failures and not missing_files
+        payload["reported_version_matches_recorded_smoke"] = (
+            version in REAL_SMOKE_TESTED_CODEX_VERSIONS
+        )
+        payload["compatibility"] = (
+            "schema_compatible_recorded_version"
+            if payload["schema_compatible"]
+            and payload["reported_version_matches_recorded_smoke"]
+            else "schema_compatible_unverified"
+            if payload["schema_compatible"]
+            else "incompatible"
+        )
+        print(json.dumps(payload, sort_keys=True))
+        if not payload["schema_compatible"]:
+            return 12
+        if (
+            args.require_verified_version
+            and not payload["reported_version_matches_recorded_smoke"]
+        ):
+            return 4
+        return 0
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError, DeliveryError) as exc:
+        payload.update({
+            "schema_compatible": False,
+            "reported_version_matches_recorded_smoke": False,
+            "compatibility": "probe_failed",
+            "reason": exc.code if isinstance(exc, DeliveryError) else type(exc).__name__,
+        })
+        print(json.dumps(payload, sort_keys=True))
+        return 12
+
+
 def init_config_command(args: argparse.Namespace) -> int:
     codex_home = str(Path(args.codex_home).expanduser().resolve(strict=False))
     config = {
@@ -700,6 +1026,10 @@ def parser() -> argparse.ArgumentParser:
     deliver.add_argument("--state-dir", type=Path, required=True)
     deliver.add_argument("--bridge-config", type=Path, required=True)
     deliver.add_argument("--once", action="store_true", help="process at most one event")
+    deliver.add_argument(
+        "--exit-zero-if-disabled", action="store_true",
+        help="service mode: disabled config is a clean stop, avoiding restart loops",
+    )
     deliver.set_defaults(func=deliver_loop)
 
     status = sub.add_parser("status", help="summarize outbox and configuration")
@@ -732,6 +1062,16 @@ def parser() -> argparse.ArgumentParser:
     init_binding.add_argument("--workspace", type=Path, required=True)
     init_binding.add_argument("--codex-home", type=Path, default=Path.home() / ".codex")
     init_binding.set_defaults(func=init_binding_command)
+
+    protocol_check = sub.add_parser(
+        "protocol-check",
+        help="verify the installed Codex App Server schema against the bridge baseline",
+    )
+    protocol_check.add_argument("--codex-bin", default="codex")
+    protocol_check.add_argument("--timeout-seconds", type=positive_float, default=30.0)
+    protocol_check.add_argument("--experimental", action="store_true")
+    protocol_check.add_argument("--require-verified-version", action="store_true")
+    protocol_check.set_defaults(func=protocol_check_command)
     return result
 
 

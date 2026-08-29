@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 4 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Test HPC skill
+        run: python -m unittest discover -s codex-hpc-monitor/scripts -p 'test_*.py'
+      - name: Test long-task skill
+        run: python -m unittest discover -s codex-long-task-monitor/scripts -p 'test_*.py'
+      - name: Verify vendored runtime files
+        run: |
+          cmp codex-hpc-monitor/scripts/semantic_events.py codex-long-task-monitor/scripts/semantic_events.py
+          cmp codex-hpc-monitor/scripts/app_server_bridge.py codex-long-task-monitor/scripts/app_server_bridge.py
+          cmp codex-hpc-monitor/scripts/postflight_guard.py codex-long-task-monitor/scripts/postflight_guard.py
+          cmp codex-hpc-monitor/scripts/monitor_events.py codex-long-task-monitor/scripts/monitor_events.py
+          cmp codex-hpc-monitor/scripts/bridge_service.py codex-long-task-monitor/scripts/bridge_service.py
+
+  app-server-protocol:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install real-smoke-tested Codex CLI
+        run: npm install --global @openai/codex@0.150.1
+      - name: Check generated App Server protocol
+        run: |
+          python codex-hpc-monitor/scripts/app_server_bridge.py protocol-check \
+            --experimental --require-verified-version
+
+  app-server-latest-advisory:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install latest Codex CLI
+        run: npm install --global @openai/codex@latest
+      - name: Detect upstream protocol drift
+        run: python codex-hpc-monitor/scripts/app_server_bridge.py protocol-check --experimental

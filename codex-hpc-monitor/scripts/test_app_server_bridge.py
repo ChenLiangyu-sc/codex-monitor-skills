@@ -57,6 +57,12 @@ for raw in sys.stdin:
         sys.stdout.flush()
         continue
     if method == "initialize":
+        if MODE == "approval_id_collision":
+            send({"id": mid, "method": "permissions/requestApproval", "params": {"reason": "secret"}})
+            continue
+        if MODE == "approval_during_initialize":
+            send({"id": 990, "method": "permissions/requestApproval", "params": {"reason": "secret"}})
+            continue
         if MODE == "overload_init":
             send({"id": mid, "error": {"code": -32001, "message": "overloaded"}})
             continue
@@ -94,9 +100,13 @@ for raw in sys.stdin:
             sys.exit(0)
         else:
             log(message["params"]["input"][0]["text"])
+            if MODE == "approval_before_turn_reply":
+                send({"id": 991, "method": "item/commandExecution/requestApproval", "params": {"command": "sensitive"}})
             if MODE == "completion_before_reply":
                 send({"method": "turn/completed", "params": {"turn": {"id": "turn_fake_1", "status": "completed"}}})
             send({"id": mid, "result": {"turn": {"id": "turn_fake_1", "status": "inProgress", "items": [], "error": None}}})
+            if MODE == "approval_during_turn":
+                send({"id": 992, "method": "item/fileChange/requestApproval", "params": {"path": "/secret"}})
             if MODE != "no_completion":
                 time.sleep(TURN_DELAY)
                 if MODE == "turn_failed_notification":
@@ -213,6 +223,109 @@ class BridgeAdapterTests(unittest.TestCase):
         return se._read_delivery(
             se.event_dir(se.outbox_root(self.state), event_id), event_id
         )
+
+    def protocol_files(self) -> dict[str, dict]:
+        request = lambda method, ref: {
+            "type": "object",
+            "properties": {
+                "id": {"type": "integer"},
+                "method": {"type": "string", "enum": [method]},
+                "params": {"$ref": f"#/definitions/{ref}"},
+            },
+            "required": ["id", "method", "params"],
+        }
+        turn_definition = {
+            "type": "object",
+            "properties": {"id": {"type": "string"}, "status": {"$ref": "#/definitions/TurnStatus"}},
+            "required": ["id", "status"],
+        }
+        return {
+            "ClientRequest.json": {"oneOf": [
+                request("initialize", "InitializeParams"),
+                request("thread/resume", "ThreadResumeParams"),
+                request("turn/start", "TurnStartParams"),
+            ]},
+            "ClientNotification.json": {"oneOf": [{
+                "type": "object", "properties": {"method": {"enum": ["initialized"]}},
+                "required": ["method"],
+            }]},
+            "ServerNotification.json": {"oneOf": [{
+                "type": "object",
+                "properties": {
+                    "method": {"enum": ["turn/completed"]},
+                    "params": {"$ref": "#/definitions/TurnCompletedNotification"},
+                },
+                "required": ["method", "params"],
+            }]},
+            "ServerRequest.json": {},
+            "InitializeResponse.json": {},
+            "InitializeParams.json": {
+                "properties": {"clientInfo": {"$ref": "#/definitions/ClientInfo"}},
+                "required": ["clientInfo"],
+                "definitions": {"ClientInfo": {
+                    "properties": {"name": {"type": "string"}, "version": {"type": "string"}},
+                    "required": ["name", "version"],
+                }},
+            },
+            "ThreadResumeParams.json": {
+                "properties": {"threadId": {"type": "string"}},
+                "required": ["threadId"],
+            },
+            "TurnStartParams.json": {
+                "properties": {
+                    "threadId": {"type": "string"},
+                    "input": {"type": "array", "items": {"$ref": "#/definitions/UserInput"}},
+                },
+                "required": ["threadId", "input"],
+                "definitions": {"UserInput": {"oneOf": [{
+                    "properties": {"type": {"enum": ["text"]}, "text": {"type": "string"}},
+                    "required": ["type", "text"],
+                }]}},
+            },
+            "ThreadResumeResponse.json": {
+                "properties": {"thread": {"$ref": "#/definitions/Thread"}},
+                "required": ["thread"],
+                "definitions": {"Thread": {
+                    "properties": {"id": {"type": "string"}, "cwd": {"type": "string"}},
+                    "required": ["id", "cwd"],
+                }},
+            },
+            "TurnStartResponse.json": {
+                "properties": {"turn": {"$ref": "#/definitions/Turn"}},
+                "required": ["turn"],
+                "definitions": {"Turn": turn_definition},
+            },
+            "TurnCompletedNotification.json": {
+                "properties": {"turn": {"$ref": "#/definitions/Turn"}},
+                "required": ["turn"],
+                "definitions": {
+                    "Turn": turn_definition,
+                    "TurnStatus": {"type": "string", "enum": ["completed", "failed", "interrupted", "inProgress"]},
+                },
+            },
+            "codex_app_server_protocol.schemas.json": {"title": "bundle"},
+        }
+
+    def write_protocol_codex(self, files: dict[str, dict], version: str = "0.150.1") -> Path:
+        fake_codex = self.root / f"fake_codex_{len(list(self.root.glob('fake_codex_*')))}.py"
+        fake_codex.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, pathlib, sys\n"
+            f"VERSION = {version!r}\n"
+            f"FILES = {files!r}\n"
+            "if sys.argv[1:] == ['--version']:\n"
+            "    print('codex-cli ' + VERSION)\n"
+            "    raise SystemExit(0)\n"
+            "out = pathlib.Path(sys.argv[sys.argv.index('--out') + 1])\n"
+            "out.mkdir(parents=True, exist_ok=True)\n"
+            "for name, payload in FILES.items():\n"
+            "    path = out / name\n"
+            "    path.parent.mkdir(parents=True, exist_ok=True)\n"
+            "    path.write_text(json.dumps(payload))\n",
+            encoding="utf-8",
+        )
+        fake_codex.chmod(0o700)
+        return fake_codex
 
     # -- lifecycle -------------------------------------------------------
 
@@ -420,6 +533,41 @@ class BridgeAdapterTests(unittest.TestCase):
         self.assertEqual(records[0]["error_code"], "required_mcp_failure")
         self.assertEqual(records[0]["state"], "scheduled_retry")
 
+    def test_approval_before_turn_reply_fails_closed_without_auto_approval(self) -> None:
+        config = self.write_config()
+        event = self.publish_event()
+        _, records = self.deliver(config, mode="approval_before_turn_reply")
+        self.assertEqual(records[0]["error_code"], "operator_interaction_required")
+        self.assertEqual(records[0]["state"], "dead_lettered")
+        delivery = self.delivery_of(event["event_id"])
+        self.assertEqual(delivery["state"], "dead_letter")
+        self.assertNotIn("sensitive", delivery["last_error"]["safe_message"])
+
+    def test_approval_during_initialize_keeps_operator_error_classification(self) -> None:
+        config = self.write_config()
+        event = self.publish_event()
+        _, records = self.deliver(config, mode="approval_during_initialize")
+        self.assertEqual(records[0]["error_code"], "operator_interaction_required")
+        self.assertEqual(records[0]["state"], "dead_lettered")
+        delivery = self.delivery_of(event["event_id"])
+        self.assertNotIn("secret", delivery["last_error"]["safe_message"])
+
+    def test_server_request_id_collision_is_not_misread_as_response(self) -> None:
+        config = self.write_config()
+        event = self.publish_event()
+        _, records = self.deliver(config, mode="approval_id_collision")
+        self.assertEqual(records[0]["error_code"], "operator_interaction_required")
+        self.assertEqual(self.delivery_of(event["event_id"])["state"], "dead_letter")
+
+    def test_approval_during_turn_fails_closed_without_waiting_for_timeout(self) -> None:
+        config = self.write_config(turn_completion_timeout_seconds=30)
+        event = self.publish_event()
+        started = time.monotonic()
+        _, records = self.deliver(config, mode="approval_during_turn")
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(records[0]["error_code"], "operator_interaction_required")
+        self.assertEqual(self.delivery_of(event["event_id"])["state"], "dead_letter")
+
     def test_retryable_failure_exhausts_into_dead_letter(self) -> None:
         config = self.write_config(max_attempts=1)
         event = self.publish_event()
@@ -515,6 +663,17 @@ class BridgeAdapterTests(unittest.TestCase):
         self.assertEqual(code, 3)
         self.assertEqual(records[0]["state"], "refused")
         self.assertEqual(records[0]["reason"], "bridge_disabled")
+
+    def test_service_mode_treats_disabled_config_as_clean_stop(self) -> None:
+        config = self.write_config(enabled=False)
+        self.publish_event()
+        result = subprocess.run(
+            [sys.executable, str(BRIDGE), "deliver", "--state-dir", str(self.state),
+             "--bridge-config", str(config), "--exit-zero-if-disabled"],
+            text=True, capture_output=True, check=False, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(json.loads(result.stdout)["reason"], "bridge_disabled")
         self.assertEqual(
             se.list_outbox(se.outbox_root(self.state))[0]["state"], "pending"
         )
@@ -581,6 +740,55 @@ class BridgeAdapterTests(unittest.TestCase):
         payload = json.loads(result.stdout)
         self.assertEqual(payload["mode"], "unattended")
         self.assertEqual(payload["config"]["reason"], "config_missing")
+
+    def test_protocol_check_accepts_matching_generated_contract(self) -> None:
+        fake_codex = self.write_protocol_codex(self.protocol_files())
+        result = subprocess.run(
+            [sys.executable, str(BRIDGE), "protocol-check", "--codex-bin", str(fake_codex),
+             "--require-verified-version"],
+            text=True, capture_output=True, check=False, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["compatibility"], "schema_compatible_recorded_version")
+        self.assertTrue(payload["schema_compatible"])
+
+    def test_protocol_check_reports_missing_method(self) -> None:
+        files = self.protocol_files()
+        files["ServerNotification.json"] = {
+            "description": "mentions turn/completed but defines no method"
+        }
+        fake_codex = self.write_protocol_codex(files, "0.151.0")
+        result = subprocess.run(
+            [sys.executable, str(BRIDGE), "protocol-check", "--codex-bin", str(fake_codex)],
+            text=True, capture_output=True, check=False, timeout=10,
+        )
+        self.assertEqual(result.returncode, 12)
+        payload = json.loads(result.stdout)
+        self.assertIn(
+            "server_notification:turn/completed", payload["contract_failures"]
+        )
+
+    def test_protocol_check_rejects_missing_initialized_and_required_fields(self) -> None:
+        mutations = {
+            "missing_initialized": lambda files: files.__setitem__("ClientNotification.json", {"oneOf": []}),
+            "missing_thread_cwd": lambda files: files["ThreadResumeResponse.json"]["definitions"]["Thread"]["required"].remove("cwd"),
+            "missing_turn_id": lambda files: files["TurnStartResponse.json"]["definitions"]["Turn"]["required"].remove("id"),
+            "missing_completion_status": lambda files: files["TurnCompletedNotification.json"]["definitions"]["Turn"]["required"].remove("status"),
+            "unlinked_user_input": lambda files: files["TurnStartParams.json"]["properties"]["input"]["items"].__setitem__("$ref", "#/definitions/OtherInput"),
+            "unlinked_resume_thread": lambda files: files["ThreadResumeResponse.json"]["properties"].__setitem__("thread", {"type": "string"}),
+            "missing_initialize_client_info": lambda files: files["InitializeParams.json"]["required"].remove("clientInfo"),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                files = self.protocol_files()
+                mutate(files)
+                fake = self.write_protocol_codex(files)
+                result = subprocess.run(
+                    [sys.executable, str(BRIDGE), "protocol-check", "--codex-bin", str(fake)],
+                    text=True, capture_output=True, check=False, timeout=10,
+                )
+                self.assertEqual(result.returncode, 12, result.stdout)
 
 
 class VendorSyncTests(unittest.TestCase):

@@ -948,6 +948,38 @@ def release_event(outbox: Path, event_id: str, *, owner: str) -> str:
     return "released"
 
 
+def retry_dead_letter(
+    outbox: Path, event_id: str, *, confirm: bool, now: Optional[str] = None
+) -> str:
+    """Human-only transition from dead_letter back to pending.
+
+    The event body and terminal evidence remain immutable. This operation is
+    intentionally explicit because retrying may start another Codex turn.
+    """
+    if not confirm:
+        return "confirmation_required"
+    with _OutboxLock(outbox):
+        dir_path = event_dir(outbox, event_id)
+        delivery = _read_delivery(dir_path, event_id)
+        if delivery is None:
+            return "delivery_missing"
+        if delivery["state"] != "dead_letter":
+            return "not_dead_letter"
+        delivery["state"] = "pending"
+        delivery["next_attempt_at"] = now or utc_now()
+        delivery["finished_at"] = None
+        delivery["lease"] = {"owner": None, "expires_at": None}
+        delivery["delivery"] = {
+            "thread_id": None,
+            "turn_id": None,
+            "delivered_at": None,
+        }
+        delivery["turn_status"] = None
+        delivery["last_error"] = {"code": None, "safe_message": None}
+        _write_delivery(dir_path, delivery)
+    return "scheduled"
+
+
 def renew_event(
     outbox: Path, event_id: str, *, owner: str, lease_seconds: float, now: datetime
 ) -> str:

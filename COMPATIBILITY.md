@@ -53,6 +53,13 @@ Baseline before changes: 100 tests passing (55 `codex-hpc-monitor`,
 | `codex-monitor.attempt/v1` | WP2 | Bridge wait attempt record (timeout is an attempt, not a terminal receipt) |
 | `<skill>.event-intent/v1` | WP2 review | Run-dir record written at start when a wake binding exists; status/wait reconcile the crash window between terminal and event publication |
 | `<skill>.semantic-event/v1` | WP3 | Run-dir record of the event publication outcome |
+| `codex-monitor.sink-receipt/v1` | Operations hardening | Independent at-least-once receipt bound to sink ID, mode, and destination digest; does not alter wake delivery |
+
+Operations hardening also adds output-only schemas under
+`codex-monitor.bridge-service.*`, `codex-monitor.bridge.protocol-check/v1`,
+and `codex-monitor.events.*`. They are command responses rather than monitor
+authority. Dead-letter retry is an explicit human-confirmed transition on the
+existing `codex-monitor.delivery/v1`; it never mutates `event.json`.
 
 Review round 2 contract changes (all additive, validated strictly):
 
@@ -84,6 +91,20 @@ Review round 3 behavior hardening (no schema-string changes):
   reconciliation can publish an event; HPC lock files reject symlinks.
 - transient terminal-to-outbox publication failures remain eligible for a
   later idempotent `status`/`wait` repair.
+
+Operations hardening behavior:
+
+- generated App Server schemas are checked for the minimal method and record
+  shapes; exact versions with a recorded real lifecycle smoke are reported
+  separately from merely schema-compatible versions;
+- any server-initiated request during a wake turn fails closed as
+  `operator_interaction_required`; the bridge never replies or records its
+  parameters;
+- systemd/LaunchAgent installation remains explicit and recoverable, with a
+  required unique service name and overwrite/uninstall requiring separate
+  confirmation; disabled service-mode delivery exits cleanly;
+- notification sinks have independent receipts and cannot acknowledge or
+  claim App Server delivery.
 
 ## 3. Migration behavior
 
