@@ -42,6 +42,7 @@ DELIVERY_SCHEMA = "codex-monitor.delivery/v1"
 POSTFLIGHT_SCHEMA = "codex-monitor.postflight/v1"
 BRIDGE_CONFIG_SCHEMA = "codex-monitor.bridge-config/v1"
 EVENT_BINDING_SCHEMA = "codex-monitor.event-binding/v1"
+BRIDGE_ACTIVATION_SCHEMA = "codex-monitor.bridge-activation/v1"
 
 EVENT_ENUMS = frozenset(
     {
@@ -66,6 +67,7 @@ MAX_DELIVERY_BYTES = 8 * 1024
 MAX_CONFIG_BYTES = 16 * 1024
 MAX_BINDING_BYTES = 8 * 1024
 MAX_POSTFLIGHT_BYTES = 4 * 1024
+MAX_ACTIVATION_BYTES = 32 * 1024
 MAX_SAFE_MESSAGE_CHARS = 200
 MIN_REQUEST_TIMEOUT_SECONDS = 0.05
 MIN_LEASE_SECONDS = 0.1
@@ -698,7 +700,7 @@ def _event_identity_payload(event: Dict[str, Any]) -> Dict[str, Any]:
     return {key: value for key, value in event.items() if key != "created_at"}
 
 
-def publish_event(outbox: Path, event: Dict[str, Any]) -> str:
+def _publish_event_unlocked(outbox: Path, event: Dict[str, Any]) -> str:
     """Atomically publish one immutable event; returns published|duplicate.
 
     Concurrent publishers of the same logical event produce exactly one
@@ -741,6 +743,18 @@ def publish_event(outbox: Path, event: Dict[str, Any]) -> str:
     return "published" if published_here else "duplicate"
 
 
+def publish_event(outbox: Path, event: Dict[str, Any]) -> str:
+    """Publish while sharing the activation cutover lock.
+
+    This makes every publication linearly ordered before or after the durable
+    activation receipt. A pre-cutover event is therefore necessarily visible
+    to the exact-set audit; a post-cutover event is a future eligible event.
+    """
+    ensure_private_directory(outbox)
+    with _OutboxLock(outbox):
+        return _publish_event_unlocked(outbox, event)
+
+
 def read_event(outbox: Path, event_id: str) -> Dict[str, Any]:
     return validate_event(
         read_regular_json(event_dir(outbox, event_id) / "event.json", MAX_EVENT_BYTES)
@@ -754,6 +768,7 @@ def claim_next_event(
     lease_seconds: float,
     now: datetime,
     binding_filter: Optional[Callable[[Dict[str, Any]], bool]] = None,
+    pre_claim: Optional[Callable[[], None]] = None,
 ) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
     """Claim the next due event for this owner under the exclusive claim lock.
 
@@ -766,6 +781,8 @@ def claim_next_event(
     if not isinstance(owner, str) or not owner:
         raise SemanticEventError("owner_invalid")
     with _OutboxLock(outbox):
+        if pre_claim is not None:
+            pre_claim()
         for child in sorted(outbox.iterdir()):
             if not _real_outbox_child(child):
                 continue
@@ -1036,6 +1053,227 @@ def list_outbox(outbox: Path) -> List[Dict[str, Any]]:
             }
         )
     return entries
+
+
+def audit_bridge_activation(
+    outbox: Path, config: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Conservatively inventory events a newly enabled bridge could consume.
+
+    The delivery daemon filters by ``instance_id``, ``codex_home_id``, and
+    ``workspace``.
+    Activation uses the same identity filter, but unreadable entries block the
+    audit because their ownership cannot be proven. Pending and leased matching
+    events require an exact operator acknowledgement before a service starts;
+    dead letters and delivered events are reported but are not auto-claimable.
+    This function is read-only and never creates or heals outbox state.
+    """
+    checked = validate_bridge_config(config)
+    matching: List[Dict[str, Any]] = []
+    unreadable: List[Dict[str, str]] = []
+    foreign_count = 0
+    if outbox.exists() or outbox.is_symlink():
+        try:
+            outbox_info = outbox.lstat()
+        except OSError as exc:
+            unreadable.append({"event_id": "unknown", "problem": type(exc).__name__})
+            outbox_info = None
+        if outbox_info is None or stat.S_ISLNK(outbox_info.st_mode) or not stat.S_ISDIR(
+            outbox_info.st_mode
+        ):
+            return {
+                "safe_to_start": False,
+                "matching": [],
+                "wakeable_event_ids": [],
+                "dead_letter_event_ids": [],
+                "delivered_event_ids": [],
+                "unreadable": unreadable or [
+                    {"event_id": "unknown", "problem": "outbox_not_real_directory"}
+                ],
+                "foreign_count": 0,
+            }
+        try:
+            children = sorted(outbox.iterdir())
+        except OSError as exc:
+            return {
+                "safe_to_start": False,
+                "matching": [],
+                "wakeable_event_ids": [],
+                "dead_letter_event_ids": [],
+                "delivered_event_ids": [],
+                "unreadable": [{"event_id": "unknown", "problem": type(exc).__name__}],
+                "foreign_count": 0,
+            }
+        for child in children:
+            if not _real_outbox_child(child):
+                continue
+            event_id = f"sha256:{child.name}"
+            try:
+                event = validate_event(
+                    read_regular_json(child / "event.json", MAX_EVENT_BYTES)
+                )
+                delivery = _read_delivery(child, event["event_id"])
+            except (FileNotFoundError, OSError, SemanticEventError) as exc:
+                unreadable.append({
+                    "event_id": event_id,
+                    "problem": getattr(exc, "reason", type(exc).__name__),
+                })
+                continue
+            binding = event["binding"]
+            if not (
+                binding["app_server_instance"] == checked["instance_id"]
+                and binding["codex_home_id"] == checked["codex_home_id"]
+                and binding["workspace"] == checked["workspace"]
+            ):
+                foreign_count += 1
+                continue
+            state = delivery["state"] if delivery is not None else "pending"
+            matching.append({
+                "event_id": event["event_id"],
+                "event": event["event"],
+                "backend": event["monitor"]["backend"],
+                "handle": event["monitor"]["handle"],
+                "generation": event["monitor"]["generation"],
+                "thread_id": binding["thread_id"],
+                "workspace_id": sha256_prefix(binding["workspace"].encode()),
+                "state": state,
+            })
+    wakeable = sorted(
+        item["event_id"] for item in matching if item["state"] in {"pending", "leased"}
+    )
+    dead_letter = sorted(
+        item["event_id"] for item in matching if item["state"] == "dead_letter"
+    )
+    delivered = sorted(
+        item["event_id"] for item in matching if item["state"] == "delivered"
+    )
+    return {
+        "safe_to_start": not wakeable and not unreadable,
+        "matching": matching,
+        "wakeable_event_ids": wakeable,
+        "dead_letter_event_ids": dead_letter,
+        "delivered_event_ids": delivered,
+        "unreadable": unreadable,
+        "foreign_count": foreign_count,
+    }
+
+
+def bridge_activation_path(outbox: Path, config: Dict[str, Any]) -> Path:
+    """Return the private activation receipt path for one delivery identity."""
+    checked = validate_bridge_config(config)
+    identity = {
+        "instance_id": checked["instance_id"],
+        "codex_home_id": checked["codex_home_id"],
+        "workspace": checked["workspace"],
+    }
+    return outbox / ".bridge-activations" / f"{sha256_hex(canonical_json(identity))}.json"
+
+
+def validate_bridge_activation(value: object, config: Dict[str, Any]) -> Dict[str, Any]:
+    checked = validate_bridge_config(config)
+    if not isinstance(value, dict):
+        raise SemanticEventError("activation_not_an_object")
+    expected = {
+        "schema", "instance_id", "codex_home_id", "workspace_id",
+        "activated_at", "accepted_event_ids",
+    }
+    if set(value) != expected:
+        raise SemanticEventError("activation_field_set_mismatch")
+    if value["schema"] != BRIDGE_ACTIVATION_SCHEMA:
+        raise SemanticEventError("activation_schema_mismatch")
+    if value["instance_id"] != checked["instance_id"]:
+        raise SemanticEventError("activation_instance_mismatch")
+    if value["codex_home_id"] != checked["codex_home_id"]:
+        raise SemanticEventError("activation_codex_home_mismatch")
+    workspace_id = sha256_prefix(checked["workspace"].encode())
+    if value["workspace_id"] != workspace_id:
+        raise SemanticEventError("activation_workspace_mismatch")
+    if parse_utc(value["activated_at"]) is None:
+        raise SemanticEventError("activation_timestamp_invalid")
+    accepted = value["accepted_event_ids"]
+    if (
+        not isinstance(accepted, list)
+        or accepted != sorted(set(accepted))
+        or any(not isinstance(item, str) or not SHA256_PREFIX_RE.fullmatch(item)
+               for item in accepted)
+    ):
+        raise SemanticEventError("activation_event_ids_invalid")
+    return value
+
+
+def read_bridge_activation(outbox: Path, config: Dict[str, Any]) -> Dict[str, Any]:
+    """Read and validate the durable permission required by every deliverer."""
+    path = bridge_activation_path(outbox, config)
+    try:
+        return validate_bridge_activation(
+            read_regular_json(path, MAX_ACTIVATION_BYTES), config
+        )
+    except FileNotFoundError as exc:
+        raise SemanticEventError("bridge_not_activated", str(path)) from exc
+
+
+def activate_bridge(
+    outbox: Path, config: Dict[str, Any], accepted_event_ids: List[str]
+) -> Dict[str, Any]:
+    """Linearize first activation against publishers under the outbox lock.
+
+    Existing wakeable events require an exact acknowledgement. Once this
+    receipt exists, later publications are considered post-cutover events and
+    may be delivered by foreground or managed daemons without another prompt.
+    """
+    checked = validate_bridge_config(config)
+    if not checked["enabled"]:
+        raise SemanticEventError("bridge_disabled")
+    if (
+        any(not isinstance(item, str) or not SHA256_PREFIX_RE.fullmatch(item)
+            for item in accepted_event_ids)
+        or len(accepted_event_ids) != len(set(accepted_event_ids))
+    ):
+        raise SemanticEventError("activation_event_id_invalid")
+    ensure_private_directory(outbox)
+    with _OutboxLock(outbox):
+        path = bridge_activation_path(outbox, checked)
+        if path.exists() or path.is_symlink():
+            record = read_bridge_activation(outbox, checked)
+            return {"state": "already_activated", "path": str(path), "record": record}
+        audit = audit_bridge_activation(outbox, checked)
+        if audit["unreadable"]:
+            raise SemanticEventError(
+                "activation_outbox_unreadable",
+                json.dumps(audit["unreadable"], sort_keys=True),
+            )
+        required = set(audit["wakeable_event_ids"])
+        provided = set(accepted_event_ids)
+        if required != provided:
+            raise SemanticEventError(
+                "activation_events_require_exact_acknowledgement",
+                json.dumps({
+                    "required_event_ids": sorted(required),
+                    "provided_event_ids": sorted(provided),
+                }, sort_keys=True),
+            )
+        record = {
+            "schema": BRIDGE_ACTIVATION_SCHEMA,
+            "instance_id": checked["instance_id"],
+            "codex_home_id": checked["codex_home_id"],
+            "workspace_id": sha256_prefix(checked["workspace"].encode()),
+            "activated_at": utc_now(),
+            "accepted_event_ids": sorted(provided),
+        }
+        publish_json_no_replace(path, record)
+        return {"state": "activated", "path": str(path), "record": record}
+
+
+def deactivate_bridge(outbox: Path, config: Dict[str, Any]) -> Dict[str, Any]:
+    """Remove the receipt under the claim lock; already leased work continues."""
+    checked = validate_bridge_config(config)
+    ensure_private_directory(outbox)
+    with _OutboxLock(outbox):
+        path = bridge_activation_path(outbox, checked)
+        read_bridge_activation(outbox, checked)
+        path.unlink()
+        fsync_directory(path.parent)
+        return {"state": "deactivated", "path": str(path)}
 
 
 def cleanup_outbox(

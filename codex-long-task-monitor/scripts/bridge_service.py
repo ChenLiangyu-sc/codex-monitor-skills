@@ -94,7 +94,8 @@ def _resolved_inputs(args: argparse.Namespace) -> tuple[Path, Path, Path, Dict[s
 def _systemd_quote(value: str) -> str:
     if "\n" in value or "\r" in value or "\x00" in value:
         raise se.SemanticEventError("service_path_invalid")
-    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    escaped = value.replace("%", "%%").replace("$", "$$")
+    return '"' + escaped.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 def render_systemd(state_dir: Path, config_path: Path, bridge: Path) -> bytes:
@@ -281,7 +282,8 @@ def _manager_action(platform: str, action: str, name: str, path: Path) -> Dict[s
         else:
             raise se.SemanticEventError("service_action_invalid")
     results = []
-    for command in commands:
+    tolerated_indexes: set[int] = set()
+    for index, command in enumerate(commands):
         result = _run(command)
         results.append({
             "command": command,
@@ -289,9 +291,25 @@ def _manager_action(platform: str, action: str, name: str, path: Path) -> Dict[s
             "stdout": result.stdout.strip()[:500],
             "stderr": result.stderr.strip()[:500],
         })
-        if result.returncode != 0 and not best_effort:
+        # launchctl bootout reports nonzero when a plist exists on disk but
+        # the agent is not currently loaded. Repair must still bootstrap it.
+        launch_output = f"{result.stdout}\n{result.stderr}".lower()
+        inactive_marker = any(marker in launch_output for marker in (
+            "could not find", "no such process", "not found", "not loaded",
+        ))
+        tolerated_inactive_bootout = (
+            platform == "darwin" and command[1] == "bootout"
+            and action in {"reload-restart", "stop"} and inactive_marker
+        )
+        if tolerated_inactive_bootout:
+            tolerated_indexes.add(index)
+        if result.returncode != 0 and not best_effort and not tolerated_inactive_bootout:
             break
-    return {"ok": all(item["returncode"] == 0 for item in results), "results": results}
+    ok = all(
+        item["returncode"] == 0 or idx in tolerated_indexes
+        for idx, item in enumerate(results)
+    )
+    return {"ok": ok, "results": results}
 
 
 def _rollback_definition(path: Path, backup: str | None) -> Dict[str, Any]:
@@ -314,6 +332,23 @@ def _rollback_definition(path: Path, backup: str | None) -> Dict[str, Any]:
     return {"restored_previous": restored, "failed_definition": str(failed_path)}
 
 
+def _activation_audit(args: argparse.Namespace) -> Dict[str, Any]:
+    config = se.load_bridge_config(Path(args.bridge_config))
+    audit = se.audit_bridge_activation(
+        se.outbox_root(Path(args.state_dir)), config
+    )
+    audit["config_enabled"] = config["enabled"]
+    return audit
+
+
+def _require_bridge_activated(args: argparse.Namespace) -> Dict[str, Any]:
+    """Require the same durable activation receipt enforced by deliver."""
+    config = se.load_bridge_config(Path(args.bridge_config))
+    if not config["enabled"]:
+        raise se.SemanticEventError("bridge_disabled")
+    return se.read_bridge_activation(se.outbox_root(Path(args.state_dir)), config)
+
+
 def install_command(args: argparse.Namespace) -> int:
     platform = _platform(args.platform)
     path, content, metadata = _definition(args, platform)
@@ -323,12 +358,17 @@ def install_command(args: argparse.Namespace) -> int:
         **metadata,
     }
     if args.dry_run:
+        activation_audit = _activation_audit(args)
+        payload["activation_audit"] = activation_audit
         payload.update({"state": "dry_run", "definition": content.decode()})
         print(json.dumps(payload, sort_keys=True))
         return 0
     if args.start and not args.no_manager and not metadata["bridge_enabled"]:
         raise se.SemanticEventError("bridge_disabled")
     with _lifecycle_lock(path):
+        activation_audit = _activation_audit(args)
+        if args.start and not args.no_manager:
+            _require_bridge_activated(args)
         backup = _write_definition(path, content, args.replace)
         manager = {"ok": True, "results": []}
         if not args.no_manager:
@@ -350,6 +390,7 @@ def install_command(args: argparse.Namespace) -> int:
         "backup": backup if manager["ok"] else None,
         "manager": manager,
         "rollback": rollback,
+        "activation_audit": activation_audit,
     })
     print(json.dumps(payload, sort_keys=True))
     return 0 if manager["ok"] else 4
@@ -379,6 +420,7 @@ def repair_command(args: argparse.Namespace) -> int:
     if args.apply and not args.no_manager and not metadata["bridge_enabled"]:
         raise se.SemanticEventError("bridge_disabled")
     with _lifecycle_lock(path):
+        activation_audit = _activation_audit(args)
         current = None
         if path.is_file() and not path.is_symlink():
             current = path.read_bytes()
@@ -387,6 +429,8 @@ def repair_command(args: argparse.Namespace) -> int:
         manager = {"ok": True, "results": []}
         original_state = state
         if state != "healthy" and args.apply:
+            if not args.no_manager:
+                _require_bridge_activated(args)
             backup = _write_definition(path, expected, replace=current is not None)
             state = "repaired"
             if not args.no_manager:
@@ -410,6 +454,7 @@ def repair_command(args: argparse.Namespace) -> int:
         "schema_version": f"{PREFIX}.repair/v1",
         "platform": platform,
         **metadata,
+        "activation_audit": activation_audit,
         "state": state,
         "applied": bool(args.apply and state == "repaired"),
         "backup": backup,
@@ -425,6 +470,10 @@ def action_command(args: argparse.Namespace) -> int:
     platform = _platform(args.platform)
     path = _service_path(args, platform)
     with _lifecycle_lock(path):
+        activation_audit = None
+        if args.command in {"start", "restart"}:
+            activation_audit = _activation_audit(args)
+            _require_bridge_activated(args)
         if not path.is_file() or path.is_symlink():
             raise se.SemanticEventError("service_not_installed")
         result = _manager_action(platform, args.command, args.service_name, path)
@@ -433,6 +482,7 @@ def action_command(args: argparse.Namespace) -> int:
         "action": args.command,
         "state": "completed" if result["ok"] else "failed",
         "manager": result,
+        "activation_audit": activation_audit,
     }, sort_keys=True))
     return 0 if result["ok"] else 4
 
@@ -519,6 +569,11 @@ def _common(subparser: argparse.ArgumentParser) -> None:
     subparser.add_argument("--platform", choices=("linux", "darwin"))
 
 
+def _activation_arguments(subparser: argparse.ArgumentParser) -> None:
+    subparser.add_argument("--state-dir", type=Path, required=True)
+    subparser.add_argument("--bridge-config", type=Path, required=True)
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     sub = result.add_subparsers(dest="command", required=True)
@@ -549,6 +604,8 @@ def parser() -> argparse.ArgumentParser:
     for name in ("start", "stop", "restart"):
         action = sub.add_parser(name, help=f"{name} the installed user service")
         _common(action)
+        if name in {"start", "restart"}:
+            _activation_arguments(action)
         action.set_defaults(func=action_command)
 
     uninstall = sub.add_parser("uninstall", help="recoverably remove the service")

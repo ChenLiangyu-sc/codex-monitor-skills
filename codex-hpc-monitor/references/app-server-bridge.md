@@ -63,11 +63,40 @@ python3 <skill-dir>/scripts/app_server_bridge.py init-config \
   --enabled
 ```
 
+Missing output parent directories are created with mode `0700`; symlinked or
+non-directory parent components are rejected.
+
 The configuration records both the `codex_home` path and its digest; a
 mismatch between them is rejected at load time, and every spawned App
 Server runs with `CODEX_HOME` pinned to that path.
 
-2. Create a per-monitor binding naming the exact thread to resume:
+2. Check the installed App Server schema, then verify capability; doctor must
+   agree in `--format text` and `--format json`:
+
+```bash
+python3 <skill-dir>/scripts/app_server_bridge.py protocol-check --experimental
+
+python3 <skill-dir>/scripts/supervise_slurm_job.py doctor \
+  --bridge-config ~/.config/codex-monitor/bridge.json \
+  --state-dir ~/.cache/<skill-state>
+```
+
+3. Audit the existing outbox **before the first delivery process starts**:
+
+```bash
+python3 <skill-dir>/scripts/app_server_bridge.py activation-check \
+  --state-dir ~/.cache/<skill-state> \
+  --bridge-config ~/.config/codex-monitor/bridge.json
+```
+
+Unreadable entries block activation. Matching pending/leased events require
+human inspection and an exact `--accept-event-id sha256:...` per event when
+writing the durable receipt with `activation-check --activate --i-mean-it`;
+dead letters are visible but not auto-claimed. Foreground and managed delivery
+both require this receipt. See [operations.md](operations.md). Run the managed daemon before binding a
+new production monitor so a terminal event cannot wait unnoticed.
+
+4. Create a per-monitor binding naming the exact thread to resume:
 
 ```bash
 python3 <skill-dir>/scripts/app_server_bridge.py init-binding \
@@ -76,35 +105,29 @@ python3 <skill-dir>/scripts/app_server_bridge.py init-binding \
   --workspace /absolute/project/path --codex-home ~/.codex
 ```
 
-3. Check the installed App Server schema, then verify capability; doctor
-   must agree in `--format text`
-   and `--format json`:
+5. Start a **new** monitor with both the binding and config identity check:
 
 ```bash
-python3 <skill-dir>/scripts/app_server_bridge.py protocol-check --experimental
-
-python3 <skill-dir>/scripts/supervise_<backend>.py doctor \
-  --bridge-config ~/.config/codex-monitor/bridge.json \
-  --state-dir ~/.cache/<skill-state>
+python3 <skill-dir>/scripts/supervise_slurm_job.py start <job-id> --host <login-host> ... \
+  --event-binding ~/.config/codex-monitor/binding-<task>.json \
+  --bridge-config ~/.config/codex-monitor/bridge.json
 ```
 
-4. Start the monitor with the binding (and, optionally, the config for an
-   identity cross-check; mismatch fails closed):
-
-```bash
-python3 <skill-dir>/scripts/supervise_<backend>.py start ... \
-  --event-binding ~/.config/codex-monitor/binding-<task>.json
-```
-
-5. Run the delivery daemon in the foreground, or explicitly install the user
-   service described in [operations.md](operations.md). You own its lifecycle;
-   the skill never installs or starts services merely by being invoked:
+The launcher rejects an attempt to add or change a binding on an already
+active run as `active_run_binding_conflict`; bindings are immutable run
+intent, not an attach operation. Let an existing unattended run finish and
+use a fresh test run. For diagnostics only, foreground delivery remains
+available after the durable activation receipt has been written:
 
 ```bash
 python3 <skill-dir>/scripts/app_server_bridge.py deliver \
   --state-dir ~/.cache/<skill-state> \
   --bridge-config ~/.config/codex-monitor/bridge.json
 ```
+
+For durable use, install the explicit user service from
+[operations.md](operations.md). The skill never installs or starts it merely
+by being invoked.
 
 ## Delivery lifecycle
 
@@ -213,7 +236,7 @@ race with `complete` and reopen an already-recorded side effect.
 | Thread archived | dead-letter (`thread_archived`) | no |
 | Thread `cwd` missing or wrong | dead-letter (`binding_mismatch`) | no |
 | Unexpected response shape | dead-letter (`unsupported_response_shape`) | no |
-| Wrong workspace/instance/CODEX_HOME binding | dead-letter (`binding_mismatch`) or never claimed | no |
+| Wrong workspace/instance/CODEX_HOME binding | never claimed by this daemon | no |
 
 Retries use exponential backoff with jitter and dead-letter after
 `max_attempts`. Inspect with `app_server_bridge.py status` or
@@ -224,8 +247,8 @@ the immutable event or terminal evidence.
 ## Multiple Codex instance isolation
 
 Each event carries its binding (`codex_home_id`, `app_server_instance`,
-`thread_id`, `workspace`). A daemon claims **only** events whose instance
-and Codex-home digests equal its configured identity; everything else
+`thread_id`, `workspace`). A daemon claims **only** events whose instance,
+Codex-home digest, and workspace equal its configured identity; everything else
 stays pending for its owning daemon. The spawned App Server runs with the
 configured `CODEX_HOME`, and the resumed thread must report the bound
 `cwd`. Event ids are full `sha256:<64 hex>` digests, so they can never
@@ -273,6 +296,7 @@ explicit dead-letter retry are documented in
 
 New schemas (`codex-monitor.event/v1`, `codex-monitor.delivery/v1`,
 `codex-monitor.bridge-config/v1`, `codex-monitor.event-binding/v1`,
+`codex-monitor.bridge-activation/v1`,
 `codex-monitor.postflight/v1`, `codex-monitor.doctor/v1`,
 `codex-monitor.list/v1`, bridge attempt and event-intent records) are
 additive; see `COMPATIBILITY.md` at the repository root for the full

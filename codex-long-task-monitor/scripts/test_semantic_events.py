@@ -8,6 +8,7 @@ import os
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -224,12 +225,149 @@ class OutboxTests(unittest.TestCase):
     def publish(self, event: dict | None = None) -> str:
         return se.publish_event(self.outbox, event or self.event)
 
+    def activation_config(self) -> dict:
+        return make_config()
+
+    def activation_event(self, **overrides) -> dict:
+        config = self.activation_config()
+        binding = {
+            **make_binding(),
+            "codex_home_id": config["codex_home_id"],
+        }
+        return make_event(binding=binding, **overrides)
+
     def test_publish_then_duplicate_is_one_logical_event(self) -> None:
         self.assertEqual(self.publish(), "published")
         self.assertEqual(self.publish(), "duplicate")
         entries = se.list_outbox(self.outbox)
         self.assertEqual(len(entries), 1)
         self.assertEqual(entries[0]["state"], "pending")
+
+    def test_activation_audit_blocks_matching_pending_but_not_foreign(self) -> None:
+        mine = self.activation_event()
+        foreign = make_event(binding={
+            **mine["binding"], "app_server_instance": "other-workstation",
+        })
+        self.publish(mine)
+        self.publish(foreign)
+        audit = se.audit_bridge_activation(self.outbox, self.activation_config())
+        self.assertFalse(audit["safe_to_start"])
+        self.assertEqual(audit["wakeable_event_ids"], [mine["event_id"]])
+        self.assertEqual(audit["foreign_count"], 1)
+        self.assertEqual(audit["unreadable"], [])
+
+    def test_activation_audit_reports_dead_letter_without_blocking(self) -> None:
+        event = self.activation_event()
+        self.publish(event)
+        se.claim_next_event(self.outbox, owner="audit", lease_seconds=60, now=NOW)
+        se.record_delivery_failure(
+            self.outbox, event["event_id"], owner="audit",
+            code="thread_missing", safe_message="missing", retryable=False,
+            now=NOW, max_attempts=1, backoff_initial_seconds=1,
+            backoff_max_seconds=2,
+        )
+        audit = se.audit_bridge_activation(self.outbox, self.activation_config())
+        self.assertTrue(audit["safe_to_start"])
+        self.assertEqual(audit["dead_letter_event_ids"], [event["event_id"]])
+
+    def test_activation_audit_fails_closed_on_unreadable_entry(self) -> None:
+        event = self.activation_event()
+        self.publish(event)
+        event_path = se.event_dir(self.outbox, event["event_id"]) / "event.json"
+        event_path.write_text("not-json", encoding="utf-8")
+        audit = se.audit_bridge_activation(self.outbox, self.activation_config())
+        self.assertFalse(audit["safe_to_start"])
+        self.assertEqual(len(audit["unreadable"]), 1)
+
+    def test_activation_audit_treats_other_workspace_as_foreign(self) -> None:
+        event = make_event(binding={
+            **self.activation_event()["binding"],
+            "workspace": "/home/user/other-project",
+        })
+        self.publish(event)
+        audit = se.audit_bridge_activation(self.outbox, self.activation_config())
+        self.assertTrue(audit["safe_to_start"])
+        self.assertEqual(audit["foreign_count"], 1)
+        self.assertEqual(audit["wakeable_event_ids"], [])
+
+    def test_durable_activation_requires_exact_snapshot(self) -> None:
+        event = self.activation_event()
+        self.publish(event)
+        with self.assertRaises(se.SemanticEventError) as ctx:
+            se.activate_bridge(self.outbox, self.activation_config(), [])
+        self.assertEqual(
+            ctx.exception.reason,
+            "activation_events_require_exact_acknowledgement",
+        )
+        result = se.activate_bridge(
+            self.outbox, self.activation_config(), [event["event_id"]]
+        )
+        self.assertEqual(result["state"], "activated")
+        record = se.read_bridge_activation(self.outbox, self.activation_config())
+        self.assertEqual(record["accepted_event_ids"], [event["event_id"]])
+
+    def test_activation_identity_is_scoped_to_workspace(self) -> None:
+        config = self.activation_config()
+        se.activate_bridge(self.outbox, config, [])
+        other = {**config, "workspace": "/home/user/other-project"}
+        with self.assertRaises(se.SemanticEventError) as ctx:
+            se.read_bridge_activation(self.outbox, other)
+        self.assertEqual(ctx.exception.reason, "bridge_not_activated")
+
+    def test_publisher_is_linearized_after_activation_cutover(self) -> None:
+        event = self.activation_event()
+        entered = threading.Event()
+        release = threading.Event()
+        original_audit = se.audit_bridge_activation
+        activation_results: list[dict] = []
+        publication_results: list[str] = []
+
+        def blocked_audit(outbox: Path, config: dict) -> dict:
+            entered.set()
+            self.assertTrue(release.wait(5))
+            return original_audit(outbox, config)
+
+        with mock.patch.object(se, "audit_bridge_activation", side_effect=blocked_audit):
+            activating = threading.Thread(target=lambda: activation_results.append(
+                se.activate_bridge(self.outbox, self.activation_config(), [])
+            ))
+            publishing = threading.Thread(target=lambda: publication_results.append(
+                self.publish(event)
+            ))
+            activating.start()
+            self.assertTrue(entered.wait(5))
+            publishing.start()
+            publishing.join(0.1)
+            self.assertTrue(publishing.is_alive(), "publisher bypassed activation lock")
+            release.set()
+            activating.join(5)
+            publishing.join(5)
+
+        self.assertEqual(activation_results[0]["state"], "activated")
+        self.assertEqual(activation_results[0]["record"]["accepted_event_ids"], [])
+        self.assertEqual(publication_results, ["published"])
+        self.assertEqual(se.list_outbox(self.outbox)[0]["state"], "pending")
+
+    def test_receipt_gate_is_inside_claim_lock(self) -> None:
+        config = self.activation_config()
+        se.activate_bridge(self.outbox, config, [])
+        event = self.activation_event()
+        self.publish(event)
+        receipt = se.bridge_activation_path(self.outbox, config)
+
+        def revoke_before_gate() -> None:
+            receipt.unlink()
+            se.read_bridge_activation(self.outbox, config)
+
+        with self.assertRaises(se.SemanticEventError) as ctx:
+            se.claim_next_event(
+                self.outbox, owner="daemon", lease_seconds=60, now=NOW,
+                pre_claim=revoke_before_gate,
+            )
+        self.assertEqual(ctx.exception.reason, "bridge_not_activated")
+        delivery = se._read_delivery(se.event_dir(self.outbox, event["event_id"]),
+                                     event["event_id"])
+        self.assertEqual(delivery["state"], "pending")
 
     def test_rebuilt_event_with_fresh_timestamp_is_duplicate(self) -> None:
         self.publish()

@@ -61,6 +61,12 @@ mandatory idempotent postflight claim protocol
 forwards `--event-binding`/`--bridge-config` and labels its events
 `backend=dispatch`.
 
+The binding is new-run intent, not an attach operation. Adding or changing it
+on an already active unattended run fails as
+`active_run_binding_conflict`. Audit the shared outbox and start the delivery
+service first, then use a fresh artifact monitor for the initial closed-loop
+test.
+
 ## Read local state
 
 Read once without reopening the observed artifact:

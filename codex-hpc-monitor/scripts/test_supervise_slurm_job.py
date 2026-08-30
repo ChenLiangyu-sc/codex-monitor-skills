@@ -223,6 +223,22 @@ class SupervisorTest(unittest.TestCase):
         time.sleep(0.1)
         self.assertEqual(len(counter.read_text(encoding="utf-8").splitlines()), 1)
 
+    def test_binding_cannot_be_retrofitted_to_active_unattended_run(self) -> None:
+        first, payload = self.run_cli(
+            "start", env={"FAKE_WATCH_SECONDS": "20"}
+        )
+        self.assertEqual(first.returncode, 0)
+        self.assertEqual(payload["state"], "active")
+        binding = self.write_binding()
+        second, payload = self.run_cli(
+            "start", "--event-binding", str(binding),
+            env={"FAKE_WATCH_SECONDS": "20"},
+        )
+        self.assertEqual(second.returncode, 12)
+        self.assertEqual(payload["start_result"], "active_run_binding_conflict")
+        self.assertIsNone(payload["active_event_binding_digest"])
+        self.assertTrue(payload["requested_event_binding_digest"].startswith("sha256:"))
+
     def test_status_observer_exit_does_not_stop_watcher(self) -> None:
         self.run_cli("start", env={"FAKE_WATCH_SECONDS": "20"})
         first = self.status()
@@ -746,6 +762,9 @@ class SupervisorTest(unittest.TestCase):
         config_path.write_text(json.dumps(config))
         config_path.chmod(0o600)
         binding_path = self.write_binding()
+        semantic_events.activate_bridge(
+            self.outbox(), semantic_events.load_bridge_config(config_path), []
+        )
 
         result, _ = self.run_cli(
             "start",

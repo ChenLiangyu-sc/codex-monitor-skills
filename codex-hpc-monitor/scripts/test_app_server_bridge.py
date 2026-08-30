@@ -204,8 +204,27 @@ class BridgeAdapterTests(unittest.TestCase):
             env["FAKE_TURN_DELAY"] = str(turn_delay)
         return env
 
+    def activate_config(self, config: Path) -> None:
+        loaded = se.load_bridge_config(config)
+        audit = se.audit_bridge_activation(se.outbox_root(self.state), loaded)
+        se.activate_bridge(
+            se.outbox_root(self.state), loaded, audit["wakeable_event_ids"]
+        )
+
     def deliver(self, config: Path, once: bool = True, mode: str = "ok",
-                turn_delay: float | None = None, timeout: int = 30) -> tuple[int, list[dict]]:
+                turn_delay: float | None = None, timeout: int = 30,
+                activate: bool = True) -> tuple[int, list[dict]]:
+        if activate:
+            try:
+                loaded = se.load_bridge_config(config)
+                if loaded["enabled"]:
+                    audit = se.audit_bridge_activation(se.outbox_root(self.state), loaded)
+                    se.activate_bridge(
+                        se.outbox_root(self.state), loaded,
+                        audit["wakeable_event_ids"],
+                    )
+            except se.SemanticEventError:
+                pass
         command = [
             sys.executable, str(BRIDGE), "deliver",
             "--state-dir", str(self.state), "--bridge-config", str(config),
@@ -447,6 +466,7 @@ class BridgeAdapterTests(unittest.TestCase):
             turn_completion_timeout_seconds=30,
         )
         self.publish_event()
+        self.activate_config(config)
         first = subprocess.Popen(
             [sys.executable, str(BRIDGE), "deliver",
              "--state-dir", str(self.state), "--bridge-config", str(config), "--once"],
@@ -469,6 +489,7 @@ class BridgeAdapterTests(unittest.TestCase):
             turn_completion_timeout_seconds=5,
         )
         self.publish_event()
+        self.activate_config(config)
         first = subprocess.Popen(
             [sys.executable, str(BRIDGE), "deliver",
              "--state-dir", str(self.state), "--bridge-config", str(config), "--once"],
@@ -621,7 +642,7 @@ class BridgeAdapterTests(unittest.TestCase):
         self.assertEqual(records[0]["error_code"], "unsupported_response_shape")
         self.assertEqual(records[0]["state"], "dead_lettered")
 
-    def test_workspace_mismatch_dead_letters(self) -> None:
+    def test_workspace_mismatch_is_foreign_and_never_claimed(self) -> None:
         config = self.write_config()
         event = self.publish_event(
             binding=json.loads(
@@ -629,8 +650,13 @@ class BridgeAdapterTests(unittest.TestCase):
             )
         )
         _, records = self.deliver(config)
-        self.assertEqual(records[0]["error_code"], "binding_mismatch")
-        self.assertEqual(self.delivery_of(event["event_id"])["state"], "dead_letter")
+        self.assertEqual(records[-1]["state"], "idle")
+        self.assertEqual(self.delivery_of(event["event_id"])["state"], "pending")
+        audit = se.audit_bridge_activation(
+            se.outbox_root(self.state), se.load_bridge_config(config)
+        )
+        self.assertEqual(audit["foreign_count"], 1)
+        self.assertEqual(audit["wakeable_event_ids"], [])
 
     def test_codex_home_digest_mismatch_is_rejected_at_load(self) -> None:
         config = self.write_config()
@@ -678,6 +704,17 @@ class BridgeAdapterTests(unittest.TestCase):
             se.list_outbox(se.outbox_root(self.state))[0]["state"], "pending"
         )
 
+    def test_service_mode_missing_receipt_is_failure_not_clean_stop(self) -> None:
+        config = self.write_config()
+        self.publish_event()
+        result = subprocess.run(
+            [sys.executable, str(BRIDGE), "deliver", "--state-dir", str(self.state),
+             "--bridge-config", str(config), "--exit-zero-if-disabled", "--once"],
+            text=True, capture_output=True, check=False, timeout=10,
+        )
+        self.assertEqual(result.returncode, 4, result.stdout)
+        self.assertEqual(json.loads(result.stdout)["reason"], "bridge_not_activated")
+
     def test_invalid_config_fails_closed(self) -> None:
         bad = self.root / "bad.json"
         bad.write_text(json.dumps({"schema": "nope"}), encoding="utf-8")
@@ -696,8 +733,9 @@ class BridgeAdapterTests(unittest.TestCase):
     # -- tooling commands --------------------------------------------------------
 
     def test_init_commands_write_valid_files(self) -> None:
-        config_path = self.root / "cfg.json"
-        binding_path = self.root / "bnd.json"
+        private_parent = self.root / "missing" / "codex-monitor"
+        config_path = private_parent / "cfg.json"
+        binding_path = private_parent / "bnd.json"
         codex_home = self.root / ".codex"
         codex_home.mkdir()
         workspace = self.root / "project"
@@ -707,12 +745,15 @@ class BridgeAdapterTests(unittest.TestCase):
              "--codex-home", str(codex_home), "--enabled"],
             text=True, capture_output=True, check=False, timeout=10)
         self.assertEqual(result.returncode, 0)
+        self.assertEqual(private_parent.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(config_path.stat().st_mode & 0o777, 0o600)
         result = subprocess.run(
             [sys.executable, str(BRIDGE), "init-binding", "--output", str(binding_path),
              "--thread-id", "thr_123", "--instance-id", "workstation-1",
              "--workspace", str(workspace), "--codex-home", str(codex_home)],
             text=True, capture_output=True, check=False, timeout=10)
         self.assertEqual(result.returncode, 0)
+        self.assertEqual(binding_path.stat().st_mode & 0o777, 0o600)
         config = se.load_bridge_config(config_path)
         binding = se.load_event_binding(binding_path)
         self.assertTrue(config["enabled"])
@@ -720,6 +761,21 @@ class BridgeAdapterTests(unittest.TestCase):
         self.assertEqual(config["codex_home_id"], binding["codex_home_id"])
         self.assertEqual(binding["app_server_instance"], config["instance_id"])
         self.assertEqual(binding["workspace"], config["workspace"])
+
+    def test_init_command_rejects_symlinked_parent(self) -> None:
+        real = self.root / "real"
+        real.mkdir()
+        link = self.root / "linked"
+        link.symlink_to(real, target_is_directory=True)
+        result = subprocess.run(
+            [sys.executable, str(BRIDGE), "init-config",
+             "--output", str(link / "bridge.json"),
+             "--instance-id", "workstation-1", "--workspace", str(self.project),
+             "--codex-home", str(self.root / ".codex")],
+            text=True, capture_output=True, check=False, timeout=10,
+        )
+        self.assertEqual(result.returncode, 12)
+        self.assertEqual(json.loads(result.stdout)["reason"], "output_parent_unsafe")
 
     def test_status_reports_mode_and_outbox(self) -> None:
         config = self.write_config()
@@ -731,6 +787,114 @@ class BridgeAdapterTests(unittest.TestCase):
         payload = json.loads(result.stdout)
         self.assertEqual(payload["mode"], "external-event-bridge")
         self.assertEqual(payload["pending"], 1)
+
+    def test_activation_check_requires_review_of_matching_pending_events(self) -> None:
+        config = self.write_config()
+        event = self.publish_event()
+        result = subprocess.run(
+            [sys.executable, str(BRIDGE), "activation-check",
+             "--state-dir", str(self.state), "--bridge-config", str(config)],
+            text=True, capture_output=True, check=False, timeout=10,
+        )
+        self.assertEqual(result.returncode, 4, result.stdout)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["state"], "review_required")
+        self.assertEqual(payload["audit"]["wakeable_event_ids"], [event["event_id"]])
+
+    def test_activation_check_is_safe_for_empty_outbox(self) -> None:
+        config = self.write_config()
+        result = subprocess.run(
+            [sys.executable, str(BRIDGE), "activation-check",
+             "--state-dir", str(self.state), "--bridge-config", str(config)],
+            text=True, capture_output=True, check=False, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(json.loads(result.stdout)["state"], "safe_to_start")
+
+    def test_activation_check_reports_disabled_config(self) -> None:
+        config = self.write_config(enabled=False)
+        result = subprocess.run(
+            [sys.executable, str(BRIDGE), "activation-check",
+             "--state-dir", str(self.state), "--bridge-config", str(config)],
+            text=True, capture_output=True, check=False, timeout=10,
+        )
+        self.assertEqual(result.returncode, 3, result.stdout)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["state"], "bridge_disabled")
+        self.assertFalse(payload["config_enabled"])
+
+    def test_foreground_deliver_requires_durable_activation(self) -> None:
+        config = self.write_config()
+        event = self.publish_event()
+        code, records = self.deliver(config, activate=False)
+        self.assertEqual(code, 4)
+        self.assertEqual(records[0]["reason"], "bridge_not_activated")
+        self.assertEqual(self.delivery_of(event["event_id"])["state"], "pending")
+
+    def test_activation_write_requires_confirmation_and_exact_ids(self) -> None:
+        config = self.write_config()
+        event = self.publish_event()
+        base = [
+            sys.executable, str(BRIDGE), "activation-check",
+            "--state-dir", str(self.state), "--bridge-config", str(config),
+            "--activate",
+        ]
+        refused = subprocess.run(
+            base, text=True, capture_output=True, check=False, timeout=10
+        )
+        self.assertEqual(refused.returncode, 4)
+        self.assertEqual(json.loads(refused.stdout)["state"], "confirmation_required")
+        missing = subprocess.run(
+            [*base, "--i-mean-it"], text=True, capture_output=True,
+            check=False, timeout=10,
+        )
+        self.assertEqual(missing.returncode, 12)
+        self.assertEqual(
+            json.loads(missing.stdout)["reason"],
+            "activation_events_require_exact_acknowledgement",
+        )
+        accepted = subprocess.run(
+            [*base, "--i-mean-it", "--accept-event-id", event["event_id"]],
+            text=True, capture_output=True, check=False, timeout=10,
+        )
+        self.assertEqual(accepted.returncode, 0, accepted.stdout)
+        self.assertEqual(json.loads(accepted.stdout)["state"], "activated")
+
+    def test_activation_check_reports_existing_receipt_not_future_event_review(self) -> None:
+        config = self.write_config()
+        self.activate_config(config)
+        self.publish_event()
+        result = subprocess.run(
+            [sys.executable, str(BRIDGE), "activation-check",
+             "--state-dir", str(self.state), "--bridge-config", str(config)],
+            text=True, capture_output=True, check=False, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["state"], "already_activated")
+        self.assertEqual(len(payload["audit"]["wakeable_event_ids"]), 1)
+
+    def test_explicit_deactivation_requires_confirmation(self) -> None:
+        config = self.write_config()
+        self.activate_config(config)
+        base = [
+            sys.executable, str(BRIDGE), "activation-check",
+            "--state-dir", str(self.state), "--bridge-config", str(config),
+            "--deactivate",
+        ]
+        refused = subprocess.run(
+            base, text=True, capture_output=True, check=False, timeout=10
+        )
+        self.assertEqual(refused.returncode, 4)
+        accepted = subprocess.run(
+            [*base, "--i-mean-it"], text=True, capture_output=True,
+            check=False, timeout=10,
+        )
+        self.assertEqual(accepted.returncode, 0, accepted.stdout)
+        self.assertEqual(json.loads(accepted.stdout)["state"], "deactivated")
+        code, records = self.deliver(config, activate=False)
+        self.assertEqual(code, 4)
+        self.assertEqual(records[0]["reason"], "bridge_not_activated")
 
     def test_status_reports_unattended_without_config(self) -> None:
         result = subprocess.run(

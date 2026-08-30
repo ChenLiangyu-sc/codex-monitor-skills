@@ -240,6 +240,19 @@ class ArtifactSupervisorTests(unittest.TestCase):
         self.assertEqual(second.returncode, 2)
         self.assertEqual(duplicate["start_result"], "already_active")
 
+    def test_binding_cannot_be_retrofitted_to_active_unattended_run(self) -> None:
+        first, payload = self.start()
+        self.assertEqual(first.returncode, 0)
+        self.assertEqual(payload["state"], "active")
+        binding = self.write_binding()
+        second, conflict = self.start("--event-binding", str(binding))
+        self.assertEqual(second.returncode, 12)
+        self.assertEqual(conflict["start_result"], "active_run_binding_conflict")
+        self.assertIsNone(conflict["active_event_binding_digest"])
+        self.assertTrue(
+            conflict["requested_event_binding_digest"].startswith("sha256:")
+        )
+
     def test_launch_handshake_requires_verified_watcher_or_terminal(self) -> None:
         self.assertFalse(
             SUPERVISOR.launch_handshake_confirmed(
@@ -696,6 +709,11 @@ class ArtifactSupervisorTests(unittest.TestCase):
         binding_path = self.root / "binding.json"
         binding_path.write_text(json.dumps(binding), encoding="utf-8")
         binding_path.chmod(0o600)
+        semantic_events.activate_bridge(
+            semantic_events.outbox_root(self.state),
+            semantic_events.load_bridge_config(config_path),
+            [],
+        )
 
         self.write_artifact()
         result, started = self.start(

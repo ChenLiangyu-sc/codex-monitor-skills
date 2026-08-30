@@ -47,6 +47,7 @@ Baseline before changes: 100 tests passing (55 `codex-hpc-monitor`,
 | `codex-monitor.delivery/v1` | WP3 | Mutable outbox delivery metadata (state, lease, attempts, backoff) |
 | `codex-monitor.bridge-config/v1` | WP1/WP4 | Explicit, opt-in bridge configuration file |
 | `codex-monitor.event-binding/v1` | WP3 | Per-monitor binding (Codex home, instance, thread, workspace) |
+| `codex-monitor.bridge-activation/v1` | Activation hardening | Private durable first-activation receipt, scoped to instance, Codex home, and workspace, with the exact accepted pre-cutover event IDs |
 | `codex-monitor.postflight/v1` | WP5 | Idempotency marker for processed wake events (extended in review round 2 with an atomic begin/complete claim: `state`, `owner`, `started_at`, `completed_at`; legacy markers without `state` read as completed) |
 | `codex-monitor.doctor/v1` | WP1 | Capability/mode probe output |
 | `codex-monitor.list/v1` | WP6 | Monitor enumeration output |
@@ -57,7 +58,8 @@ Baseline before changes: 100 tests passing (55 `codex-hpc-monitor`,
 
 Operations hardening also adds output-only schemas under
 `codex-monitor.bridge-service.*`, `codex-monitor.bridge.protocol-check/v1`,
-and `codex-monitor.events.*`. They are command responses rather than monitor
+`codex-monitor.bridge.activation-check/v1`, and `codex-monitor.events.*`.
+They are command responses rather than monitor
 authority. Dead-letter retry is an explicit human-confirmed transition on the
 existing `codex-monitor.delivery/v1`; it never mutates `event.json`.
 
@@ -105,6 +107,19 @@ Operations hardening behavior:
   confirmation; disabled service-mode delivery exits cleanly;
 - notification sinks have independent receipts and cannot acknowledge or
   claim App Server delivery.
+
+Activation hardening behavior (additive):
+
+- bridge activation audits only the events matching the configured App Server
+  instance, Codex home, and workspace; unreadable entries fail closed;
+- explicit activation linearizes a durable receipt against publishers under
+  the outbox lock and requires exact acknowledgement of every pre-cutover
+  matching pending/leased event; foreground delivery, managed starts, and
+  manager auto-restarts all verify that receipt;
+- manifests created with a binding include an optional
+  `event_binding_digest`; attempts to retrofit a different binding onto an
+  active run return `active_run_binding_conflict` without changing the run;
+- existing manifests without `event_binding_digest` remain readable.
 
 ## 3. Migration behavior
 

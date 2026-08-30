@@ -1,6 +1,6 @@
 ---
 name: codex-hpc-monitor
-description: Monitor long-running Slurm jobs from Codex with a detached deterministic read-only supervisor and local terminal artifacts, avoiding repeated model-driven polling. Use when Codex needs to monitor submitted training or postflight jobs, survive tool-session or agent exit, recover a job's status cheaply, or report important Slurm terminal states. This Codex-only orchestration skill complements hpc-train and does not authorize submit, cancel, retry, file edits, project-gate decisions, or protected-data access.
+description: Monitor already-submitted long-running Slurm jobs from Codex with a detached deterministic read-only supervisor, optional event-driven thread resume, and no unchanged-state model polling. Use when Codex must survive turn exit, recover verified scheduler evidence cheaply, or resume only after a genuine terminal event. This skill does not submit, cancel, retry, mutate, or perform business acceptance.
 ---
 
 # Codex HPC Monitor
@@ -12,12 +12,16 @@ Let the detached Python supervisor poll Slurm. Keep the main agent out of pollin
 Run once per environment; it reads local state only and never queries Slurm:
 
 ```bash
-python3 <skill-dir>/scripts/supervise_slurm_job.py doctor --state-dir ~/.cache/codex-hpc-monitor
+python3 <skill-dir>/scripts/supervise_slurm_job.py doctor \
+  --state-dir ~/.cache/codex-hpc-monitor \
+  --bridge-config ~/.config/codex-monitor/bridge.json
 ```
 
 The doctor reports the negotiated mode with a reason. Default installations
 select `unattended`; any probe failure falls back to `unattended` with a
-safe reason code.
+safe reason code. A configured mode is capability evidence, not proof that a
+delivery daemon is currently alive; confirm the named user service with
+`bridge_service.py status` before claiming the closed loop is operational.
 
 | Mode | Model turns while unchanged | Automatic Codex resume | Long-lived agent slot |
 | --- | ---: | ---: | ---: |
@@ -41,6 +45,15 @@ digest, atomically claim the postflight with `scripts/postflight_guard.py
 begin`, perform its side effects once, then `complete` the claim; an
 unverified terminal record wakes the thread only as `contract_violation`.
 
+Enable this only for a **new supervisor run**. Never try to retrofit a binding
+onto an active unattended run: the launcher rejects that as
+`active_run_binding_conflict`. Let the existing run finish unattended, then
+use a fresh test job/run for the first closed-loop verification. Before the
+first daemon start, run `app_server_bridge.py activation-check`, then explicitly
+write its durable activation receipt with `--activate --i-mean-it`; every
+matching pending/leased event must be inspected and acknowledged by exact event
+ID. Foreground and managed delivery both refuse to run without that receipt.
+
 Read [references/operations.md](references/operations.md) only when checking
 Codex protocol compatibility, installing or repairing the optional daemon,
 diagnosing delivery history, or configuring a non-model notification sink.
@@ -51,7 +64,13 @@ expand permissions or change task authority.
 
 ## Apply the authority boundary
 
-Read the companion `hpc-train` skill's `SKILL.md` (resolved from your skill installation, not a hard-coded path) completely before issuing any HPC command. Read its debugging reference only after a failure, anomalous state, or prolonged pending result.
+Read-only monitoring of an already-submitted job has **no runtime dependency
+on `hpc-train`**. If the task also requires submission, cancellation, retry,
+mutation, or training-specific diagnosis, route that separate action through
+an installed `hpc-train` skill and read its instructions first. If it is not
+installed, disclose that limitation and stop the mutating/diagnostic action;
+never replace it with an improvised raw-SSH `sbatch`/`scancel` fallback. The
+deterministic read-only monitor may still proceed independently.
 
 Use this skill only after a job has already been submitted under separate authority. Perform only read-only `squeue` and `sacct` queries. Never submit, retry, cancel, reprioritize, edit files, inspect training outputs, or access protected content through this skill.
 
@@ -63,6 +82,10 @@ Treat all watcher results as Slurm-only evidence. `COMPLETED / 0:0` does not est
 - For longer work, start or reuse one detached supervisor, verify its handshake once, and end the Codex turn while the job remains active.
 - When the user returns or another genuine semantic event activates a later turn, read local `status` once.
 - Never claim that `terminal.json` or another local artifact wakes an inactive Codex turn.
+- Never create or keep a periodic Goal active solely to monitor a supervisor.
+  A skill cannot debounce a Goal before its model turn exists; fixed-cadence
+  activation defeats the zero-token design. Use the external event bridge, or
+  unattended mode until a natural user turn.
 
 For work expected to exceed about two minutes, never let the main agent run `bridge_slurm_terminal.py run`, call `write_stdin` repeatedly, repeat `status`, `squeue`, `sacct`, or log reads, emit heartbeat commentary, or enter any periodic wait loop.
 
@@ -76,6 +99,13 @@ python3 <skill-dir>/scripts/supervise_slurm_job.py start <job-id> \
   --terminal-observability-seconds 300 --max-watch-seconds 604800 \
   --expected-owner <owner> --expected-job-name <name> \
   --expected-partition <partition>
+```
+
+For a newly enabled closed loop, add both identity files on the initial start:
+
+```bash
+  --event-binding ~/.config/codex-monitor/binding-<task>.json \
+  --bridge-config ~/.config/codex-monitor/bridge.json
 ```
 
 Include every known identity constraint. Omit unknown optional fields; never guess them. The launcher returns after a bounded handshake while the supervisor and watcher continue independently.
@@ -112,14 +142,18 @@ python3 <skill-dir>/scripts/supervise_slurm_job.py status <job-id> --host hpc142
 
 Add `--require-terminal` for machine use; it returns `3` while the run is nonterminal. This command reads local JSON only and must not poll, wait, or open SSH.
 
-## Continue active Goals automatically (conditional compatibility mode)
+## Goal compatibility is not a polling mode
 
 The durable automatic-resume path is the explicitly configured event bridge
 above. The Goal/notification-worker path below remains available only as a
 conditional compatibility mode when the runtime provides an eligible worker;
 it is not the preferred durable path, and unattended monitoring is always
 correct when no worker is proven. Never emulate notification with
-main-agent polling.
+main-agent polling. Do not create a Goal for scheduled status checks. If an
+externally managed Goal activates without a new mailbox semantic event, end
+that activation without reading status, querying Slurm, emitting a heartbeat,
+or scheduling another activation. This reduces work inside an already-created
+turn but cannot eliminate that turn's token cost.
 
 For an active Goal with a proven eligible worker, Goal activation itself
 supplies the continuation request, so do not ask the user to repeat it.

@@ -49,6 +49,42 @@ python3 <skill-dir>/scripts/monitor_events.py retry sha256:<digest> \
 Retry changes only delivery metadata. It cannot alter the semantic event or
 terminal evidence and may start another wake turn.
 
+## Audit before the first activation
+
+Before any foreground delivery or service start, take a read-only snapshot of
+the events this exact `instance_id`, `codex_home_id`, and workspace could consume:
+
+```bash
+python3 <skill-dir>/scripts/app_server_bridge.py activation-check \
+  --state-dir <state-dir> --bridge-config <bridge.json>
+```
+
+Exit `0` means no matching pending/leased events and no unreadable entries.
+Exit `4` means review is required. Inspect every `wakeable_event_id` with
+`monitor_events.py timeline`; unreadable entries block activation and cannot
+be overridden. Dead letters are reported but are not automatically claimed.
+
+After inspection, durably activate this delivery identity. When an existing
+pending/leased event is intentionally accepted, pass its exact ID to this one
+activation operation:
+
+```bash
+python3 <skill-dir>/scripts/app_server_bridge.py activation-check \
+  --state-dir <state-dir> --bridge-config <bridge.json> \
+  --activate --i-mean-it \
+  --accept-event-id sha256:<digest>
+```
+
+Repeat the option for every ID shown by the latest audit; omit it when the set
+is empty. The write takes the outbox lock, repeats the audit, compares the
+complete sets, and publishes a private durable activation receipt. Foreground
+delivery, service start/restart, and automatic manager restarts all verify that
+receipt. Events published after this linearized cutover are eligible without a
+new prompt. A
+different instance ID deliberately isolates future bindings from old events,
+but does not resolve or delete those old records; keep them for explicit
+reconciliation. Never clean pending evidence merely to make activation pass.
+
 ## Install the delivery daemon
 
 Preview the user service definition first:
@@ -83,7 +119,8 @@ python3 <skill-dir>/scripts/bridge_service.py status \
 python3 <skill-dir>/scripts/bridge_service.py logs \
   --service-name codex-monitor-long-workstation-1 --lines 100
 python3 <skill-dir>/scripts/bridge_service.py restart \
-  --service-name codex-monitor-long-workstation-1
+  --service-name codex-monitor-long-workstation-1 \
+  --state-dir <state-dir> --bridge-config <bridge.json>
 python3 <skill-dir>/scripts/bridge_service.py repair \
   --service-name codex-monitor-long-workstation-1 \
   --state-dir <state-dir> --bridge-config <bridge.json>
@@ -97,6 +134,26 @@ python3 <skill-dir>/scripts/bridge_service.py uninstall \
 Uninstall renames the definition to a recoverable timestamped path instead of
 deleting it. No service is installed, started, repaired, or removed merely by
 invoking the monitoring skill.
+
+`install --start`, applied repair that starts/restarts a definition, and
+manual `start`/`restart` all require the durable activation receipt. The
+delivery process independently verifies it, so manager auto-restarts cannot
+bypass the boundary. `stop`, `status`, `logs`, and uninstall do not require it.
+
+To revoke delivery, stop the daemon first, then remove the receipt under the
+same claim lock with explicit confirmation:
+
+```bash
+python3 <skill-dir>/scripts/app_server_bridge.py activation-check \
+  --state-dir <state-dir> --bridge-config <bridge.json> \
+  --deactivate --i-mean-it
+```
+
+An event already leased before revocation is allowed to finish; no later claim
+can cross the revocation lock boundary. A missing or corrupt receipt exits
+delivery nonzero (including service mode), so accidental damage is visible and
+the service manager can retry. Only an explicitly disabled bridge config is a
+clean service stop.
 
 ## Event timeline
 

@@ -27,6 +27,7 @@ import os
 import selectors
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -508,12 +509,21 @@ def deliver_loop(args: argparse.Namespace) -> int:
         )
         return 0 if getattr(args, "exit_zero_if_disabled", False) else 3
     outbox = se.outbox_root(Path(args.state_dir))
+    try:
+        se.read_bridge_activation(outbox, config)
+    except se.SemanticEventError as exc:
+        print(json.dumps({
+            "schema_version": f"{BRIDGE_PREFIX}.deliver/v1",
+            "state": "refused", "reason": exc.reason, "detail": exc.detail,
+        }, sort_keys=True))
+        return 4
     owner = owner_identity(config)
 
     def binding_matches(event: Dict[str, Any]) -> bool:
         return (
             event["binding"]["app_server_instance"] == config["instance_id"]
             and event["binding"]["codex_home_id"] == config["codex_home_id"]
+            and event["binding"]["workspace"] == config["workspace"]
         )
 
     held_event: Dict[str, Any] = {}
@@ -533,12 +543,16 @@ def deliver_loop(args: argparse.Namespace) -> int:
     while True:
         claimed = None
         try:
+            # The receipt is also a revocation boundary: removing it stops the
+            # daemon before the next claim, including after service restarts.
+            se.read_bridge_activation(outbox, config)
             claimed = se.claim_next_event(
                 outbox,
                 owner=owner,
                 lease_seconds=float(config["lease_seconds"]),
                 now=utc_now(),
                 binding_filter=binding_matches,
+                pre_claim=lambda: se.read_bridge_activation(outbox, config),
             )
         except se.SemanticEventError as exc:
             print(
@@ -548,7 +562,7 @@ def deliver_loop(args: argparse.Namespace) -> int:
                     sort_keys=True,
                 )
             )
-            return 12
+            return 4
         if claimed is None:
             if args.once:
                 break
@@ -641,6 +655,16 @@ def status_command(args: argparse.Namespace) -> int:
         payload["mode"] = (
             "external-event-bridge" if config["enabled"] else "unattended"
         )
+        try:
+            activation = se.read_bridge_activation(
+                se.outbox_root(Path(args.state_dir)), config
+            )
+            payload["activation"] = {
+                "state": "activated",
+                "activated_at": activation["activated_at"],
+            }
+        except se.SemanticEventError as exc:
+            payload["activation"] = {"state": "inactive", "reason": exc.reason}
     except se.SemanticEventError as exc:
         payload["config"] = {"healthy": False, "reason": exc.reason}
         payload["mode"] = "unattended"
@@ -649,6 +673,69 @@ def status_command(args: argparse.Namespace) -> int:
     payload["pending"] = sum(1 for e in entries if e.get("state") == "pending")
     print(json.dumps(payload, sort_keys=True))
     return 0
+
+
+def activation_check_command(args: argparse.Namespace) -> int:
+    """Audit, and optionally durably authorize, first bridge activation."""
+    config = se.load_bridge_config(Path(args.bridge_config))
+    outbox = se.outbox_root(Path(args.state_dir))
+    audit = se.audit_bridge_activation(
+        outbox, config
+    )
+    existing_activation = None
+    try:
+        existing_activation = se.read_bridge_activation(outbox, config)
+    except se.SemanticEventError as exc:
+        if exc.reason != "bridge_not_activated":
+            raise
+    payload = {
+        "schema_version": f"{BRIDGE_PREFIX}.activation-check/v1",
+        "state": "safe_to_start" if audit["safe_to_start"] else "review_required",
+        "state_dir": str(Path(args.state_dir)),
+        "instance_id": config["instance_id"],
+        "codex_home_id": config["codex_home_id"],
+        "config_enabled": config["enabled"],
+        "audit": audit,
+        "next_action": (
+            "start the bridge for future/newly published events"
+            if audit["safe_to_start"]
+            else "inspect every unreadable and wakeable event before activation"
+        ),
+    }
+    if not config["enabled"]:
+        payload["state"] = "bridge_disabled"
+        payload["next_action"] = "enable and revalidate the bridge configuration"
+    elif args.deactivate:
+        if args.accept_event_id:
+            raise se.SemanticEventError("deactivation_event_ids_not_allowed")
+        if not args.i_mean_it:
+            payload["state"] = "confirmation_required"
+            payload["next_action"] = "stop the daemon, then repeat with --deactivate --i-mean-it"
+        else:
+            result = se.deactivate_bridge(outbox, config)
+            payload["state"] = result["state"]
+            payload["next_action"] = "keep delivery stopped or disable the bridge config"
+    elif args.activate:
+        if not args.i_mean_it:
+            payload["state"] = "confirmation_required"
+            payload["next_action"] = "repeat with --activate --i-mean-it"
+        else:
+            result = se.activate_bridge(outbox, config, args.accept_event_id)
+            payload["state"] = result["state"]
+            payload["activation"] = result["record"]
+            payload["next_action"] = "foreground or managed delivery may now start"
+    elif existing_activation is not None:
+        payload["state"] = "already_activated"
+        payload["activation"] = existing_activation
+        payload["next_action"] = "foreground or managed delivery may start"
+    print(json.dumps(payload, sort_keys=True))
+    if not config["enabled"]:
+        return 3
+    if args.activate or args.deactivate:
+        return 0 if args.i_mean_it else 4
+    if existing_activation is not None:
+        return 0
+    return 0 if audit["safe_to_start"] else 4
 
 
 def _method_variant(schema: Dict[str, Any], method: str) -> Optional[Dict[str, Any]]:
@@ -946,6 +1033,43 @@ def protocol_check_command(args: argparse.Namespace) -> int:
         return 12
 
 
+def _private_output_path(value: Path) -> Path:
+    """Create missing parent components as 0700; reject symlink traversal."""
+    path = Path(os.path.abspath(str(Path(value).expanduser())))
+    parent = path.parent
+    current = Path(parent.anchor)
+    for part in parent.parts[1:]:
+        current = current / part
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            try:
+                current.mkdir(mode=0o700)
+            except FileExistsError:
+                pass
+            info = current.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise se.SemanticEventError("output_parent_unsafe", str(current))
+    return path
+
+
+def _write_private_json_output(path: Path, payload: Dict[str, Any]) -> None:
+    if path.exists() or path.is_symlink():
+        raise se.SemanticEventError("output_exists", str(path))
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        view = memoryview((json.dumps(payload, indent=2, sort_keys=True) + "\n").encode())
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError("short write")
+            view = view[written:]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    se.fsync_directory(path.parent)
+
+
 def init_config_command(args: argparse.Namespace) -> int:
     codex_home = str(Path(args.codex_home).expanduser().resolve(strict=False))
     config = {
@@ -965,17 +1089,8 @@ def init_config_command(args: argparse.Namespace) -> int:
         "turn_completion_timeout_seconds": args.turn_completion_timeout_seconds,
     }
     se.validate_bridge_config(config)
-    path = Path(args.output)
-    if path.exists():
-        print(json.dumps({"state": "error", "reason": "output_exists"}))
-        return 12
-    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        payload = (json.dumps(config, indent=2, sort_keys=True) + "\n").encode()
-        os.write(fd, payload)
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+    path = _private_output_path(args.output)
+    _write_private_json_output(path, config)
     print(json.dumps({"state": "written", "path": str(path)}, sort_keys=True))
     return 0
 
@@ -989,17 +1104,8 @@ def init_binding_command(args: argparse.Namespace) -> int:
         "workspace": str(Path(args.workspace).resolve(strict=False)),
     }
     se.validate_event_binding(binding)
-    path = Path(args.output)
-    if path.exists():
-        print(json.dumps({"state": "error", "reason": "output_exists"}))
-        return 12
-    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        payload = (json.dumps(binding, indent=2, sort_keys=True) + "\n").encode()
-        os.write(fd, payload)
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+    path = _private_output_path(args.output)
+    _write_private_json_output(path, binding)
     print(json.dumps({"state": "written", "path": str(path)}, sort_keys=True))
     return 0
 
@@ -1036,6 +1142,31 @@ def parser() -> argparse.ArgumentParser:
     status.add_argument("--state-dir", type=Path, required=True)
     status.add_argument("--bridge-config", type=Path, required=True)
     status.set_defaults(func=status_command)
+
+    activation_check = sub.add_parser(
+        "activation-check",
+        help="audit existing matching outbox events before enabling delivery",
+    )
+    activation_check.add_argument("--state-dir", type=Path, required=True)
+    activation_check.add_argument("--bridge-config", type=Path, required=True)
+    activation_mode = activation_check.add_mutually_exclusive_group()
+    activation_mode.add_argument(
+        "--activate", action="store_true",
+        help="write the durable activation receipt after a fresh exact audit",
+    )
+    activation_mode.add_argument(
+        "--deactivate", action="store_true",
+        help="remove the activation receipt under the claim lock",
+    )
+    activation_check.add_argument(
+        "--i-mean-it", action="store_true",
+        help="confirm the state-changing --activate operation",
+    )
+    activation_check.add_argument(
+        "--accept-event-id", action="append", default=[],
+        help="exact pre-cutover wakeable event id accepted; repeat per id",
+    )
+    activation_check.set_defaults(func=activation_check_command)
 
     init_config = sub.add_parser("init-config", help="write a validated config template")
     init_config.add_argument("--output", type=Path, required=True)
@@ -1085,7 +1216,10 @@ def main() -> int:
                 {"schema_version": f"{BRIDGE_PREFIX}.error/v1",
                  "state": "bridge_error",
                  "error_type": type(exc).__name__,
-                 "detail": str(exc)},
+                 "reason": exc.reason if isinstance(exc, se.SemanticEventError)
+                 else type(exc).__name__,
+                 "detail": exc.detail if isinstance(exc, se.SemanticEventError)
+                 else str(exc)},
                 sort_keys=True,
             )
         )

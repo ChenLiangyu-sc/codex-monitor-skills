@@ -16,7 +16,9 @@ python3 <skill-dir>/scripts/supervise_artifact.py doctor --state-dir ~/.cache/co
 ```
 
 Default installations select `unattended`; any probe failure falls back to
-`unattended` with a safe reason code.
+`unattended` with a safe reason code. Doctor proves configuration capability,
+not delivery-daemon liveness; confirm the named user service with
+`bridge_service.py status` before claiming automatic resume is operational.
 
 | Mode | Model turns while unchanged | Automatic Codex resume | Long-lived agent slot |
 | --- | ---: | ---: | ---: |
@@ -30,6 +32,14 @@ Auto-resume exists **only** through the explicitly configured event bridge
 [references/app-server-bridge.md](references/app-server-bridge.md)). Never
 infer auto-resume merely because a terminal file, worker script, or Goal
 exists. A terminal file cannot awaken an inactive Codex turn by itself.
+
+Enable a binding only on a new supervisor run. Never retrofit it onto an
+active unattended run: the launcher rejects that as
+`active_run_binding_conflict`. Audit the existing outbox with
+`app_server_bridge.py activation-check` before the first daemon start, then
+write its durable receipt with `--activate --i-mean-it` after inspecting and
+acknowledging every matching pending or leased event by exact ID. Foreground
+and managed delivery both refuse to run without that receipt.
 
 When a monitor is started with `--event-binding`, each verified terminal
 record additionally publishes one durable semantic event into the local
@@ -90,11 +100,20 @@ For work expected to exceed about two minutes, start or reuse one detached super
 
 Never let the main agent run a foreground bridge or local monitor `wait`, repeatedly call `write_stdin`, monitor `status`, query the backend, read logs, emit heartbeat commentary, or enter a periodic model-driven wait loop.
 
+Never create or keep a periodic Goal active solely to monitor a supervisor.
+Goal cadence cannot be debounced before the model turn is created; use the
+external event bridge or unattended mode until a natural user turn.
+
 The durable automatic-resume path is the explicitly configured event bridge
 (see [references/app-server-bridge.md](references/app-server-bridge.md)).
 The Goal/notification-worker path below remains available only as a
 conditional compatibility mode when the runtime provides an eligible
-worker; it is not the preferred durable path.
+worker; it is not the preferred durable path. Do not create a Goal for
+scheduled status checks. If an externally managed Goal activates without a
+new mailbox semantic event, end the activation without reading monitor status,
+polling the backend, emitting a heartbeat, or scheduling another activation.
+This limits work inside an already-created turn; only the external bridge
+eliminates unchanged-state turns entirely.
 
 For an active Goal with a proven eligible worker, Goal activation itself supplies the continuation request, so do not ask the user to repeat it. Also use it for a non-Goal task when the user explicitly requests same-turn continuation. After verifying the detached supervisor, let `codex-task-routing` create at most one bounded Luna/low notification worker. Let it run exactly one backend-provided deterministic local bridge wait with `--notification-worker-ack` and publish exactly one fixed-schema semantic event. The acknowledgement records intent and discourages accidental main-agent use; it does not authenticate a model role.
 

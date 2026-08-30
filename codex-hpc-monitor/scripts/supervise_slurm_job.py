@@ -403,6 +403,12 @@ def resolved_event_binding(args: argparse.Namespace) -> Optional[Dict[str, Any]]
     return binding
 
 
+def event_binding_digest(binding: Optional[Dict[str, Any]]) -> Optional[str]:
+    if binding is None:
+        return None
+    return semantic_events.sha256_prefix(semantic_events.canonical_json(binding))
+
+
 def reconcile_run_event(run: Optional[Path]) -> Optional[str]:
     """Close the crash window between terminal.json and event publication.
 
@@ -574,7 +580,23 @@ def start_monitor(args: argparse.Namespace) -> int:
     try:
         lock_fd = open_lifetime_lock(base)
     except BlockingIOError:
-        payload = run_status(current_run(base), args.host, args.job_id)
+        run = current_run(base)
+        payload = run_status(run, args.host, args.job_id)
+        current_binding = None
+        if run is not None:
+            candidate = read_json(run / "manifest.json").get("event_binding")
+            if isinstance(candidate, dict):
+                current_binding = candidate
+        if event_binding is not None and current_binding != event_binding:
+            payload["start_result"] = "active_run_binding_conflict"
+            payload["requested_event_binding_digest"] = event_binding_digest(
+                event_binding
+            )
+            payload["active_event_binding_digest"] = event_binding_digest(
+                current_binding
+            )
+            print(json.dumps(payload, sort_keys=True))
+            return 12
         payload["start_result"] = "already_active"
         print(json.dumps(payload, sort_keys=True))
         return 2
@@ -621,6 +643,7 @@ def start_monitor(args: argparse.Namespace) -> int:
         }
         if event_binding is not None:
             manifest["event_binding"] = event_binding
+            manifest["event_binding_digest"] = event_binding_digest(event_binding)
             manifest["event_backend"] = "slurm"
         publish_json_no_replace(run / "manifest.json", manifest)
         if event_binding is not None:

@@ -317,6 +317,12 @@ def resolved_event_binding(args: argparse.Namespace) -> dict[str, Any] | None:
     return binding
 
 
+def event_binding_digest(binding: dict[str, Any] | None) -> str | None:
+    if binding is None:
+        return None
+    return semantic_events.sha256_prefix(semantic_events.canonical_json(binding))
+
+
 def reconcile_run_event(run: Path | None) -> str | None:
     """Close the crash window between terminal.json and event publication.
 
@@ -608,14 +614,31 @@ def start_monitor(args: argparse.Namespace) -> int:
     contract = contract_from_args(args)
     contract_digest = sha256_bytes(canonical_json(contract))
     handle = task_handle(contract)
+    event_binding = resolved_event_binding(args)
     ensure_private_directory(args.state_dir)
     base = base_dir(args.state_dir, handle)
     try:
         lock_fd = open_lifetime_lock(base)
     except BlockingIOError:
-        payload = run_status(current_run(base), handle)
+        run = current_run(base)
+        payload = run_status(run, handle)
         if payload.get("contract_digest") not in {None, contract_digest}:
             payload["start_result"] = "contract_conflict"
+            print(json.dumps(payload, sort_keys=True))
+            return 12
+        current_binding = None
+        if run is not None:
+            candidate = read_json(run / "manifest.json").get("event_binding")
+            if isinstance(candidate, dict):
+                current_binding = candidate
+        if event_binding is not None and current_binding != event_binding:
+            payload["start_result"] = "active_run_binding_conflict"
+            payload["requested_event_binding_digest"] = event_binding_digest(
+                event_binding
+            )
+            payload["active_event_binding_digest"] = event_binding_digest(
+                current_binding
+            )
             print(json.dumps(payload, sort_keys=True))
             return 12
         payload["start_result"] = "already_active"
@@ -676,9 +699,9 @@ def start_monitor(args: argparse.Namespace) -> int:
             "scope": "artifact_observation_only",
             "business_verdict": "pending",
         }
-        event_binding = resolved_event_binding(args)
         if event_binding is not None:
             manifest["event_binding"] = event_binding
+            manifest["event_binding_digest"] = event_binding_digest(event_binding)
             manifest["event_backend"] = args.event_backend
         publish_json_no_replace(run / "manifest.json", manifest)
         if event_binding is not None:

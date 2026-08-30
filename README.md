@@ -75,6 +75,19 @@ publication, any later `status`/`wait` observation reconciles it; transient
 publication failures remain retryable instead of permanently suppressing
 that repair.
 
+Before the first delivery daemon start, `activation-check` inventories the
+events matching that exact App Server instance, Codex home, and workspace.
+`activation-check --activate --i-mean-it` then writes a private durable
+activation receipt, under the same outbox lock used by publishers. Unreadable
+entries block activation; every pre-cutover pending or leased event requires
+an exact event-ID acknowledgement. Foreground delivery, managed service starts,
+and automatic service restarts all fail closed without that receipt. This
+avoids silently waking an old thread when a bridge is enabled for the first
+time while allowing later events from newly bound monitors without repeated
+prompts.
+Bindings belong to new supervisor runs: attempts to retrofit one onto an
+active unattended run fail as `active_run_binding_conflict`.
+
 If the App Server asks for command, file, permission, MCP, or user-input
 approval during the wake turn, the bridge never answers it. The attempt
 fails closed as `operator_interaction_required` for human diagnosis instead
@@ -88,6 +101,11 @@ until the release gates below are met it stays disabled by default and
 labeled experimental. Full setup, failure matrix, and disable procedure:
 [`codex-hpc-monitor/references/app-server-bridge.md`](codex-hpc-monitor/references/app-server-bridge.md).
 
+A scheduled Goal is not a substitute for the bridge. Goal cadence creates a
+model turn before skill logic can debounce it, so these skills explicitly
+forbid creating or retaining a periodic Goal solely for status checks. Use an
+event-driven bridge, or unattended mode until a natural user turn.
+
 Bridge release gates (partially met): all tests green on supported Pythons,
 skill validation for both skills, one opt-in live end-to-end test against a
 real Codex App Server, offline/duplicate-delivery and multi-instance
@@ -100,7 +118,8 @@ needs no credentials.
 Both supervisors expose `start`, `status`, `wait`, plus:
 
 - `doctor` — one command that reports the negotiated mode, zero-turn
-  semantics, agent-slot usage, auto-resume availability, state-root
+  semantics, agent-slot usage, configured auto-resume capability (not daemon
+  liveness), state-root
   filesystem suitability, outbox summary, and (optionally) a live App
   Server probe. `--format text` and `--format json` agree.
 - `list` — enumerate local monitors and their states.
@@ -110,7 +129,8 @@ Both supervisors expose `start`, `status`, `wait`, plus:
   events only; terminal evidence is never touched.
 
 Bridge tooling lives in `scripts/app_server_bridge.py`
-(`init-config`, `init-binding`, `status`, `deliver`, `protocol-check`) and the idempotent
+(`init-config`, `init-binding`, `activation-check`, `status`, `deliver`,
+`protocol-check`) and the idempotent
 postflight state machine in `scripts/postflight_guard.py` (`begin` → perform
 side effects → `complete`; `reset --i-mean-it` only clears an in-progress
 claim and never a completed marker; `mark` is only for a single atomic
@@ -264,11 +284,16 @@ Slurm `COMPLETED / 0:0` is scheduler evidence only. It does not prove that a tra
 
 This initial release preserves the original workflow contracts and therefore contains integration paths tailored to the author's environment:
 
-- `codex-hpc-monitor/SKILL.md` expects a separate `hpc-train` skill and uses `hpc142` in examples.
+- `codex-hpc-monitor/SKILL.md` uses `hpc142` in examples. Read-only monitoring
+  of an already-submitted job is self-contained; `hpc-train` is a conditional
+  companion only for separate submission, mutation, or training diagnosis.
 - `codex-long-task-monitor/SKILL.md` references separate `codex-task-dispatch` and `codex-task-routing` skills.
 - `monitor_dispatch.py` has a default path for an external dispatch supervisor.
 
-Review and adapt those paths and companion-skill assumptions before using the repository in another environment. Do not weaken the authority boundaries merely to make an example run.
+Review and adapt those paths and conditional companion-skill assumptions
+before using the repository in another environment. A missing companion must
+never trigger improvised raw-SSH submission or mutation. Do not weaken the
+authority boundaries merely to make an example run.
 
 The artifact-monitoring backend is self-contained and is the easiest place to start.
 
@@ -313,7 +338,7 @@ real-smoke Codex version, and runs a non-blocking scheduled advisory check
 against the latest Codex CLI.
 
 Current operations-hardening baseline after independent review:
-**392 tests passing** (213 HPC monitor tests and 179 long-task monitor tests),
+**440 tests passing** (237 HPC monitor tests and 203 long-task monitor tests),
 including the outbox, App Server fake, postflight claim, doctor,
 protocol contract check, approval-request fail-closed behavior, service
 definition lifecycle, independent notification receipts, event timeline,

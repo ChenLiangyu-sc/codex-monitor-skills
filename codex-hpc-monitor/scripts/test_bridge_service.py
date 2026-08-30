@@ -70,6 +70,28 @@ class BridgeServiceTests(unittest.TestCase):
             "--no-manager",
         ]
 
+    def publish_matching_event(self) -> dict:
+        binding = {
+            "schema": se.EVENT_BINDING_SCHEMA,
+            "codex_home_id": se.codex_home_digest(self.codex_home),
+            "app_server_instance": "local-1",
+            "thread_id": "thr_service_test",
+            "workspace": str(self.workspace),
+        }
+        event = se.build_event(
+            backend="artifact", handle="service-test", generation="run_1",
+            terminal_digest="sha256:" + "a" * 64,
+            event="transport_success", exit_code=0, binding=binding,
+        )
+        se.publish_event(se.outbox_root(self.state), event)
+        return event
+
+    def activate(self, accepted: list[str] | None = None) -> None:
+        se.activate_bridge(
+            se.outbox_root(self.state), se.load_bridge_config(self.config),
+            accepted or [],
+        )
+
     def test_linux_dry_run_is_non_mutating_and_contains_no_config_secret(self) -> None:
         result = self.cli(*self.install_args(), "--dry-run")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -197,13 +219,70 @@ class BridgeServiceTests(unittest.TestCase):
         self.assertEqual(json.loads(result.stdout)["reason"], "bridge_disabled")
         self.assertFalse((self.service_dir / f"{SERVICE_NAME}.service").exists())
 
+    def test_start_requires_durable_activation_receipt(self) -> None:
+        event = self.publish_matching_event()
+        args = self.install_args()
+        args.remove("--no-manager")
+        refused = self.cli(*args, "--start")
+        self.assertEqual(refused.returncode, 12, refused.stdout)
+        payload = json.loads(refused.stdout)
+        self.assertEqual(
+            payload["reason"],
+            "bridge_not_activated",
+        )
+        self.assertFalse((self.service_dir / f"{SERVICE_NAME}.service").exists())
+        self.activate([event["event_id"]])
+        parsed = service.parser().parse_args([*args, "--start"])
+        with mock.patch.object(service, "_manager_action", return_value={
+            "ok": True, "results": [],
+        }):
+            with mock.patch("builtins.print"):
+                accepted = service.install_command(parsed)
+        self.assertEqual(accepted, 0)
+        self.assertTrue((self.service_dir / f"{SERVICE_NAME}.service").is_file())
+
+    def test_unreadable_outbox_cannot_be_activated(self) -> None:
+        event = self.publish_matching_event()
+        path = se.event_dir(se.outbox_root(self.state), event["event_id"]) / "event.json"
+        path.write_text("not-json", encoding="utf-8")
+        args = self.install_args()
+        args.remove("--no-manager")
+        with self.assertRaises(se.SemanticEventError) as ctx:
+            self.activate([event["event_id"]])
+        self.assertEqual(ctx.exception.reason, "activation_outbox_unreadable")
+
+    def test_manual_start_requires_same_activation_receipt(self) -> None:
+        self.assertEqual(self.cli(*self.install_args()).returncode, 0)
+        event = self.publish_matching_event()
+        common = [
+            "start", "--platform", "linux", "--service-name", SERVICE_NAME,
+            "--service-dir", str(self.service_dir),
+            "--state-dir", str(self.state), "--bridge-config", str(self.config),
+        ]
+        refused = self.cli(*common)
+        self.assertEqual(refused.returncode, 12, refused.stdout)
+        self.assertEqual(
+            json.loads(refused.stdout)["reason"], "bridge_not_activated",
+        )
+        self.activate([event["event_id"]])
+        parsed = service.parser().parse_args(common)
+        with mock.patch.object(service, "_manager_action", return_value={
+            "ok": True, "results": [],
+        }):
+            with mock.patch("builtins.print"):
+                self.assertEqual(service.action_command(parsed), 0)
+
     def test_action_and_uninstall_share_one_lifecycle_lock(self) -> None:
         self.assertEqual(self.cli(*self.install_args()).returncode, 0)
+        self.activate()
         common = [
             "--platform", "linux", "--service-name", SERVICE_NAME,
             "--service-dir", str(self.service_dir),
         ]
-        action_args = service.parser().parse_args(["start", *common])
+        action_args = service.parser().parse_args([
+            "start", *common, "--state-dir", str(self.state),
+            "--bridge-config", str(self.config),
+        ])
         uninstall_args = service.parser().parse_args([
             "uninstall", *common, "--no-manager", "--i-mean-it",
         ])
@@ -235,6 +314,43 @@ class BridgeServiceTests(unittest.TestCase):
                 uninstall.join(5)
         self.assertEqual(sorted(results), [0, 0])
         self.assertFalse((self.service_dir / f"{SERVICE_NAME}.service").exists())
+
+    def test_systemd_execstart_escapes_specifiers_and_environment_syntax(self) -> None:
+        content = service.render_systemd(
+            Path("/tmp/state%name$HOME"), Path("/tmp/config%id$X"),
+            HERE / "app_server_bridge.py",
+        ).decode()
+        self.assertIn("state%%name$$HOME", content)
+        self.assertIn("config%%id$$X", content)
+
+    def test_launchd_reload_continues_when_agent_is_inactive(self) -> None:
+        results = [
+            subprocess.CompletedProcess([], 3, "", "not loaded"),
+            subprocess.CompletedProcess([], 0, "", ""),
+        ]
+        with mock.patch.object(service, "_run", side_effect=results) as run:
+            outcome = service._manager_action(
+                "darwin", "reload-restart", SERVICE_NAME,
+                self.service_dir / f"{SERVICE_NAME}.plist",
+            )
+        self.assertTrue(outcome["ok"])
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_args_list[1].args[0][1], "bootstrap")
+
+    def test_launchd_uninstall_tolerates_already_inactive_agent(self) -> None:
+        self.assertEqual(self.cli(*self.install_args("darwin")).returncode, 0)
+        parsed = service.parser().parse_args([
+            "uninstall", "--platform", "darwin",
+            "--service-name", SERVICE_NAME,
+            "--service-dir", str(self.service_dir), "--i-mean-it",
+        ])
+        inactive = subprocess.CompletedProcess([], 3, "", "service not loaded")
+        with mock.patch.object(service, "_run", return_value=inactive):
+            with mock.patch("builtins.print"):
+                result = service.uninstall_command(parsed)
+        self.assertEqual(result, 0)
+        self.assertFalse((self.service_dir / f"{SERVICE_NAME}.plist").exists())
+        self.assertTrue(list(self.service_dir.glob("*.removed.*")))
 
 
 class VendorSyncTests(unittest.TestCase):
