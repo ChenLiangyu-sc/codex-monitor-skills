@@ -58,8 +58,13 @@ later `status`/`wait` observation. See
 (including the awaited `turn/completed`), failure behavior, and the
 mandatory idempotent postflight claim protocol
 (`postflight_guard.py begin`/`complete`). The `monitor_dispatch.py` wrapper
-forwards `--event-binding`/`--bridge-config` and labels its events
+forwards `--event-binding`/`--bridge-config`/`--require-auto-resume` and labels its events
 `backend=dispatch`.
+
+Use `--require-auto-resume` when completion depends on the wake loop. Without
+it, `--event-binding` alone remains compatible but emits a prominent stderr
+warning and a structured JSON warning; the strict check still does not prove
+daemon liveness.
 
 The binding is new-run intent, not an attach operation. Adding or changing it
 on an already active unattended run fails as

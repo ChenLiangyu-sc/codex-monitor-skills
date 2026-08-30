@@ -88,6 +88,14 @@ prompts.
 Bindings belong to new supervisor runs: attempts to retrofit one onto an
 active unattended run fail as `active_run_binding_conflict`.
 
+If `start` receives `--event-binding` without `--bridge-config`, it still
+preserves the compatible event-publication behavior but emits a prominent
+stderr warning and a structured `warnings` entry in its JSON result. Use
+`--require-auto-resume` for a strict start: it fails before launching unless
+the binding, enabled matching bridge config, and durable activation receipt
+are all present. This preflight does not claim that the delivery daemon is
+currently alive.
+
 If the App Server asks for command, file, permission, MCP, or user-input
 approval during the wake turn, the bridge never answers it. The attempt
 fails closed as `operator_interaction_required` for human diagnosis instead
@@ -338,7 +346,7 @@ real-smoke Codex version, and runs a non-blocking scheduled advisory check
 against the latest Codex CLI.
 
 Current operations-hardening baseline after independent review:
-**440 tests passing** (237 HPC monitor tests and 203 long-task monitor tests),
+**448 tests passing** (240 HPC monitor tests and 208 long-task monitor tests),
 including the outbox, App Server fake, postflight claim, doctor,
 protocol contract check, approval-request fail-closed behavior, service
 definition lifecycle, independent notification receipts, event timeline,

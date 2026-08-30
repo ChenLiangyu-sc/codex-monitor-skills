@@ -105,8 +105,15 @@ For a newly enabled closed loop, add both identity files on the initial start:
 
 ```bash
   --event-binding ~/.config/codex-monitor/binding-<task>.json \
-  --bridge-config ~/.config/codex-monitor/bridge.json
+  --bridge-config ~/.config/codex-monitor/bridge.json \
+  --require-auto-resume
 ```
+
+If a caller deliberately supplies `--event-binding` without
+`--bridge-config`, disclose the prominent launcher warning: events are
+published, but closed-loop auto-resume is not configured or verified. Use
+`--require-auto-resume` whenever the requested outcome depends on automatic
+wake; it checks binding/config/activation readiness, not daemon liveness.
 
 Include every known identity constraint. Omit unknown optional fields; never guess them. The launcher returns after a bounded handshake while the supervisor and watcher continue independently.
 

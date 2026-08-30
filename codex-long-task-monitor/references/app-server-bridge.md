@@ -110,8 +110,14 @@ python3 <skill-dir>/scripts/app_server_bridge.py init-binding \
 ```bash
 python3 <skill-dir>/scripts/supervise_artifact.py start <artifact-path> ... \
   --event-binding ~/.config/codex-monitor/binding-<task>.json \
-  --bridge-config ~/.config/codex-monitor/bridge.json
+  --bridge-config ~/.config/codex-monitor/bridge.json \
+  --require-auto-resume
 ```
+
+The strict flag verifies the binding/config identity, enabled config, and
+durable activation receipt before launch. It cannot prove daemon liveness.
+Without the strict flag, a binding with no config remains compatible but emits
+both a prominent stderr warning and a structured JSON warning.
 
 The launcher rejects an attempt to add or change a binding on an already
 active run as `active_run_binding_conflict`; bindings are immutable run

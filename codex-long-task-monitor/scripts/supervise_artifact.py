@@ -323,6 +323,68 @@ def event_binding_digest(binding: dict[str, Any] | None) -> str | None:
     return semantic_events.sha256_prefix(semantic_events.canonical_json(binding))
 
 
+def auto_resume_preflight(
+    args: argparse.Namespace, binding: dict[str, Any] | None
+) -> list[dict[str, str]]:
+    """Report or reject start-time conditions that do not form a wake loop."""
+    warnings: list[dict[str, str]] = []
+    require = bool(getattr(args, "require_auto_resume", False))
+    if binding is None:
+        if args.bridge_config is not None:
+            warnings.append({
+                "code": "bridge_config_without_event_binding",
+                "message": "bridge config is present but this run has no event binding; no wake event will be published",
+            })
+    elif args.bridge_config is None:
+        warnings.append({
+            "code": "event_binding_without_bridge_config",
+            "message": "event binding will publish wake events, but automatic resume is not configured or verified without --bridge-config",
+        })
+    else:
+        config = semantic_events.load_bridge_config(Path(args.bridge_config))
+        if not config["enabled"]:
+            warnings.append({
+                "code": "bridge_config_disabled",
+                "message": "event binding is present but the bridge configuration is disabled",
+            })
+        else:
+            try:
+                semantic_events.read_bridge_activation(
+                    semantic_events.outbox_root(Path(args.state_dir)), config
+                )
+            except semantic_events.SemanticEventError as exc:
+                warnings.append({
+                    "code": exc.reason,
+                    "message": "event binding and bridge config are present, but the durable bridge activation receipt is not ready",
+                })
+    if require and warnings:
+        codes = ",".join(item["code"] for item in warnings)
+        raise ValueError(
+            "--require-auto-resume preconditions failed: " + codes
+            + "; this checks binding/config/activation, not daemon liveness"
+        )
+    if require and binding is None:
+        raise ValueError("--require-auto-resume requires --event-binding and --bridge-config")
+    return warnings
+
+
+def emit_auto_resume_warnings(warnings: list[dict[str, str]]) -> None:
+    for warning in warnings:
+        print(
+            f"*** WARNING [{warning['code']}]: {warning['message']} ***",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def print_start_payload(
+    payload: dict[str, Any], warnings: list[dict[str, str]]
+) -> None:
+    if warnings:
+        payload["warnings"] = warnings
+    print(json.dumps(payload, sort_keys=True))
+
+
 def reconcile_run_event(run: Path | None) -> str | None:
     """Close the crash window between terminal.json and event publication.
 
@@ -615,6 +677,8 @@ def start_monitor(args: argparse.Namespace) -> int:
     contract_digest = sha256_bytes(canonical_json(contract))
     handle = task_handle(contract)
     event_binding = resolved_event_binding(args)
+    auto_resume_warnings = auto_resume_preflight(args, event_binding)
+    emit_auto_resume_warnings(auto_resume_warnings)
     ensure_private_directory(args.state_dir)
     base = base_dir(args.state_dir, handle)
     try:
@@ -624,7 +688,7 @@ def start_monitor(args: argparse.Namespace) -> int:
         payload = run_status(run, handle)
         if payload.get("contract_digest") not in {None, contract_digest}:
             payload["start_result"] = "contract_conflict"
-            print(json.dumps(payload, sort_keys=True))
+            print_start_payload(payload, auto_resume_warnings)
             return 12
         current_binding = None
         if run is not None:
@@ -639,10 +703,10 @@ def start_monitor(args: argparse.Namespace) -> int:
             payload["active_event_binding_digest"] = event_binding_digest(
                 current_binding
             )
-            print(json.dumps(payload, sort_keys=True))
+            print_start_payload(payload, auto_resume_warnings)
             return 12
         payload["start_result"] = "already_active"
-        print(json.dumps(payload, sort_keys=True))
+        print_start_payload(payload, auto_resume_warnings)
         return 2
 
     try:
@@ -650,11 +714,11 @@ def start_monitor(args: argparse.Namespace) -> int:
         previous_digest = previous.get("contract_digest")
         if previous_digest is not None and previous_digest != contract_digest:
             previous["start_result"] = "contract_conflict"
-            print(json.dumps(previous, sort_keys=True))
+            print_start_payload(previous, auto_resume_warnings)
             return 12
         if previous["state"] != "not_started" and not args.restart:
             previous["start_result"] = "restart_required"
-            print(json.dumps(previous, sort_keys=True))
+            print_start_payload(previous, auto_resume_warnings)
             return 3
 
         previous_current = read_json(base / "current.json")
@@ -771,14 +835,14 @@ def start_monitor(args: argparse.Namespace) -> int:
             status_payload = run_status(run, handle)
             if launch_handshake_confirmed(status_payload):
                 status_payload["start_result"] = "started"
-                print(json.dumps(status_payload, sort_keys=True))
+                print_start_payload(status_payload, auto_resume_warnings)
                 return 0
             if child.poll() is not None:
                 break
             time.sleep(0.05)
         status_payload = run_status(run, handle)
         status_payload["start_result"] = "handshake_failed"
-        print(json.dumps(status_payload, sort_keys=True))
+        print_start_payload(status_payload, auto_resume_warnings)
         return 4
     finally:
         if lock_fd >= 0:
@@ -1367,6 +1431,11 @@ def parser() -> argparse.ArgumentParser:
         "--bridge-config",
         type=Path,
         help="bridge configuration the binding must agree with (optional)",
+    )
+    start.add_argument(
+        "--require-auto-resume",
+        action="store_true",
+        help="fail before launch unless binding, enabled bridge config, and durable activation receipt are ready (does not prove daemon liveness)",
     )
     start.add_argument(
         "--event-backend",

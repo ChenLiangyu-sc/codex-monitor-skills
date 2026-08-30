@@ -215,6 +215,8 @@ def helper_command(args: argparse.Namespace) -> list[str]:
             command += ["--event-binding", str(args.event_binding)]
         if getattr(args, "bridge_config", None) is not None:
             command += ["--bridge-config", str(args.bridge_config)]
+        if getattr(args, "require_auto_resume", False):
+            command.append("--require-auto-resume")
         command += ["--event-backend", "dispatch"]
         return command
     command.append(args.monitor_task_handle)
@@ -303,6 +305,8 @@ def compact_payload(
                 "watcher_alive": payload.get("watcher_alive") is True,
             }
         )
+        if isinstance(payload.get("warnings"), list):
+            result["warnings"] = payload["warnings"]
     if terminal:
         result.update(
             {
@@ -314,6 +318,25 @@ def compact_payload(
             }
         )
     return result
+
+
+def wrapper_auto_resume_preflight(args: argparse.Namespace) -> list[dict[str, str]]:
+    warnings: list[dict[str, str]] = []
+    if args.event_binding is not None and args.bridge_config is None:
+        warnings.append({
+            "code": "event_binding_without_bridge_config",
+            "message": "event binding will publish wake events, but automatic resume is not configured or verified without --bridge-config",
+        })
+    elif args.event_binding is None and args.bridge_config is not None:
+        warnings.append({
+            "code": "bridge_config_without_event_binding",
+            "message": "bridge config is present but this run has no event binding; no wake event will be published",
+        })
+    if args.require_auto_resume and (
+        args.event_binding is None or args.bridge_config is None
+    ):
+        raise WrapperError("--require-auto-resume requires --event-binding and --bridge-config")
+    return warnings
 
 
 def positive_float(value: str) -> float:
@@ -344,6 +367,7 @@ def parser() -> argparse.ArgumentParser:
     start.add_argument("--restart", action="store_true")
     start.add_argument("--event-binding", type=Path)
     start.add_argument("--bridge-config", type=Path)
+    start.add_argument("--require-auto-resume", action="store_true")
     status = sub.add_parser("status")
     status.add_argument("monitor_task_handle")
     status.add_argument("--state-dir", type=Path)
@@ -371,6 +395,15 @@ def main() -> int:
             )
         if args.command != "start":
             args.binding = load_binding(state_directory(args.state_dir), args.monitor_task_handle)
+        wrapper_warnings: list[dict[str, str]] = []
+        if args.command == "start":
+            wrapper_warnings = wrapper_auto_resume_preflight(args)
+            for warning in wrapper_warnings:
+                print(
+                    f"*** WARNING [{warning['code']}]: {warning['message']} ***",
+                    file=sys.stderr,
+                    flush=True,
+                )
         return_code, payload = run_helper(helper_command(args))
         if args.command == "start" and isinstance(payload.get("task_handle"), str):
             binding = new_binding(args)
@@ -389,6 +422,8 @@ def main() -> int:
         compact = compact_payload(
             args.command, payload, getattr(args, "resolved_dispatch_handle", None)
         )
+        if args.command == "start" and wrapper_warnings and "warnings" not in compact:
+            compact["warnings"] = wrapper_warnings
         compact.update(verification)
         print(
             json.dumps(
@@ -400,7 +435,14 @@ def main() -> int:
         return return_code
     except (OSError, subprocess.SubprocessError, WrapperError) as exc:
         state = "dispatch_verification_failed" if isinstance(exc, DispatchVerificationError) else "wrapper_error"
-        print(json.dumps({"schema_version": SCHEMA, "operation": args.command, "state": state}, sort_keys=True, separators=(",", ":")))
+        error_payload = {
+            "schema_version": SCHEMA,
+            "operation": args.command,
+            "state": state,
+        }
+        if str(exc).startswith("--require-auto-resume"):
+            error_payload["reason"] = "auto_resume_requirements_not_met"
+        print(json.dumps(error_payload, sort_keys=True, separators=(",", ":")))
         return 12
 
 

@@ -239,6 +239,41 @@ class SupervisorTest(unittest.TestCase):
         self.assertIsNone(payload["active_event_binding_digest"])
         self.assertTrue(payload["requested_event_binding_digest"].startswith("sha256:"))
 
+    def test_binding_without_config_emits_prominent_warning(self) -> None:
+        binding = self.write_binding()
+        result, payload = self.run_cli(
+            "start", "--event-binding", str(binding), env={"FAKE_EXIT": "0"}
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("*** WARNING [event_binding_without_bridge_config]", result.stderr)
+        self.assertEqual(
+            payload["warnings"][0]["code"],
+            "event_binding_without_bridge_config",
+        )
+
+    def test_require_auto_resume_fails_before_launch_without_ready_bridge(self) -> None:
+        binding = self.write_binding()
+        result, payload = self.run_cli(
+            "start", "--event-binding", str(binding), "--require-auto-resume"
+        )
+        self.assertEqual(result.returncode, 12)
+        self.assertIn("event_binding_without_bridge_config", payload["detail"])
+        self.assertFalse(self.state.exists())
+
+    def test_require_auto_resume_accepts_activated_matching_bridge(self) -> None:
+        binding = self.write_binding()
+        config = self.write_bridge_config()
+        semantic_events.activate_bridge(
+            self.outbox(), semantic_events.load_bridge_config(config), []
+        )
+        result, payload = self.run_cli(
+            "start", "--event-binding", str(binding),
+            "--bridge-config", str(config), "--require-auto-resume",
+            env={"FAKE_EXIT": "0"},
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertNotIn("warnings", payload)
+
     def test_status_observer_exit_does_not_stop_watcher(self) -> None:
         self.run_cli("start", env={"FAKE_WATCH_SECONDS": "20"})
         first = self.status()

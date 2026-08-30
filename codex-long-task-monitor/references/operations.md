@@ -155,6 +155,19 @@ delivery nonzero (including service mode), so accidental damage is visible and
 the service manager can retry. Only an explicitly disabled bridge config is a
 clean service stop.
 
+## Strict monitor start preflight
+
+When the requested outcome requires a wake turn, start a new monitor with
+`--event-binding`, `--bridge-config`, and `--require-auto-resume` together.
+The strict option fails before creating a run or launching a watcher unless
+the binding/config identity matches, the config is enabled, and its durable
+activation receipt exists. It does not probe delivery-daemon liveness.
+
+For backward compatibility, a binding without a config still publishes an
+event, but start prints a prominent stderr warning and includes the same
+warning code in JSON. Treat that mode as event publication only, not a closed
+loop.
+
 ## Event timeline
 
 Read lifecycle state without querying the workload or starting a model turn:

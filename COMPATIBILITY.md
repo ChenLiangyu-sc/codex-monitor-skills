@@ -120,6 +120,10 @@ Activation hardening behavior (additive):
   `event_binding_digest`; attempts to retrofit a different binding onto an
   active run return `active_run_binding_conflict` without changing the run;
 - existing manifests without `event_binding_digest` remain readable.
+- `start --event-binding` without `--bridge-config` remains accepted for
+  compatibility but adds a structured `warnings` field and a prominent stderr
+  warning; the additive `--require-auto-resume` option fails before launch
+  unless binding, enabled matching config, and activation receipt are ready.
 
 ## 3. Migration behavior
 

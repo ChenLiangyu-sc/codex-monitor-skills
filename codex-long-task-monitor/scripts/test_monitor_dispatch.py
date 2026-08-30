@@ -116,6 +116,35 @@ class DispatchMonitorWrapperTests(unittest.TestCase):
         for outcome in ("exit_nonzero", "signaled", "not_started", "contract_violation", "unknown"):
             self.assertIn(json.dumps(outcome), argv)
 
+    def test_binding_without_config_warning_survives_compact_wrapper(self) -> None:
+        result = self.run_wrapper(
+            "start", str(self.dispatch), "--state-dir", str(self.root / "state"),
+            "--timeout-seconds", "60", "--event-binding", str(self.root / "binding.json"),
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("*** WARNING [event_binding_without_bridge_config]", result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["warnings"][0]["code"], "event_binding_without_bridge_config")
+
+    def test_require_auto_resume_requires_both_inputs_and_is_forwarded(self) -> None:
+        refused = self.run_wrapper(
+            "start", str(self.dispatch), "--state-dir", str(self.root / "state"),
+            "--timeout-seconds", "60", "--event-binding", str(self.root / "binding.json"),
+            "--require-auto-resume",
+        )
+        self.assertEqual(refused.returncode, 12)
+        self.assertEqual(json.loads(refused.stdout)["reason"], "auto_resume_requirements_not_met")
+
+        accepted = self.run_wrapper(
+            "start", str(self.dispatch), "--state-dir", str(self.root / "state"),
+            "--timeout-seconds", "60", "--event-binding", str(self.root / "binding.json"),
+            "--bridge-config", str(self.root / "bridge.json"),
+            "--require-auto-resume",
+        )
+        self.assertEqual(accepted.returncode, 0, accepted.stdout)
+        argv = json.loads(self.capture.read_text(encoding="utf-8"))
+        self.assertIn("--require-auto-resume", argv)
+
     def test_status_is_compact_and_preserves_exit_code(self) -> None:
         started = self.run_wrapper(
             "start", str(self.dispatch), "--state-dir", str(self.root / "state"), "--timeout-seconds", "60"

@@ -409,6 +409,68 @@ def event_binding_digest(binding: Optional[Dict[str, Any]]) -> Optional[str]:
     return semantic_events.sha256_prefix(semantic_events.canonical_json(binding))
 
 
+def auto_resume_preflight(
+    args: argparse.Namespace, binding: Optional[Dict[str, Any]]
+) -> List[Dict[str, str]]:
+    """Report or reject start-time conditions that do not form a wake loop."""
+    warnings: List[Dict[str, str]] = []
+    require = bool(getattr(args, "require_auto_resume", False))
+    if binding is None:
+        if args.bridge_config is not None:
+            warnings.append({
+                "code": "bridge_config_without_event_binding",
+                "message": "bridge config is present but this run has no event binding; no wake event will be published",
+            })
+    elif args.bridge_config is None:
+        warnings.append({
+            "code": "event_binding_without_bridge_config",
+            "message": "event binding will publish wake events, but automatic resume is not configured or verified without --bridge-config",
+        })
+    else:
+        config = semantic_events.load_bridge_config(Path(args.bridge_config))
+        if not config["enabled"]:
+            warnings.append({
+                "code": "bridge_config_disabled",
+                "message": "event binding is present but the bridge configuration is disabled",
+            })
+        else:
+            try:
+                semantic_events.read_bridge_activation(
+                    semantic_events.outbox_root(Path(args.state_dir)), config
+                )
+            except semantic_events.SemanticEventError as exc:
+                warnings.append({
+                    "code": exc.reason,
+                    "message": "event binding and bridge config are present, but the durable bridge activation receipt is not ready",
+                })
+    if require and warnings:
+        codes = ",".join(item["code"] for item in warnings)
+        raise ValueError(
+            "--require-auto-resume preconditions failed: " + codes
+            + "; this checks binding/config/activation, not daemon liveness"
+        )
+    if require and binding is None:
+        raise ValueError("--require-auto-resume requires --event-binding and --bridge-config")
+    return warnings
+
+
+def emit_auto_resume_warnings(warnings: List[Dict[str, str]]) -> None:
+    for warning in warnings:
+        print(
+            f"*** WARNING [{warning['code']}]: {warning['message']} ***",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def print_start_payload(
+    payload: Dict[str, Any], warnings: List[Dict[str, str]]
+) -> None:
+    if warnings:
+        payload["warnings"] = warnings
+    print(json.dumps(payload, sort_keys=True))
+
+
 def reconcile_run_event(run: Optional[Path]) -> Optional[str]:
     """Close the crash window between terminal.json and event publication.
 
@@ -568,6 +630,8 @@ def publish_semantic_event(
 def start_monitor(args: argparse.Namespace) -> int:
     validate_identity(args.job_id, args.host)
     event_binding = resolved_event_binding(args)
+    auto_resume_warnings = auto_resume_preflight(args, event_binding)
+    emit_auto_resume_warnings(auto_resume_warnings)
     watcher_input = args.watcher_path.expanduser()
     if watcher_input.is_symlink():
         raise ValueError(f"watcher path must not be a symlink: {watcher_input}")
@@ -595,10 +659,10 @@ def start_monitor(args: argparse.Namespace) -> int:
             payload["active_event_binding_digest"] = event_binding_digest(
                 current_binding
             )
-            print(json.dumps(payload, sort_keys=True))
+            print_start_payload(payload, auto_resume_warnings)
             return 12
         payload["start_result"] = "already_active"
-        print(json.dumps(payload, sort_keys=True))
+        print_start_payload(payload, auto_resume_warnings)
         return 2
 
     try:
@@ -616,11 +680,11 @@ def start_monitor(args: argparse.Namespace) -> int:
             previous["start_result"] = "contract_conflict"
             previous["contract_digest"] = digest
             previous["previous_contract_digest"] = prior_digest
-            print(json.dumps(previous, sort_keys=True))
+            print_start_payload(previous, auto_resume_warnings)
             return 12
         if previous["state"] != "not_started" and not args.restart:
             previous["start_result"] = "restart_required"
-            print(json.dumps(previous, sort_keys=True))
+            print_start_payload(previous, auto_resume_warnings)
             return 3
 
         run_id = f"run_{int(time.time())}_{os.getpid()}_{secrets.token_hex(4)}"
@@ -711,7 +775,7 @@ def start_monitor(args: argparse.Namespace) -> int:
             if status["state"] in {"active", "terminal", "exit_observed_terminal_missing"}:
                 status["start_result"] = "started"
                 status["launcher_observed_pid"] = child.pid
-                print(json.dumps(status, sort_keys=True))
+                print_start_payload(status, auto_resume_warnings)
                 return 0
             if child.poll() is not None:
                 break
@@ -719,7 +783,7 @@ def start_monitor(args: argparse.Namespace) -> int:
         status = run_status(run, args.host, args.job_id)
         status["start_result"] = "handshake_failed"
         status["launcher_observed_pid"] = child.pid
-        print(json.dumps(status, sort_keys=True))
+        print_start_payload(status, auto_resume_warnings)
         return 4
     finally:
         if lock_fd >= 0:
@@ -1525,6 +1589,11 @@ def parser() -> argparse.ArgumentParser:
         "--bridge-config",
         type=Path,
         help="bridge configuration the binding must agree with (optional)",
+    )
+    start.add_argument(
+        "--require-auto-resume",
+        action="store_true",
+        help="fail before launch unless binding, enabled bridge config, and durable activation receipt are ready (does not prove daemon liveness)",
     )
     start.add_argument("--handshake-seconds", type=positive_float, default=10.0)
     start.set_defaults(func=start_monitor)
