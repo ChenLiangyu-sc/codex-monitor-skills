@@ -89,6 +89,22 @@ python3 <skill-dir>/scripts/supervise_slurm_job.py doctor \
   --state-dir ~/.cache/<skill-state>
 ```
 
+Then run the explicitly confirmed real lifecycle smoke. This creates an
+isolated test thread and two small read-only/no-approval model turns, with the
+second turn occurring after a new connection resumes the thread:
+
+```bash
+python3 <skill-dir>/scripts/app_server_bridge.py lifecycle-smoke \
+  --state-dir ~/.cache/<skill-state> \
+  --bridge-config ~/.config/codex-monitor/bridge.json \
+  --i-mean-it
+```
+
+Success writes a private receipt bound to the full config digest, absolute
+executable path and SHA-256, reported CLI version, Codex home, and workspace.
+Changing any of those invalidates strict readiness. A bare `codex` command is
+never strict-ready; regenerate the config with `init-config` to freeze it.
+
 3. Audit the existing outbox **before the first delivery process starts**:
 
 ```bash
@@ -123,7 +139,20 @@ python3 <skill-dir>/scripts/supervise_slurm_job.py start <job-id> --host <login-
 ```
 
 The strict flag verifies the binding/config identity, enabled config, and
-durable activation receipt before launch. It cannot prove daemon liveness.
+durable activation receipt before launch. It also probes the configured direct
+`codex app-server` executable and accepts only an exact version with a recorded
+real initialize/resume/start/completed smoke. Codex CLI 0.149.1 is known to
+close its output in a real deployment and is rejected; 0.150.1 and 0.151.0
+are currently recorded. The matching local lifecycle-smoke receipt is also
+required. Commands not shaped as `<absolute-executable> app-server`, unknown
+reported versions, missing receipts, and executable/config hash drift fail
+strict preflight. The receipt is local evidence, not a cryptographic remote
+attestation. It cannot prove daemon liveness.
+
+The delivery process revalidates this receipt when it starts and again after
+each event claim, immediately before App Server delivery. If the executable
+hash, config, workspace, or state-root receipt has drifted, it releases the
+claim to pending and exits without creating a wake turn.
 Without the strict flag, a binding with no config remains compatible but emits
 both a prominent stderr warning and a structured JSON warning.
 
@@ -258,7 +287,12 @@ race with `complete` and reopen an already-recorded side effect.
 
 Retries use exponential backoff with jitter and dead-letter after
 `max_attempts`. Inspect with `app_server_bridge.py status` or
-`monitor_events.py timeline`. A human may explicitly requeue one corrected
+`monitor_events.py timeline`. Each failure stores a bounded
+`last_error.stage`, nullable `last_error.app_server_exit_code`, and a
+secret/path-redacted 2,048-character `last_error.stderr_tail`. These fields distinguish
+initialize, resume, turn-start, and completion-stream failures even when the
+stable reason remains `connection_lost`; legacy records without them remain
+readable. A human may explicitly requeue one corrected
 dead-letter with `monitor_events.py retry ... --i-mean-it`; this never changes
 the immutable event or terminal evidence.
 

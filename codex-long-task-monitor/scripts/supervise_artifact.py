@@ -357,11 +357,40 @@ def auto_resume_preflight(
                     "code": exc.reason,
                     "message": "event binding and bridge config are present, but the durable bridge activation receipt is not ready",
                 })
+            try:
+                import app_server_bridge
+                lifecycle = app_server_bridge.configured_lifecycle_compatibility(
+                    config, Path(args.state_dir)
+                )
+            except (ImportError, OSError):
+                lifecycle = {
+                    "compatible": False,
+                    "reason": "codex_lifecycle_probe_failed",
+                    "codex_version": None,
+                }
+            if not lifecycle["compatible"]:
+                version = lifecycle.get("codex_version") or "unknown"
+                if lifecycle["reason"] == "codex_lifecycle_version_unverified":
+                    lifecycle_action = (
+                        "upgrade to a recorded version before relying on automatic resume"
+                    )
+                else:
+                    lifecycle_action = (
+                        "run app_server_bridge.py lifecycle-smoke --i-mean-it "
+                        "for this exact config and executable"
+                    )
+                warnings.append({
+                    "code": str(lifecycle["reason"]),
+                    "message": (
+                        f"configured Codex CLI {version} has no valid local real App Server lifecycle evidence; "
+                        + lifecycle_action
+                    ),
+                })
     if require and warnings:
         codes = ",".join(item["code"] for item in warnings)
         raise ValueError(
             "--require-auto-resume preconditions failed: " + codes
-            + "; this checks binding/config/activation, not daemon liveness"
+            + "; this checks binding/config/activation/CLI lifecycle compatibility, not daemon liveness"
         )
     if require and binding is None:
         raise ValueError("--require-auto-resume requires --event-binding and --bridge-config")
@@ -1135,6 +1164,7 @@ def build_doctor_payload(args: argparse.Namespace) -> dict[str, Any]:
     })
     app_server: dict[str, Any] = {"configured": False}
     reason = "bridge_not_configured"
+    bridge_ready = False
     if args.bridge_config is not None:
         try:
             config = semantic_events.load_bridge_config(Path(args.bridge_config))
@@ -1163,6 +1193,43 @@ def build_doctor_payload(args: argparse.Namespace) -> dict[str, Any]:
                 reason = "bridge_configured"
                 checks.append({"name": "bridge_config", "state": "pass",
                                "detail": "valid and enabled (no live probe requested)"})
+            if config["enabled"] and reason.startswith("bridge_configured"):
+                import app_server_bridge
+                lifecycle = app_server_bridge.configured_lifecycle_compatibility(
+                    config, state_dir
+                )
+                app_server["real_transport_smoke"] = (
+                    "passed" if lifecycle["compatible"] else "unverified"
+                )
+                app_server["lifecycle_reason"] = lifecycle["reason"]
+                checks.append({
+                    "name": "app_server_lifecycle_smoke",
+                    "state": "pass" if lifecycle["compatible"] else "warn",
+                    "detail": lifecycle["reason"],
+                })
+                try:
+                    semantic_events.read_bridge_activation(
+                        semantic_events.outbox_root(state_dir), config
+                    )
+                    activation_ready = True
+                    activation_reason = "bridge_activated"
+                    app_server["activation"] = "ready"
+                    checks.append({"name": "bridge_activation", "state": "pass",
+                                   "detail": "durable activation receipt is ready"})
+                except semantic_events.SemanticEventError as exc:
+                    activation_ready = False
+                    activation_reason = exc.reason
+                    app_server["activation"] = "missing_or_stale"
+                    checks.append({"name": "bridge_activation", "state": "warn",
+                                   "detail": exc.reason})
+                bridge_ready = lifecycle["compatible"] and activation_ready
+                if bridge_ready:
+                    reason = "bridge_configured_and_ready"
+                else:
+                    reason = "bridge_not_ready:" + (
+                        lifecycle["reason"] if not lifecycle["compatible"]
+                        else activation_reason
+                    )
         except semantic_events.SemanticEventError as exc:
             reason = f"bridge_config_invalid:{exc.reason}"
             checks.append({"name": "bridge_config", "state": "warn",
@@ -1184,7 +1251,7 @@ def build_doctor_payload(args: argparse.Namespace) -> dict[str, Any]:
 
     outbox_root = semantic_events.outbox_root(state_dir)
     entries = semantic_events.list_outbox(outbox_root) if outbox_root.exists() else []
-    auto_resume = selected == "external-event-bridge"
+    auto_resume = selected == "external-event-bridge" and bridge_ready
     return {
         "schema_version": DOCTOR_SCHEMA,
         "skill": "codex-long-task-monitor",
@@ -1193,6 +1260,10 @@ def build_doctor_payload(args: argparse.Namespace) -> dict[str, Any]:
         "agent_slot_occupied": False,
         "auto_resume_available": auto_resume,
         "notification_available": auto_resume,
+        "configuration_ready": bridge_ready,
+        "delivery_daemon_live": (
+            "unknown_not_probed" if app_server.get("configured") else "not_configured"
+        ),
         "state_root": {
             "path": str(state_dir),
             "filesystem": kind,
@@ -1224,7 +1295,9 @@ def render_doctor_text(payload: dict[str, Any]) -> str:
         app_line = (
             f"app server: transport={app_server.get('transport')} "
             f"instance={app_server.get('instance_id')} "
-            f"enabled={app_server.get('enabled')} healthy={app_server.get('healthy')}"
+            f"enabled={app_server.get('enabled')} healthy={app_server.get('healthy')} "
+            f"real_transport_smoke={app_server.get('real_transport_smoke')} "
+            f"activation={app_server.get('activation')}"
         )
     else:
         app_line = "app server: not configured"
@@ -1236,6 +1309,8 @@ def render_doctor_text(payload: dict[str, Any]) -> str:
         "zero model turns while unchanged: yes",
         f"agent slot occupied: {'yes' if payload['agent_slot_occupied'] else 'no'}",
         f"auto-resume available: {'yes' if payload['auto_resume_available'] else 'no'}",
+        f"configuration ready: {'yes' if payload['configuration_ready'] else 'no'}",
+        f"delivery daemon live: {payload['delivery_daemon_live']}",
         f"notification available: {'yes' if payload['notification_available'] else 'no'}",
         "state root: {path} ({filesystem}, {suitability})".format(
             path=payload["state_root"]["path"],
@@ -1435,7 +1510,11 @@ def parser() -> argparse.ArgumentParser:
     start.add_argument(
         "--require-auto-resume",
         action="store_true",
-        help="fail before launch unless binding, enabled bridge config, and durable activation receipt are ready (does not prove daemon liveness)",
+        help=(
+            "fail before launch unless binding, enabled bridge config, durable activation "
+            "receipt, recorded CLI version, frozen executable hash, and matching local "
+            "lifecycle-smoke receipt are ready (does not prove daemon liveness)"
+        ),
     )
     start.add_argument(
         "--event-backend",

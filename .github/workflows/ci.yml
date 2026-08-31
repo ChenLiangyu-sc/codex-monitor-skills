@@ -45,7 +45,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install real-smoke-tested Codex CLI
-        run: npm install --global @openai/codex@0.150.1
+        run: npm install --global @openai/codex@0.151.0
       - name: Check generated App Server protocol
         run: |
           python codex-hpc-monitor/scripts/app_server_bridge.py protocol-check \

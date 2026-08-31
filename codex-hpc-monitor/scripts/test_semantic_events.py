@@ -496,6 +496,9 @@ class OutboxTests(unittest.TestCase):
                 owner="daemon",
                 code=f"failure_{index}",
                 safe_message="x" * 500,
+                stage="thread_resume",
+                app_server_exit_code=18,
+                stderr_tail="diagnostic tail",
                 retryable=True,
                 now=NOW + timedelta(seconds=index),
                 max_attempts=3,
@@ -514,6 +517,9 @@ class OutboxTests(unittest.TestCase):
         self.assertEqual(delivery["last_error"]["code"], "failure_2")
         self.assertEqual(len(delivery["last_error"]["safe_message"]),
                          se.MAX_SAFE_MESSAGE_CHARS)
+        self.assertEqual(delivery["last_error"]["stage"], "thread_resume")
+        self.assertEqual(delivery["last_error"]["app_server_exit_code"], 18)
+        self.assertEqual(delivery["last_error"]["stderr_tail"], "diagnostic tail")
         self.assertIsNotNone(delivery["finished_at"])
         # A dead-lettered event is not claimable.
         self.assertIsNone(
@@ -521,6 +527,15 @@ class OutboxTests(unittest.TestCase):
                 self.outbox, owner="daemon", lease_seconds=60, now=NOW + timedelta(hours=2)
             )
         )
+
+    def test_legacy_delivery_last_error_remains_readable(self) -> None:
+        self.publish()
+        path = se.event_dir(self.outbox, self.event["event_id"]) / "delivery.json"
+        delivery = json.loads(path.read_text(encoding="utf-8"))
+        delivery["last_error"] = {"code": "legacy", "safe_message": "old record"}
+        path.write_text(json.dumps(delivery), encoding="utf-8")
+        loaded = se._read_delivery(path.parent, self.event["event_id"])
+        self.assertEqual(loaded["last_error"]["code"], "legacy")
 
     def test_retry_not_claimable_before_next_attempt_at(self) -> None:
         self.publish()

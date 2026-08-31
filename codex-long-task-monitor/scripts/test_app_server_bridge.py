@@ -35,6 +35,10 @@ LOG = os.environ.get("FAKE_LOG")
 CWD = os.environ.get("FAKE_THREAD_CWD", "/default/workspace")
 TURN_DELAY = float(os.environ.get("FAKE_TURN_DELAY", "0"))
 
+if sys.argv[1:] == ["--version"]:
+    print("codex-cli 0.151.0")
+    raise SystemExit(0)
+
 def send(obj):
     sys.stdout.write(json.dumps(obj) + "\n")
     sys.stdout.flush()
@@ -59,6 +63,10 @@ for raw in sys.stdin:
         sys.stdout.flush()
         continue
     if method == "initialize":
+        if MODE == "crash_initialize":
+            sys.stderr.write("initialize failed authorization: Bearer top-secret-token CODEX_HOME=" + os.environ.get("CODEX_HOME", "") + "\n")
+            sys.stderr.flush()
+            sys.exit(17)
         if MODE == "approval_id_collision":
             send({"id": mid, "method": "permissions/requestApproval", "params": {"reason": "secret"}})
             continue
@@ -74,13 +82,21 @@ for raw in sys.stdin:
     elif method == "initialized":
         if MODE == "drop_after_init":
             sys.exit(1)
+    elif method == "thread/start":
+        send({"id": mid, "result": {"thread": {"id": "thr_smoke_1", "cwd": message["params"].get("cwd")}}})
     elif method == "thread/resume":
-        if MODE == "thread_missing":
+        if MODE == "crash_resume":
+            sys.stderr.write("resume failed api_key=very-secret-value\n")
+            sys.stderr.flush()
+            sys.exit(18)
+        elif MODE == "thread_missing":
             send({"id": mid, "error": {"code": -32602, "message": "thread thr_x not found"}})
         elif MODE == "thread_archived":
             send({"id": mid, "error": {"code": -32602, "message": "thread is archived"}})
         elif MODE == "mcp_required":
             send({"id": mid, "error": {"code": -32000, "message": "required MCP server failed to initialize"}})
+        elif MODE == "mcp_secret_error":
+            send({"id": mid, "error": {"code": -32000, "message": "required MCP failed api_key=very-secret-value Authorization: Bearer bearer-secret at " + CWD}})
         elif MODE == "overload":
             send({"id": mid, "error": {"code": -32001, "message": "overloaded"}})
         elif MODE == "resume_bad_shape":
@@ -92,7 +108,11 @@ for raw in sys.stdin:
         else:
             send({"id": mid, "result": {"thread": {"id": message["params"]["threadId"], "cwd": CWD}}})
     elif method == "turn/start":
-        if MODE == "turn_conflict":
+        if MODE == "crash_turn_start":
+            sys.stderr.write("turn start failed access_token=very-secret-value\n")
+            sys.stderr.flush()
+            sys.exit(19)
+        elif MODE == "turn_conflict":
             send({"id": mid, "error": {"code": -32000, "message": "thread already has an active turn"}})
         elif MODE == "turn_bad_shape":
             send({"id": mid, "result": {"turn": {"status": "inProgress"}}})
@@ -107,6 +127,10 @@ for raw in sys.stdin:
             if MODE == "completion_before_reply":
                 send({"method": "turn/completed", "params": {"turn": {"id": "turn_fake_1", "status": "completed"}}})
             send({"id": mid, "result": {"turn": {"id": "turn_fake_1", "status": "inProgress", "items": [], "error": None}}})
+            if MODE == "crash_completion":
+                sys.stderr.write("completion stream failed refresh_token=very-secret-value\n")
+                sys.stderr.flush()
+                sys.exit(20)
             if MODE == "approval_during_turn":
                 send({"id": 992, "method": "item/fileChange/requestApproval", "params": {"path": "/secret"}})
             if MODE != "no_completion":
@@ -152,7 +176,7 @@ class BridgeAdapterTests(unittest.TestCase):
             "codex_home": str(self.root / ".codex"),
             "codex_home_id": se.codex_home_digest(self.root / ".codex"),
             "workspace": str(self.project),
-            "transport": {"type": "stdio", "command": [sys.executable, str(self.fake)]},
+            "transport": {"type": "stdio", "command": [str(self.fake), "app-server"]},
             "request_timeout_seconds": 5,
             "poll_seconds": 0.05,
             "lease_seconds": 60,
@@ -212,6 +236,19 @@ class BridgeAdapterTests(unittest.TestCase):
         se.activate_bridge(
             se.outbox_root(self.state), loaded, audit["wakeable_event_ids"]
         )
+        self.attest_config(loaded)
+
+    def attest_config(self, loaded: dict) -> None:
+        identity = bridge._configured_cli_identity(loaded, timeout_seconds=5)
+        self.assertTrue(identity["probe_ok"], identity)
+        bridge.record_lifecycle_smoke_receipt(
+            self.state,
+            loaded,
+            identity,
+            thread_id="thr_test_smoke",
+            first_turn_id="turn_test_smoke_1",
+            second_turn_id="turn_test_smoke_2",
+        )
 
     def deliver(self, config: Path, once: bool = True, mode: str = "ok",
                 turn_delay: float | None = None, timeout: int = 30,
@@ -225,6 +262,7 @@ class BridgeAdapterTests(unittest.TestCase):
                         se.outbox_root(self.state), loaded,
                         audit["wakeable_event_ids"],
                     )
+                    self.attest_config(loaded)
             except se.SemanticEventError:
                 pass
         command = [
@@ -535,6 +573,48 @@ class BridgeAdapterTests(unittest.TestCase):
         self.assertEqual(records[0]["error_code"], "connection_lost")
         self.assertEqual(self.delivery_of(event["event_id"])["state"], "pending")
 
+    def test_initialize_crash_records_stage_exit_code_and_redacted_stderr(self) -> None:
+        config = self.write_config()
+        event = self.publish_event()
+        _, records = self.deliver(config, mode="crash_initialize")
+        self.assertEqual(records[0]["failure_stage"], "initialize")
+        self.assertEqual(records[0]["app_server_exit_code"], 17)
+        error = self.delivery_of(event["event_id"])["last_error"]
+        self.assertEqual(error["stage"], "initialize")
+        self.assertEqual(error["app_server_exit_code"], 17)
+        self.assertIn("initialize failed", error["stderr_tail"])
+        self.assertIn("<redacted>", error["stderr_tail"])
+        self.assertIn("<redacted-path>", error["stderr_tail"])
+        self.assertNotIn("top-secret-token", error["stderr_tail"])
+        self.assertNotIn(str(self.root / ".codex"), error["stderr_tail"])
+
+    def test_resume_crash_records_failure_stage_and_exit_code(self) -> None:
+        config = self.write_config()
+        event = self.publish_event()
+        _, records = self.deliver(config, mode="crash_resume")
+        self.assertEqual(records[0]["failure_stage"], "thread_resume")
+        error = self.delivery_of(event["event_id"])["last_error"]
+        self.assertEqual(error["app_server_exit_code"], 18)
+        self.assertNotIn("very-secret-value", error["stderr_tail"])
+
+    def test_turn_start_crash_records_failure_stage_and_exit_code(self) -> None:
+        config = self.write_config()
+        event = self.publish_event()
+        _, records = self.deliver(config, mode="crash_turn_start")
+        self.assertEqual(records[0]["failure_stage"], "turn_start")
+        error = self.delivery_of(event["event_id"])["last_error"]
+        self.assertEqual(error["app_server_exit_code"], 19)
+        self.assertNotIn("very-secret-value", error["stderr_tail"])
+
+    def test_completion_crash_records_failure_stage_and_exit_code(self) -> None:
+        config = self.write_config()
+        event = self.publish_event()
+        _, records = self.deliver(config, mode="crash_completion")
+        self.assertEqual(records[0]["failure_stage"], "turn_completion")
+        error = self.delivery_of(event["event_id"])["last_error"]
+        self.assertEqual(error["app_server_exit_code"], 20)
+        self.assertNotIn("very-secret-value", error["stderr_tail"])
+
     def test_drop_before_turn_reply_is_retryable(self) -> None:
         config = self.write_config()
         event = self.publish_event()
@@ -547,7 +627,23 @@ class BridgeAdapterTests(unittest.TestCase):
         event = self.publish_event()
         _, records = self.deliver(config, mode="hang")
         self.assertEqual(records[0]["error_code"], "request_timeout")
-        self.assertEqual(self.delivery_of(event["event_id"])["state"], "pending")
+        delivery = self.delivery_of(event["event_id"])
+        self.assertEqual(delivery["state"], "pending")
+        # The bridge terminates the hung child during cleanup; that signal is
+        # not misreported as an App Server-originated exit code.
+        self.assertIsNone(delivery["last_error"]["app_server_exit_code"])
+
+    def test_stderr_redaction_covers_json_secrets_and_private_paths(self) -> None:
+        raw = (
+            '{"api_key":"sk-super-secret-value","password":"hunter2"}\n'
+            + str(self.project / "private.log")
+        )
+        redacted = bridge.redact_stderr_tail(raw, (str(self.project),))
+        self.assertNotIn("sk-super-secret-value", redacted)
+        self.assertNotIn("hunter2", redacted)
+        self.assertNotIn(str(self.project), redacted)
+        self.assertGreaterEqual(redacted.count("<redacted>"), 2)
+        self.assertIn("<redacted-path>", redacted)
 
     def test_mcp_required_failure_is_retryable(self) -> None:
         config = self.write_config()
@@ -555,6 +651,16 @@ class BridgeAdapterTests(unittest.TestCase):
         _, records = self.deliver(config, mode="mcp_required")
         self.assertEqual(records[0]["error_code"], "required_mcp_failure")
         self.assertEqual(records[0]["state"], "scheduled_retry")
+
+    def test_server_error_safe_message_is_redacted(self) -> None:
+        config = self.write_config()
+        event = self.publish_event()
+        self.deliver(config, mode="mcp_secret_error")
+        safe = self.delivery_of(event["event_id"])["last_error"]["safe_message"]
+        self.assertNotIn("very-secret-value", safe)
+        self.assertNotIn("bearer-secret", safe)
+        self.assertNotIn(str(self.project), safe)
+        self.assertIn("<redacted>", safe)
 
     def test_approval_before_turn_reply_fails_closed_without_auto_approval(self) -> None:
         config = self.write_config()
@@ -930,6 +1036,75 @@ class BridgeAdapterTests(unittest.TestCase):
         self.assertEqual(records[0]["reason"], "bridge_not_activated")
         self.assertEqual(self.delivery_of(event["event_id"])["state"], "pending")
 
+    def test_foreground_deliver_requires_lifecycle_receipt(self) -> None:
+        config = self.write_config()
+        event = self.publish_event()
+        loaded = se.load_bridge_config(config)
+        audit = se.audit_bridge_activation(se.outbox_root(self.state), loaded)
+        se.activate_bridge(
+            se.outbox_root(self.state), loaded, audit["wakeable_event_ids"]
+        )
+        code, records = self.deliver(config, activate=False)
+        self.assertEqual(code, 4)
+        self.assertEqual(records[0]["reason"], "lifecycle_smoke_receipt_missing")
+        self.assertEqual(self.delivery_of(event["event_id"])["state"], "pending")
+        self.assertFalse(self.wake_log.exists())
+
+    def test_foreground_deliver_rejects_0149_even_when_activated(self) -> None:
+        old_fake = self.root / "fake_app_server_0149.py"
+        old_fake.write_text(
+            FAKE_SERVER.replace("codex-cli 0.151.0", "codex-cli 0.149.1"),
+            encoding="utf-8",
+        )
+        old_fake.chmod(0o700)
+        config = self.write_config(
+            transport={"type": "stdio", "command": [str(old_fake), "app-server"]}
+        )
+        event = self.publish_event()
+        loaded = se.load_bridge_config(config)
+        audit = se.audit_bridge_activation(se.outbox_root(self.state), loaded)
+        se.activate_bridge(
+            se.outbox_root(self.state), loaded, audit["wakeable_event_ids"]
+        )
+        code, records = self.deliver(config, activate=False)
+        self.assertEqual(code, 4)
+        self.assertEqual(records[0]["reason"], "codex_lifecycle_version_unverified")
+        self.assertEqual(records[0]["codex_version"], "0.149.1")
+        self.assertEqual(self.delivery_of(event["event_id"])["state"], "pending")
+        self.assertFalse(self.wake_log.exists())
+
+    def test_running_daemon_rechecks_binary_before_claimed_delivery(self) -> None:
+        config = self.write_config(poll_seconds=0.02)
+        self.activate_config(config)
+        command = [
+            sys.executable, str(BRIDGE), "deliver",
+            "--state-dir", str(self.state), "--bridge-config", str(config),
+        ]
+        process = subprocess.Popen(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=self.deliver_env("ok"),
+        )
+        try:
+            time.sleep(0.4)
+            self.assertIsNone(process.poll())
+            self.fake.write_text(FAKE_SERVER + "\n# binary drift\n", encoding="utf-8")
+            event = self.publish_event()
+            stdout, stderr = process.communicate(timeout=10)
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=5)
+        self.assertEqual(process.returncode, 4, stdout + stderr)
+        records = [json.loads(line) for line in stdout.splitlines() if line.strip()]
+        self.assertEqual(
+            records[-1]["reason"], "lifecycle_smoke_executable_sha256_mismatch"
+        )
+        self.assertEqual(self.delivery_of(event["event_id"])["state"], "pending")
+        self.assertFalse(self.wake_log.exists())
+
     def test_activation_write_requires_confirmation_and_exact_ids(self) -> None:
         config = self.write_config()
         event = self.publish_event()
@@ -1016,6 +1191,119 @@ class BridgeAdapterTests(unittest.TestCase):
         self.assertEqual(payload["compatibility"], "schema_compatible_recorded_version")
         self.assertTrue(payload["schema_compatible"])
 
+    def test_codex_0149_schema_can_be_compatible_while_lifecycle_is_unverified(self) -> None:
+        fake_codex = self.write_protocol_codex(self.protocol_files(), "0.149.1")
+        result = subprocess.run(
+            [sys.executable, str(BRIDGE), "protocol-check", "--codex-bin", str(fake_codex)],
+            text=True, capture_output=True, check=False, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["schema_compatible"])
+        self.assertFalse(payload["reported_version_matches_recorded_smoke"])
+        self.assertEqual(payload["compatibility"], "schema_compatible_unverified")
+
+    def test_strict_lifecycle_compatibility_rejects_0149_and_accepts_recorded_version(self) -> None:
+        old_codex = self.write_protocol_codex(self.protocol_files(), "0.149.1")
+        old_config = se.load_bridge_config(self.write_config(
+            transport={"type": "stdio", "command": [str(old_codex), "app-server"]}
+        ))
+        old = bridge.configured_lifecycle_compatibility(old_config, self.state)
+        self.assertFalse(old["compatible"])
+        self.assertEqual(old["codex_version"], "0.149.1")
+        self.assertEqual(old["reason"], "codex_lifecycle_version_unverified")
+
+        tested_codex = self.write_protocol_codex(self.protocol_files(), "0.150.1")
+        tested_config = se.load_bridge_config(self.write_config(
+            transport={"type": "stdio", "command": [str(tested_codex), "app-server"]}
+        ))
+        missing = bridge.configured_lifecycle_compatibility(tested_config, self.state)
+        self.assertFalse(missing["compatible"])
+        self.assertEqual(missing["reason"], "lifecycle_smoke_receipt_missing")
+        tested_identity = bridge._configured_cli_identity(
+            tested_config, timeout_seconds=5
+        )
+        bridge.record_lifecycle_smoke_receipt(
+            self.state, tested_config, tested_identity,
+            thread_id="thr_test", first_turn_id="turn_1", second_turn_id="turn_2",
+        )
+        tested = bridge.configured_lifecycle_compatibility(tested_config, self.state)
+        self.assertTrue(tested["compatible"])
+        self.assertEqual(tested["reason"], "recorded_real_lifecycle_smoke")
+
+        latest_codex = self.write_protocol_codex(self.protocol_files(), "0.151.0")
+        latest_config = se.load_bridge_config(self.write_config(
+            transport={"type": "stdio", "command": [str(latest_codex), "app-server"]}
+        ))
+        latest_identity = bridge._configured_cli_identity(
+            latest_config, timeout_seconds=5
+        )
+        bridge.record_lifecycle_smoke_receipt(
+            self.state, latest_config, latest_identity,
+            thread_id="thr_latest", first_turn_id="turn_3", second_turn_id="turn_4",
+        )
+        self.assertTrue(bridge.configured_lifecycle_compatibility(
+            latest_config, self.state
+        )["compatible"])
+
+    def test_strict_lifecycle_compatibility_rejects_custom_wrapper(self) -> None:
+        config = se.load_bridge_config(self.write_config(
+            transport={"type": "stdio", "command": [sys.executable, str(self.fake)]}
+        ))
+        result = bridge.configured_lifecycle_compatibility(config, self.state)
+        self.assertFalse(result["compatible"])
+        self.assertEqual(result["reason"], "transport_not_direct_codex_app_server")
+
+    def test_strict_lifecycle_compatibility_rejects_unfrozen_bare_executable(self) -> None:
+        config = se.load_bridge_config(self.write_config(
+            transport={"type": "stdio", "command": ["codex", "app-server"]}
+        ))
+        result = bridge.configured_lifecycle_compatibility(config, self.state)
+        self.assertFalse(result["compatible"])
+        self.assertEqual(result["reason"], "transport_executable_not_frozen")
+
+    def test_lifecycle_smoke_command_requires_confirmation_and_writes_bound_receipt(self) -> None:
+        config = self.write_config(
+            transport={"type": "stdio", "command": [str(self.fake), "app-server"]}
+        )
+        base = [
+            sys.executable, str(BRIDGE), "lifecycle-smoke",
+            "--state-dir", str(self.state), "--bridge-config", str(config),
+        ]
+        refused = subprocess.run(
+            base, text=True, capture_output=True, check=False,
+            env=self.deliver_env("ok"), timeout=10,
+        )
+        self.assertEqual(refused.returncode, 4)
+        passed = subprocess.run(
+            [*base, "--i-mean-it"], text=True, capture_output=True, check=False,
+            env=self.deliver_env("ok"), timeout=10,
+        )
+        self.assertEqual(passed.returncode, 0, passed.stdout + passed.stderr)
+        payload = json.loads(passed.stdout)
+        self.assertEqual(payload["state"], "passed")
+        loaded = se.load_bridge_config(config)
+        compatible = bridge.configured_lifecycle_compatibility(loaded, self.state)
+        self.assertTrue(compatible["compatible"])
+        receipt_path = bridge.lifecycle_smoke_path(self.state, loaded)
+        self.assertEqual(receipt_path.stat().st_mode & 0o777, 0o600)
+        status = subprocess.run(
+            [sys.executable, str(BRIDGE), "status", "--state-dir", str(self.state),
+             "--bridge-config", str(config)],
+            text=True, capture_output=True, check=False, timeout=10,
+        )
+        capability = json.loads(status.stdout)["capabilities"]
+        self.assertEqual(capability["schema"], "not_probed_run_protocol_check")
+        self.assertEqual(capability["real_transport_smoke"], "passed")
+        self.assertEqual(
+            capability["real_monitor_closed_loop"], "not_proven_by_bridge_status"
+        )
+
+        self.fake.write_text(FAKE_SERVER + "\n# executable changed\n", encoding="utf-8")
+        changed = bridge.configured_lifecycle_compatibility(loaded, self.state)
+        self.assertFalse(changed["compatible"])
+        self.assertEqual(changed["reason"], "lifecycle_smoke_executable_sha256_mismatch")
+
     def test_protocol_check_reports_missing_method(self) -> None:
         files = self.protocol_files()
         files["ServerNotification.json"] = {
@@ -1065,6 +1353,22 @@ class VendorSyncTests(unittest.TestCase):
             (HERE / "app_server_bridge.py").read_bytes(),
             sibling.read_bytes(),
             "vendored app_server_bridge.py copies have diverged",
+        )
+
+
+class RepositoryPolicyTests(unittest.TestCase):
+    def test_ci_pins_latest_recorded_real_smoke_version(self) -> None:
+        workflow = HERE.parent.parent / ".github" / "workflows" / "ci.yml"
+        if not workflow.exists():
+            self.skipTest("repository CI workflow not present in standalone skill install")
+        latest = max(
+            bridge.REAL_SMOKE_TESTED_CODEX_VERSIONS,
+            key=lambda value: tuple(int(part) for part in value.split(".")),
+        )
+        self.assertIn(
+            f"@openai/codex@{latest}",
+            workflow.read_text(encoding="utf-8"),
+            "CI protocol pin must track the newest recorded real-smoke version",
         )
 
 

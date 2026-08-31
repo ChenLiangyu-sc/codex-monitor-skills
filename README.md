@@ -93,8 +93,13 @@ preserves the compatible event-publication behavior but emits a prominent
 stderr warning and a structured `warnings` entry in its JSON result. Use
 `--require-auto-resume` for a strict start: it fails before launching unless
 the binding, enabled matching bridge config, and durable activation receipt
-are all present. This preflight does not claim that the delivery daemon is
-currently alive.
+are all present **and** the configured direct `codex app-server` executable
+reports an exact CLI version with a recorded real lifecycle smoke. It also
+requires a local `lifecycle-smoke` receipt bound to the exact absolute
+executable hash, full bridge config, Codex home, and workspace. Codex CLI
+0.149.1 is deliberately rejected after a real output-closure failure;
+0.150.1 and 0.151.0 are currently recorded. This preflight does not claim
+that the delivery daemon is currently alive.
 
 If the App Server asks for command, file, permission, MCP, or user-input
 approval during the wake turn, the bridge never answers it. The attempt
@@ -126,8 +131,9 @@ needs no credentials.
 Both supervisors expose `start`, `status`, `wait`, plus:
 
 - `doctor` — one command that reports the negotiated mode, zero-turn
-  semantics, agent-slot usage, configured auto-resume capability (not daemon
-  liveness), state-root
+  semantics, agent-slot usage, configured auto-resume readiness, and daemon
+  liveness as a separate `unknown_not_probed` field (never inferred from
+  receipts), state-root
   filesystem suitability, outbox summary, and (optionally) a live App
   Server probe. `--format text` and `--format json` agree.
 - `list` — enumerate local monitors and their states.
@@ -138,7 +144,7 @@ Both supervisors expose `start`, `status`, `wait`, plus:
 
 Bridge tooling lives in `scripts/app_server_bridge.py`
 (`init-config`, `init-binding`, `activation-check`, `status`, `deliver`,
-`protocol-check`) and the idempotent
+`protocol-check`, `lifecycle-smoke`) and the idempotent
 postflight state machine in `scripts/postflight_guard.py` (`begin` → perform
 side effects → `complete`; `reset --i-mean-it` only clears an in-progress
 claim and never a completed marker; `mark` is only for a single atomic
@@ -157,6 +163,46 @@ later config/executable mismatch even when relative paths share a basename. The
 postflight CLI accepts either 64 lowercase hex or the canonical
 `sha256:<64 lowercase hex>` terminal digest and always stores/reports the
 canonical form; the internal event contract remains prefix-strict.
+
+Before strict auto-resume can be enabled, run the explicit
+`lifecycle-smoke --i-mean-it` command while the configured Codex account is
+available. It creates an isolated test thread, completes one read-only/no-
+approval turn, reconnects, resumes that thread, and completes a second turn.
+Only then is a private receipt written. Replacing the executable or changing
+any bridge-config field invalidates the receipt; legacy configs with a bare
+`codex` executable must be regenerated so PATH drift cannot validate a
+different binary from the daemon's frozen one. The delivery daemon enforces
+the same receipt at startup and again after each event claim, before starting
+a wake turn; a changed binary releases the event back to pending and exits
+fail-closed.
+
+Failed App Server attempts retain bounded diagnostics in
+`delivery.json.last_error`: the lifecycle stage, process exit code when known,
+and a 2,048-character stderr tail after secret/path redaction. The stable reason code
+remains unchanged, so `connection_lost` now has enough local evidence to tell
+initialize, resume, turn-start, and completion-stream failures apart. Legacy
+delivery records containing only `code` and `safe_message` remain readable.
+
+Bridge `status` reports evidence layers separately: schema is not inferred
+unless `protocol-check` is run, fake lifecycle coverage is identified as test
+evidence only, the local real-transport receipt is `passed` or `unverified`,
+and a full real monitor-to-postflight closed loop is explicitly not proven by
+bridge status. A running service, compatible schema, or fake server test never
+stands in for the next layer.
+
+The current compatibility evidence is intentionally layered:
+
+| Codex CLI | Schema/protocol fixture | Deterministic fake lifecycle | Recorded real transport | Strict local start |
+| --- | --- | --- | --- | --- |
+| 0.149.1 | compatible fixture | passed | failed in deployment (`connection_lost`) | rejected |
+| 0.150.1 | compatible | passed | passed 2026-08-29 | requires matching local receipt |
+| 0.151.0 | compatible | passed | passed 2026-08-31 | requires matching local receipt |
+| any unrecorded version | run `protocol-check` | version-independent client tests only | unverified | rejected |
+
+The fake lifecycle column validates this repository's client state machine;
+it is not evidence about a particular installed Codex binary. Likewise, a
+real transport smoke validates initialize/start/reconnect/resume/completion,
+not a Slurm submission-to-business-postflight closed loop.
 
 Shared runtime code
 (`semantic_events.py`, `app_server_bridge.py`, `postflight_guard.py`,
@@ -355,7 +401,7 @@ real-smoke Codex version, and runs a non-blocking scheduled advisory check
 against the latest Codex CLI.
 
 Current operations-hardening baseline after independent review:
-**474 tests passing** (253 HPC monitor tests and 221 long-task monitor tests),
+**512 tests passing** (272 HPC monitor tests and 240 long-task monitor tests),
 including the outbox, App Server fake, postflight claim, doctor,
 protocol contract check, approval-request fail-closed behavior, service
 definition lifecycle, independent notification receipts, event timeline,
@@ -365,11 +411,12 @@ start-to-wake suites. The
 full local chain (start with binding -> verified terminal -> outbox ->
 delivery daemon -> fixed wake template -> awaited turn/completed ->
 idempotent postflight claim) but **not** a real Codex App Server or a real
-model turn. No credentials or network access are required. An opt-in live
-lifecycle smoke was also run successfully with Codex CLI 0.150.1 on
-2026-08-29 (real thread resume, wake turn, strict `turn/completed`, and
-outbox acknowledgement); it is not part of default CI and does not by
-itself prove the woken model performed a business postflight correctly.
+model turn. No credentials or network access are required. Opt-in live
+lifecycle smokes were run successfully with Codex CLI 0.150.1 on 2026-08-29
+and 0.151.0 on 2026-08-31 (real initialize, thread start/resume across a new
+connection, wake turns, and strict `turn/completed`); they are not part of
+default CI and do not by themselves prove the woken model performed a
+business postflight correctly.
 
 ## Contributing
 

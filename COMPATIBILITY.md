@@ -55,6 +55,7 @@ Baseline before changes: 100 tests passing (55 `codex-hpc-monitor`,
 | `<skill>.event-intent/v1` | WP2 review | Run-dir record written at start when a wake binding exists; status/wait reconcile the crash window between terminal and event publication |
 | `<skill>.semantic-event/v1` | WP3 | Run-dir record of the event publication outcome |
 | `codex-monitor.sink-receipt/v1` | Operations hardening | Independent at-least-once receipt bound to sink ID, mode, and destination digest; does not alter wake delivery |
+| `codex-monitor.app-server-lifecycle-smoke/v1` | Lifecycle diagnostics hardening | Private local receipt proving a confirmed two-connection initialize/thread-start/turn-completed/reinitialize/thread-resume/turn-completed smoke, bound to config and executable hash |
 
 Operations hardening also adds output-only schemas under
 `codex-monitor.bridge-service.*`, `codex-monitor.bridge.protocol-check/v1`,
@@ -135,6 +136,35 @@ Activation hardening behavior (additive):
   compatibility but adds a structured `warnings` field and a prominent stderr
   warning; the additive `--require-auto-resume` option fails before launch
   unless binding, enabled matching config, and activation receipt are ready.
+
+App Server lifecycle diagnostics hardening (additive, 2026-08-31):
+
+- `--require-auto-resume` now also requires the configured direct
+  `codex app-server` executable to report an exact version with a recorded real
+  lifecycle smoke. Codex CLI 0.149.1 is rejected after a real output-closure
+  failure; 0.150.1 and 0.151.0 are recorded. Schema generation alone is not a
+  lifecycle attestation. Strict readiness additionally requires a matching
+  local `codex-monitor.app-server-lifecycle-smoke/v1` receipt bound to the
+  absolute executable SHA-256, full bridge config digest, Codex home, and
+  workspace; missing or stale receipts fail before watcher launch. Delivery
+  independently revalidates the receipt at daemon startup and after each
+  event claim before starting a wake turn, releasing the claim on drift.
+- New `codex-monitor.delivery/v1` writers extend `last_error` with nullable
+  `stage`, `app_server_exit_code`, and a bounded redacted `stderr_tail`.
+  Readers accept both the original two-field `last_error` and this additive
+  diagnostic shape, so settled legacy outbox entries remain readable.
+
+Capability and version evidence must not be collapsed into one boolean:
+
+| Codex CLI | Schema/protocol | Fake client lifecycle | Real binary transport | Strict readiness |
+| --- | --- | --- | --- | --- |
+| 0.149.1 | compatible fixture | passed | observed output closure | rejected |
+| 0.150.1 | compatible | passed | recorded 2026-08-29 | matching local receipt required |
+| 0.151.0 | compatible | passed | recorded 2026-08-31 | matching local receipt required |
+| unrecorded | probe result only | client test remains version-independent | unverified | rejected |
+
+None of these rows claims a real Slurm terminal-to-postflight business
+acceptance loop. That is a separate deployment-level release gate.
 
 ## 3. Migration behavior
 

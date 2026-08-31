@@ -113,7 +113,11 @@ If a caller deliberately supplies `--event-binding` without
 `--bridge-config`, disclose the prominent launcher warning: events are
 published, but closed-loop auto-resume is not configured or verified. Use
 `--require-auto-resume` whenever the requested outcome depends on automatic
-wake; it checks binding/config/activation readiness, not daemon liveness.
+wake; it checks binding/config/activation readiness and requires the configured
+direct Codex CLI version to have a recorded real App Server lifecycle smoke
+plus a matching local `lifecycle-smoke --i-mean-it` receipt bound to the
+absolute executable hash and full config. It does not prove daemon liveness.
+Treat 0.149.1 as incompatible; 0.150.1 and 0.151.0 are currently recorded.
 
 Include every known identity constraint. Omit unknown optional fields; never guess them. The launcher returns after a bounded handshake while the supervisor and watcher continue independently.
 

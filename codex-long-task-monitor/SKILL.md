@@ -46,7 +46,11 @@ flags together: `--event-binding <binding> --bridge-config <config>
 --require-auto-resume`. Supplying a binding without a config remains
 backward-compatible but produces a prominent stderr warning and structured
 JSON warning; never describe that state as a working closed loop. The strict
-preflight checks binding/config/activation readiness, not daemon liveness.
+preflight checks binding/config/activation readiness and requires the configured
+direct Codex CLI version to have a recorded real App Server lifecycle smoke
+plus a matching local `lifecycle-smoke --i-mean-it` receipt bound to the
+absolute executable hash and full config. It does not prove daemon liveness.
+Treat 0.149.1 as incompatible; 0.150.1 and 0.151.0 are currently recorded.
 
 When a monitor is started with `--event-binding`, each verified terminal
 record additionally publishes one durable semantic event into the local

@@ -595,7 +595,13 @@ def _initial_delivery(now: Optional[str]) -> Dict[str, Any]:
         "lease": {"owner": None, "expires_at": None},
         "delivery": {"thread_id": None, "turn_id": None, "delivered_at": None},
         "turn_status": None,
-        "last_error": {"code": None, "safe_message": None},
+        "last_error": {
+            "code": None,
+            "safe_message": None,
+            "stage": None,
+            "app_server_exit_code": None,
+            "stderr_tail": None,
+        },
     }
 
 
@@ -642,12 +648,33 @@ def _validate_delivery(value: object, event_id: str) -> Dict[str, Any]:
         if text is not None and not isinstance(text, str):
             raise SemanticEventError("delivery_field_invalid")
     error = value["last_error"]
-    if set(error) != {"code", "safe_message"}:
+    legacy_error_keys = {"code", "safe_message"}
+    diagnostic_error_keys = legacy_error_keys | {
+        "stage", "app_server_exit_code", "stderr_tail"
+    }
+    if frozenset(error) not in {
+        frozenset(legacy_error_keys), frozenset(diagnostic_error_keys)
+    }:
         raise SemanticEventError("delivery_last_error_invalid")
     if error["code"] is not None and not isinstance(error["code"], str):
         raise SemanticEventError("delivery_last_error_invalid")
     if error["safe_message"] is not None and not isinstance(error["safe_message"], str):
         raise SemanticEventError("delivery_last_error_invalid")
+    if "stage" in error:
+        if error["stage"] is not None and (
+            not isinstance(error["stage"], str) or len(error["stage"]) > 64
+        ):
+            raise SemanticEventError("delivery_last_error_invalid")
+        exit_code = error["app_server_exit_code"]
+        if exit_code is not None and (
+            isinstance(exit_code, bool) or not isinstance(exit_code, int)
+        ):
+            raise SemanticEventError("delivery_last_error_invalid")
+        stderr_tail = error["stderr_tail"]
+        if stderr_tail is not None and (
+            not isinstance(stderr_tail, str) or len(stderr_tail) > 2048
+        ):
+            raise SemanticEventError("delivery_last_error_invalid")
     return value
 
 
@@ -904,6 +931,9 @@ def record_delivery_failure(
     owner: str,
     code: str,
     safe_message: str,
+    stage: Optional[str] = None,
+    app_server_exit_code: Optional[int] = None,
+    stderr_tail: Optional[str] = None,
     retryable: bool,
     now: datetime,
     max_attempts: int,
@@ -914,6 +944,15 @@ def record_delivery_failure(
     """Record one failed attempt; schedule retry with backoff or dead-letter."""
     if not isinstance(code, str) or not (1 <= len(code) <= 64):
         raise SemanticEventError("failure_code_invalid")
+    if stage is not None and not isinstance(stage, str):
+        raise SemanticEventError("failure_stage_invalid")
+    if app_server_exit_code is not None and (
+        isinstance(app_server_exit_code, bool)
+        or not isinstance(app_server_exit_code, int)
+    ):
+        raise SemanticEventError("failure_exit_code_invalid")
+    if stderr_tail is not None and not isinstance(stderr_tail, str):
+        raise SemanticEventError("failure_stderr_tail_invalid")
     rng = rng or secrets.SystemRandom().random
     with _OutboxLock(outbox):
         dir_path, delivery = _load_for_mutation(outbox, event_id, owner)
@@ -923,6 +962,16 @@ def record_delivery_failure(
         delivery["last_error"] = {
             "code": code,
             "safe_message": sanitize_safe_message(safe_message),
+            "stage": sanitize_safe_message(stage)[:64] if stage is not None else None,
+            "app_server_exit_code": app_server_exit_code,
+            "stderr_tail": (
+                "".join(
+                    ch if ch.isprintable() or ch in "\r\n\t" else "?"
+                    for ch in stderr_tail
+                )[-2048:]
+                if stderr_tail is not None
+                else None
+            ),
         }
         attempts = delivery["attempts"]
         if retryable and attempts < max_attempts:
@@ -992,7 +1041,13 @@ def retry_dead_letter(
             "delivered_at": None,
         }
         delivery["turn_status"] = None
-        delivery["last_error"] = {"code": None, "safe_message": None}
+        delivery["last_error"] = {
+            "code": None,
+            "safe_message": None,
+            "stage": None,
+            "app_server_exit_code": None,
+            "stderr_tail": None,
+        }
         _write_delivery(dir_path, delivery)
     return "scheduled"
 

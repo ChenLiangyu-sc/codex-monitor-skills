@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
+import hashlib
 import json
 import os
 import selectors
@@ -46,8 +47,11 @@ import semantic_events as se
 
 
 BRIDGE_PREFIX = "codex-monitor.bridge"
+LIFECYCLE_SMOKE_SCHEMA = "codex-monitor.app-server-lifecycle-smoke/v1"
+MAX_LIFECYCLE_SMOKE_BYTES = 16 * 1024
 CLIENT_INFO = {"name": "codex-monitor-skills", "title": "monitor bridge", "version": "1"}
-REAL_SMOKE_TESTED_CODEX_VERSIONS = {"0.150.1"}
+REAL_SMOKE_TESTED_CODEX_VERSIONS = {"0.150.1", "0.151.0"}
+CODEX_VERSION_RE = re.compile(r"(?:codex-cli\s+)?(\d+\.\d+\.\d+)")
 REQUIRED_PROTOCOL_METHODS = {
     "initialize",
     "initialized",
@@ -87,10 +91,37 @@ _DELIVERY_OWNER: list[str] = [""]
 
 
 class DeliveryError(RuntimeError):
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        stage: str | None = None,
+        app_server_exit_code: int | None = None,
+        stderr_tail: str | None = None,
+    ) -> None:
         super().__init__(f"{code}: {message}")
         self.code = code
         self.message = message
+        self.stage = stage
+        self.app_server_exit_code = app_server_exit_code
+        self.stderr_tail = stderr_tail
+
+    def attach_diagnostics(
+        self,
+        *,
+        stage: str,
+        app_server_exit_code: int | None,
+        stderr_tail: str | None,
+    ) -> "DeliveryError":
+        """Attach bounded process evidence without replacing the root error."""
+        if self.stage is None:
+            self.stage = stage
+        if self.app_server_exit_code is None:
+            self.app_server_exit_code = app_server_exit_code
+        if self.stderr_tail is None:
+            self.stderr_tail = stderr_tail
+        return self
 
     @property
     def retryable(self) -> bool:
@@ -114,12 +145,23 @@ class AppServerSession:
         command: list[str],
         request_timeout_seconds: float,
         env: dict[str, str] | None = None,
+        private_paths: tuple[str, ...] = (),
     ) -> None:
         self.request_timeout = request_timeout_seconds
         self._next_id = 0
         self._line_buffer = b""
         self._notifications: Deque[Dict[str, Any]] = deque()
         self._stderr_file = tempfile.TemporaryFile()
+        self.final_exit_code: int | None = None
+        self.final_stderr_tail: str | None = None
+        self._closed = False
+        self._redacted_paths = tuple(
+            str(Path(path).expanduser())
+            for path in (
+                (env or {}).get("CODEX_HOME"), str(Path.home()), *private_paths
+            )
+            if path
+        )
         spawn_env = os.environ.copy()
         if env:
             spawn_env.update(env)
@@ -184,12 +226,22 @@ class AppServerSession:
 
     def _stderr_tail(self) -> str:
         try:
-            self._stderr_file.seek(0)
-            return (
-                self._stderr_file.read(4096).decode("utf-8", errors="replace").strip()
-            )
+            self._stderr_file.seek(0, os.SEEK_END)
+            size = self._stderr_file.tell()
+            self._stderr_file.seek(max(0, size - 8192), os.SEEK_SET)
+            raw = self._stderr_file.read(8192).decode("utf-8", errors="replace")
+            return redact_stderr_tail(raw, self._redacted_paths)
         except OSError:
             return ""
+
+    def failure_diagnostics(self) -> tuple[int | None, str | None]:
+        """Capture evidence before close can terminate a still-live process."""
+        if self.process.poll() is None:
+            try:
+                self.process.wait(timeout=0.1)
+            except subprocess.TimeoutExpired:
+                pass
+        return self.process.poll(), self._stderr_tail() or None
 
     # -- protocol -------------------------------------------------------
 
@@ -380,6 +432,8 @@ class AppServerSession:
                 tick_deadline = time.monotonic() + tick_interval
 
     def close(self) -> None:
+        if self._closed:
+            return
         try:
             if self.process.stdin is not None:
                 try:
@@ -396,12 +450,40 @@ class AppServerSession:
                     self.process.kill()
                     self.process.wait(timeout=5)
         finally:
+            self.final_exit_code = self.process.poll()
+            self.final_stderr_tail = self._stderr_tail() or None
             if self.process.stdout is not None:
                 try:
                     self.process.stdout.close()
                 except OSError:
                     pass
             self._stderr_file.close()
+            self._closed = True
+
+
+_SECRET_PATTERNS = (
+    re.compile(r"(?i)([\"']?authorization[\"']?\s*[:=]\s*[\"']?(?:bearer\s+)?)[^\s,;\"']+"),
+    re.compile(r"(?i)([\"']?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|secret)[\"']?\s*[:=]\s*[\"']?)[^\s,;\"']+"),
+    re.compile(r"\b(?:sk|sess|proj)-[A-Za-z0-9_-]{12,}\b"),
+    re.compile(r"\beyJ[A-Za-z0-9_-]{12,}(?:\.[A-Za-z0-9_-]{8,}){1,2}\b"),
+)
+
+
+def redact_stderr_tail(text: str, private_paths: tuple[str, ...] = ()) -> str:
+    """Return a printable, bounded diagnostic tail with common secrets removed."""
+    redacted = text
+    for path in sorted(set(private_paths), key=len, reverse=True):
+        if path:
+            redacted = redacted.replace(path, "<redacted-path>")
+    for pattern in _SECRET_PATTERNS:
+        if pattern.groups:
+            redacted = pattern.sub(lambda match: match.group(1) + "<redacted>", redacted)
+        else:
+            redacted = pattern.sub("<redacted>", redacted)
+    redacted = "".join(
+        ch if ch.isprintable() or ch in "\r\n\t" else "?" for ch in redacted
+    )
+    return redacted.strip()[-2048:]
 
 
 def _classify_server_error(
@@ -505,11 +587,16 @@ def attempt_delivery(
             "event workspace does not match the configured bridge workspace",
         )
     wake_text = se.wake_message(event)
-    session = AppServerSession(
-        resolved_delivery_command(config, resolved_executable, configured_executable),
-        float(config["request_timeout_seconds"]),
-        env=spawn_env(config),
-    )
+    stage = "spawn"
+    try:
+        session = AppServerSession(
+            resolved_delivery_command(config, resolved_executable, configured_executable),
+            float(config["request_timeout_seconds"]),
+            env=spawn_env(config),
+            private_paths=(str(config["workspace"]),),
+        )
+    except (OSError, se.SemanticEventError) as exc:
+        raise DeliveryError("spawn_failed", str(exc), stage=stage) from exc
 
     def renew() -> None:
         try:
@@ -526,12 +613,16 @@ def attempt_delivery(
             raise DeliveryError("lease_lost", exc.reason) from exc
 
     try:
+        stage = "initialize"
         session.initialize()
         renew()
+        stage = "thread_resume"
         session.resume_thread(binding["thread_id"], binding["workspace"])
         renew()
+        stage = "turn_start"
         turn_id = session.start_turn(binding["thread_id"], wake_text)
         renew()
+        stage = "turn_completion"
         turn_status = session.wait_turn_completion(
             turn_id,
             float(config["turn_completion_timeout_seconds"]),
@@ -540,6 +631,14 @@ def attempt_delivery(
         )
         renew()
         return turn_id, turn_status, wake_text
+    except DeliveryError as exc:
+        exit_code, stderr_tail = session.failure_diagnostics()
+        session.close()
+        raise exc.attach_diagnostics(
+            stage=stage,
+            app_server_exit_code=exit_code,
+            stderr_tail=stderr_tail,
+        )
     finally:
         session.close()
 
@@ -591,6 +690,15 @@ def deliver_loop(args: argparse.Namespace) -> int:
         print(json.dumps({
             "schema_version": f"{BRIDGE_PREFIX}.deliver/v1",
             "state": "refused", "reason": exc.reason, "detail": exc.detail,
+        }, sort_keys=True))
+        return 4
+    lifecycle = configured_lifecycle_compatibility(config, Path(args.state_dir))
+    if not lifecycle["compatible"]:
+        print(json.dumps({
+            "schema_version": f"{BRIDGE_PREFIX}.deliver/v1",
+            "state": "refused",
+            "reason": lifecycle["reason"],
+            "codex_version": lifecycle.get("codex_version"),
         }, sort_keys=True))
         return 4
     owner = owner_identity(config)
@@ -646,6 +754,22 @@ def deliver_loop(args: argparse.Namespace) -> int:
             continue
         event, _delivery = claimed
         held_event = event
+        # Re-check after claim so a daemon that outlives an executable/config
+        # replacement cannot use a historical smoke receipt for a new wake.
+        lifecycle = configured_lifecycle_compatibility(config, Path(args.state_dir))
+        if not lifecycle["compatible"]:
+            try:
+                se.release_event(outbox, event["event_id"], owner=owner)
+            finally:
+                held_event = {}
+            print(json.dumps({
+                "schema_version": f"{BRIDGE_PREFIX}.deliver/v1",
+                "state": "refused",
+                "reason": lifecycle["reason"],
+                "codex_version": lifecycle.get("codex_version"),
+                "event_id": event["event_id"],
+            }, sort_keys=True))
+            return 4
         _DELIVERY_STATE_DIR[0] = str(Path(args.state_dir))
         _DELIVERY_OWNER[0] = owner
         record: Dict[str, Any] = {
@@ -683,21 +807,38 @@ def deliver_loop(args: argparse.Namespace) -> int:
                     event["event_id"],
                     owner=owner,
                     code=exc.code,
-                    safe_message=exc.message,
+                    safe_message=redact_stderr_tail(
+                        exc.message,
+                        (str(config["codex_home"]), str(config["workspace"])),
+                    ),
+                    stage=exc.stage,
+                    app_server_exit_code=exc.app_server_exit_code,
+                    stderr_tail=exc.stderr_tail,
                     retryable=exc.retryable,
                     now=utc_now(),
                     max_attempts=int(config["max_attempts"]),
                     backoff_initial_seconds=float(config["backoff_initial_seconds"]),
                     backoff_max_seconds=float(config["backoff_max_seconds"]),
                 )
-            record.update({"state": outcome, "error_code": exc.code})
+            record.update({
+                "state": outcome,
+                "error_code": exc.code,
+                "failure_stage": exc.stage,
+                "app_server_exit_code": exc.app_server_exit_code,
+            })
         except (OSError, se.SemanticEventError) as exc:
             outcome = se.record_delivery_failure(
                 outbox,
                 event["event_id"],
                 owner=owner,
                 code="server_error",
-                safe_message=str(exc),
+                safe_message=redact_stderr_tail(
+                    str(exc),
+                    (str(config["codex_home"]), str(config["workspace"])),
+                ),
+                stage="delivery_internal",
+                app_server_exit_code=None,
+                stderr_tail=None,
                 retryable=True,
                 now=utc_now(),
                 max_attempts=int(config["max_attempts"]),
@@ -724,6 +865,13 @@ def status_command(args: argparse.Namespace) -> int:
     payload: Dict[str, Any] = {
         "schema_version": f"{BRIDGE_PREFIX}.status/v1",
         "state_dir": str(Path(args.state_dir)),
+        "capabilities": {
+            "schema": "not_probed_run_protocol_check",
+            "fake_lifecycle": "covered_by_test_suite_not_runtime_evidence",
+            "real_transport_smoke": "unverified",
+            "real_monitor_closed_loop": "not_proven_by_bridge_status",
+            "goal_control": "not_probed",
+        },
     }
     try:
         config = se.load_bridge_config(Path(args.bridge_config))
@@ -736,6 +884,18 @@ def status_command(args: argparse.Namespace) -> int:
         payload["mode"] = (
             "external-event-bridge" if config["enabled"] else "unattended"
         )
+        lifecycle = configured_lifecycle_compatibility(
+            config, Path(args.state_dir)
+        )
+        payload["capabilities"]["real_transport_smoke"] = (
+            "passed" if lifecycle["compatible"] else "unverified"
+        )
+        payload["capabilities"]["real_transport_reason"] = lifecycle["reason"]
+        payload["capabilities"]["codex_version"] = lifecycle.get("codex_version")
+        if lifecycle.get("receipt_completed_at") is not None:
+            payload["capabilities"]["receipt_completed_at"] = lifecycle[
+                "receipt_completed_at"
+            ]
         try:
             activation = se.read_bridge_activation(
                 se.outbox_root(Path(args.state_dir)), config
@@ -1057,7 +1217,7 @@ def protocol_check_command(args: argparse.Namespace) -> int:
         if version_run.returncode != 0:
             raise DeliveryError("version_probe_failed", "codex --version failed")
         version_text = version_run.stdout.strip()
-        match = re.search(r"(?:codex-cli\s+)?(\d+\.\d+\.\d+)", version_text)
+        match = CODEX_VERSION_RE.search(version_text)
         version = match.group(1) if match else None
         payload["codex_version"] = version
         payload["version_output"] = version_text[:160]
@@ -1125,6 +1285,192 @@ def protocol_check_command(args: argparse.Namespace) -> int:
         })
         print(json.dumps(payload, sort_keys=True))
         return 12
+
+
+def _executable_sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return "sha256:" + digest.hexdigest()
+
+
+def _configured_cli_identity(
+    config: Dict[str, Any], *, timeout_seconds: float
+) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "probe_ok": False,
+        "codex_version": None,
+        "reason": "codex_version_probe_failed",
+    }
+    try:
+        configured_command = config["transport"]["command"]
+        if not os.path.isabs(str(configured_command[0])):
+            result["reason"] = "transport_executable_not_frozen"
+            return result
+        command = resolved_delivery_command(config)
+        if len(command) < 2 or command[1] != "app-server":
+            result["reason"] = "transport_not_direct_codex_app_server"
+            return result
+        probe = subprocess.run(
+            [command[0], "--version"],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=timeout_seconds,
+            env={**os.environ, **spawn_env(config)},
+        )
+        if probe.returncode != 0:
+            result["reason"] = "codex_version_probe_failed"
+            return result
+        match = CODEX_VERSION_RE.search(probe.stdout.strip())
+        if match is None:
+            result["reason"] = "codex_version_unparseable"
+            return result
+        version = match.group(1)
+        result["codex_version"] = version
+        result.update({
+            "probe_ok": True,
+            "reason": "probe_ok",
+            "command": command,
+            "executable": command[0],
+            "executable_sha256": _executable_sha256(command[0]),
+        })
+        return result
+    except (OSError, subprocess.TimeoutExpired, se.SemanticEventError):
+        result["reason"] = "codex_version_probe_failed"
+        return result
+
+
+def _lifecycle_smoke_config_digest(config: Dict[str, Any]) -> str:
+    checked = se.validate_bridge_config(config)
+    return se.sha256_prefix(se.canonical_json(checked))
+
+
+def lifecycle_smoke_path(state_dir: Path, config: Dict[str, Any]) -> Path:
+    identity = {
+        "config_digest": _lifecycle_smoke_config_digest(config),
+        "instance_id": config["instance_id"],
+        "codex_home_id": config["codex_home_id"],
+        "workspace": config["workspace"],
+    }
+    name = se.sha256_hex(se.canonical_json(identity)) + ".json"
+    return se.outbox_root(Path(state_dir)) / ".lifecycle-smokes" / name
+
+
+def record_lifecycle_smoke_receipt(
+    state_dir: Path,
+    config: Dict[str, Any],
+    cli_identity: Dict[str, Any],
+    *,
+    thread_id: str,
+    first_turn_id: str,
+    second_turn_id: str,
+    completed_at: str | None = None,
+) -> Dict[str, Any]:
+    """Atomically record one completed two-connection lifecycle smoke."""
+    if not cli_identity.get("probe_ok"):
+        raise se.SemanticEventError("lifecycle_smoke_cli_probe_invalid")
+    for value in (thread_id, first_turn_id, second_turn_id):
+        if not isinstance(value, str) or not value:
+            raise se.SemanticEventError("lifecycle_smoke_turn_identity_invalid")
+    record = {
+        "schema": LIFECYCLE_SMOKE_SCHEMA,
+        "config_digest": _lifecycle_smoke_config_digest(config),
+        "instance_id": config["instance_id"],
+        "codex_home_id": config["codex_home_id"],
+        "workspace_id": se.sha256_prefix(config["workspace"].encode()),
+        "command": list(cli_identity["command"]),
+        "executable": cli_identity["executable"],
+        "executable_sha256": cli_identity["executable_sha256"],
+        "codex_version": cli_identity["codex_version"],
+        "thread_id": thread_id,
+        "turn_ids": [first_turn_id, second_turn_id],
+        "stages": [
+            "initialize", "thread_start", "first_turn_completed",
+            "reinitialize", "thread_resume", "second_turn_completed",
+        ],
+        "completed_at": completed_at or se.utc_now(),
+    }
+    se.atomic_replace_json(lifecycle_smoke_path(state_dir, config), record)
+    return record
+
+
+def read_lifecycle_smoke_receipt(
+    state_dir: Path, config: Dict[str, Any], cli_identity: Dict[str, Any]
+) -> Dict[str, Any]:
+    path = lifecycle_smoke_path(state_dir, config)
+    try:
+        value = se.read_regular_json(path, MAX_LIFECYCLE_SMOKE_BYTES)
+    except FileNotFoundError as exc:
+        raise se.SemanticEventError("lifecycle_smoke_receipt_missing", str(path)) from exc
+    expected = {
+        "schema", "config_digest", "instance_id", "codex_home_id",
+        "workspace_id", "command", "executable", "executable_sha256",
+        "codex_version", "thread_id", "turn_ids", "stages", "completed_at",
+    }
+    if set(value) != expected or value["schema"] != LIFECYCLE_SMOKE_SCHEMA:
+        raise se.SemanticEventError("lifecycle_smoke_receipt_invalid")
+    checks = {
+        "config_digest": _lifecycle_smoke_config_digest(config),
+        "instance_id": config["instance_id"],
+        "codex_home_id": config["codex_home_id"],
+        "workspace_id": se.sha256_prefix(config["workspace"].encode()),
+        "command": list(cli_identity["command"]),
+        "executable": cli_identity["executable"],
+        "executable_sha256": cli_identity["executable_sha256"],
+        "codex_version": cli_identity["codex_version"],
+    }
+    for key, expected_value in checks.items():
+        if value[key] != expected_value:
+            raise se.SemanticEventError(f"lifecycle_smoke_{key}_mismatch")
+    if (
+        not isinstance(value["thread_id"], str) or not value["thread_id"]
+        or not isinstance(value["turn_ids"], list) or len(value["turn_ids"]) != 2
+        or any(not isinstance(item, str) or not item for item in value["turn_ids"])
+        or value["stages"] != [
+            "initialize", "thread_start", "first_turn_completed",
+            "reinitialize", "thread_resume", "second_turn_completed",
+        ]
+        or se.parse_utc(value["completed_at"]) is None
+    ):
+        raise se.SemanticEventError("lifecycle_smoke_receipt_invalid")
+    return value
+
+
+def configured_lifecycle_compatibility(
+    config: Dict[str, Any], state_dir: Path, *, timeout_seconds: float = 5.0
+) -> Dict[str, Any]:
+    """Require reported version plus a config/binary-bound live-smoke receipt."""
+    result: Dict[str, Any] = {
+        "compatible": False,
+        "codex_version": None,
+        "reason": "unverified_codex_lifecycle",
+        "real_smoke_tested_versions": sorted(REAL_SMOKE_TESTED_CODEX_VERSIONS),
+    }
+    identity = _configured_cli_identity(config, timeout_seconds=timeout_seconds)
+    result["codex_version"] = identity.get("codex_version")
+    if not identity.get("probe_ok"):
+        result["reason"] = identity["reason"]
+        return result
+    if identity["codex_version"] not in REAL_SMOKE_TESTED_CODEX_VERSIONS:
+        result["reason"] = "codex_lifecycle_version_unverified"
+        return result
+    try:
+        receipt = read_lifecycle_smoke_receipt(state_dir, config, identity)
+    except se.SemanticEventError as exc:
+        result["reason"] = exc.reason
+        return result
+    result.update({
+        "compatible": True,
+        "reason": "recorded_real_lifecycle_smoke",
+        "receipt_completed_at": receipt["completed_at"],
+        "executable_sha256": identity["executable_sha256"],
+    })
+    return result
 
 
 def _private_output_path(value: Path) -> Path:
@@ -1204,6 +1550,145 @@ def init_binding_command(args: argparse.Namespace) -> int:
     _write_private_json_output(path, binding)
     print(json.dumps({"state": "written", "path": str(path)}, sort_keys=True))
     return 0
+
+
+def lifecycle_smoke_command(args: argparse.Namespace) -> int:
+    """Run an explicit two-connection real App Server lifecycle smoke."""
+    if not args.i_mean_it:
+        print(json.dumps({
+            "schema_version": f"{BRIDGE_PREFIX}.lifecycle-smoke/v1",
+            "state": "refused",
+            "reason": "confirmation_required",
+            "detail": "this creates a test thread and two small model turns",
+        }, sort_keys=True))
+        return 4
+    config: Dict[str, Any] | None = None
+    try:
+        config = se.load_bridge_config(Path(args.bridge_config))
+        if not config["enabled"]:
+            raise se.SemanticEventError("bridge_disabled")
+        identity = _configured_cli_identity(
+            config, timeout_seconds=float(args.timeout_seconds)
+        )
+        if not identity.get("probe_ok"):
+            raise DeliveryError(str(identity["reason"]), "Codex CLI probe failed")
+        if identity["codex_version"] not in REAL_SMOKE_TESTED_CODEX_VERSIONS:
+            raise DeliveryError(
+                "codex_lifecycle_version_unverified",
+                "this repository version has not recorded the reported CLI version",
+            )
+        command = list(identity["command"])
+        session: AppServerSession | None = None
+        stage = "spawn"
+        try:
+            session = AppServerSession(
+                command,
+                float(config["request_timeout_seconds"]),
+                env=spawn_env(config),
+                private_paths=(str(config["workspace"]),),
+            )
+            stage = "initialize"
+            session.initialize()
+            stage = "thread_start"
+            started = session.request(
+                "thread/start",
+                {
+                    "cwd": config["workspace"],
+                    "approvalPolicy": "never",
+                    "sandbox": "read-only",
+                },
+            )
+            thread = started.get("thread")
+            if (
+                not isinstance(thread, dict)
+                or not isinstance(thread.get("id"), str)
+                or not thread.get("id")
+                or thread.get("cwd") != config["workspace"]
+            ):
+                raise DeliveryError(
+                    "unsupported_response_shape",
+                    "thread/start returned a malformed or wrong-workspace thread",
+                )
+            thread_id = str(thread["id"])
+            stage = "first_turn"
+            first_turn_id = session.start_turn(
+                thread_id,
+                "Codex monitor lifecycle smoke 1/2. Reply exactly SMOKE_ONE_OK. Do not use tools or modify files.",
+            )
+            session.wait_turn_completion(
+                first_turn_id, float(config["turn_completion_timeout_seconds"])
+            )
+            session.close()
+            session = None
+
+            stage = "respawn"
+            session = AppServerSession(
+                command,
+                float(config["request_timeout_seconds"]),
+                env=spawn_env(config),
+                private_paths=(str(config["workspace"]),),
+            )
+            stage = "reinitialize"
+            session.initialize()
+            stage = "thread_resume"
+            session.resume_thread(thread_id, config["workspace"])
+            stage = "second_turn"
+            second_turn_id = session.start_turn(
+                thread_id,
+                "Codex monitor lifecycle smoke 2/2 after reconnect and resume. Reply exactly SMOKE_TWO_OK. Do not use tools or modify files.",
+            )
+            session.wait_turn_completion(
+                second_turn_id, float(config["turn_completion_timeout_seconds"])
+            )
+        except (OSError, se.SemanticEventError) as exc:
+            raise DeliveryError("lifecycle_smoke_failed", str(exc), stage=stage) from exc
+        except DeliveryError as exc:
+            if session is not None:
+                exit_code, stderr_tail = session.failure_diagnostics()
+                exc.attach_diagnostics(
+                    stage=stage,
+                    app_server_exit_code=exit_code,
+                    stderr_tail=stderr_tail,
+                )
+            raise
+        finally:
+            if session is not None:
+                session.close()
+        receipt = record_lifecycle_smoke_receipt(
+            Path(args.state_dir), config, identity,
+            thread_id=thread_id,
+            first_turn_id=first_turn_id,
+            second_turn_id=second_turn_id,
+        )
+        print(json.dumps({
+            "schema_version": f"{BRIDGE_PREFIX}.lifecycle-smoke/v1",
+            "state": "passed",
+            "codex_version": identity["codex_version"],
+            "executable_sha256": identity["executable_sha256"],
+            "receipt": str(lifecycle_smoke_path(Path(args.state_dir), config)),
+            "completed_at": receipt["completed_at"],
+        }, sort_keys=True))
+        return 0
+    except (DeliveryError, se.SemanticEventError, OSError) as exc:
+        message = exc.message if isinstance(exc, DeliveryError) else str(exc)
+        private_paths = (
+            (str(config["codex_home"]), str(config["workspace"]))
+            if config is not None
+            else ()
+        )
+        print(json.dumps({
+            "schema_version": f"{BRIDGE_PREFIX}.lifecycle-smoke/v1",
+            "state": "failed",
+            "reason": exc.code if isinstance(exc, DeliveryError)
+            else getattr(exc, "reason", type(exc).__name__),
+            "failure_stage": exc.stage if isinstance(exc, DeliveryError) else None,
+            "app_server_exit_code": (
+                exc.app_server_exit_code if isinstance(exc, DeliveryError) else None
+            ),
+            "safe_message": redact_stderr_tail(message, private_paths),
+            "stderr_tail": exc.stderr_tail if isinstance(exc, DeliveryError) else None,
+        }, sort_keys=True))
+        return 12
 
 
 def positive_float(value: str) -> float:
@@ -1297,6 +1782,16 @@ def parser() -> argparse.ArgumentParser:
     init_binding.add_argument("--workspace", type=Path, required=True)
     init_binding.add_argument("--codex-home", type=Path, default=Path.home() / ".codex")
     init_binding.set_defaults(func=init_binding_command)
+
+    lifecycle_smoke = sub.add_parser(
+        "lifecycle-smoke",
+        help="run a confirmed real two-connection App Server lifecycle smoke",
+    )
+    lifecycle_smoke.add_argument("--state-dir", type=Path, required=True)
+    lifecycle_smoke.add_argument("--bridge-config", type=Path, required=True)
+    lifecycle_smoke.add_argument("--timeout-seconds", type=positive_float, default=10.0)
+    lifecycle_smoke.add_argument("--i-mean-it", action="store_true")
+    lifecycle_smoke.set_defaults(func=lifecycle_smoke_command)
 
     protocol_check = sub.add_parser(
         "protocol-check",

@@ -25,9 +25,13 @@ assert SPEC and SPEC.loader
 SUPERVISOR = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(SUPERVISOR)
 import semantic_events
+import app_server_bridge
 
 FAKE_APP_SERVER_OK = r'''#!/usr/bin/env python3
 import json, os, sys
+if sys.argv[1:] == ["--version"]:
+    print("codex-cli 0.151.0")
+    raise SystemExit(0)
 LOG = os.environ["FAKE_LOG"]
 CWD = os.environ.get("FAKE_THREAD_CWD", "/default/workspace")
 def send(obj):
@@ -263,8 +267,14 @@ class SupervisorTest(unittest.TestCase):
     def test_require_auto_resume_accepts_activated_matching_bridge(self) -> None:
         binding = self.write_binding()
         config = self.write_bridge_config()
-        semantic_events.activate_bridge(
-            self.outbox(), semantic_events.load_bridge_config(config), []
+        loaded = semantic_events.load_bridge_config(config)
+        semantic_events.activate_bridge(self.outbox(), loaded, [])
+        identity = app_server_bridge._configured_cli_identity(
+            loaded, timeout_seconds=5
+        )
+        app_server_bridge.record_lifecycle_smoke_receipt(
+            self.state, loaded, identity,
+            thread_id="thr_smoke", first_turn_id="turn_1", second_turn_id="turn_2",
         )
         result, payload = self.run_cli(
             "start", "--event-binding", str(binding),
@@ -273,6 +283,51 @@ class SupervisorTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertNotIn("warnings", payload)
+
+    def test_require_auto_resume_rejects_missing_live_smoke_receipt(self) -> None:
+        binding = self.write_binding()
+        config = self.write_bridge_config()
+        semantic_events.activate_bridge(
+            self.outbox(), semantic_events.load_bridge_config(config), []
+        )
+        result, payload = self.run_cli(
+            "start", "--event-binding", str(binding),
+            "--bridge-config", str(config), "--require-auto-resume",
+        )
+        self.assertEqual(result.returncode, 12)
+        self.assertIn("lifecycle_smoke_receipt_missing", payload["detail"])
+        self.assertFalse((self.state / "slurm").exists())
+
+    def test_require_auto_resume_rejects_codex_0149_before_launch(self) -> None:
+        binding = self.write_binding()
+        config = self.write_bridge_config(codex_version="0.149.1")
+        semantic_events.activate_bridge(
+            self.outbox(), semantic_events.load_bridge_config(config), []
+        )
+        result, payload = self.run_cli(
+            "start", "--event-binding", str(binding),
+            "--bridge-config", str(config), "--require-auto-resume",
+        )
+        self.assertEqual(result.returncode, 12)
+        self.assertIn("codex_lifecycle_version_unverified", payload["detail"])
+        self.assertFalse((self.state / "slurm").exists())
+
+    def test_require_auto_resume_rejects_legacy_bare_codex_path(self) -> None:
+        binding = self.write_binding()
+        config_path = self.write_bridge_config()
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["transport"]["command"] = ["codex", "app-server"]
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        semantic_events.activate_bridge(
+            self.outbox(), semantic_events.load_bridge_config(config_path), []
+        )
+        result, payload = self.run_cli(
+            "start", "--event-binding", str(binding),
+            "--bridge-config", str(config_path), "--require-auto-resume",
+        )
+        self.assertEqual(result.returncode, 12)
+        self.assertIn("transport_executable_not_frozen", payload["detail"])
+        self.assertFalse((self.state / "slurm").exists())
 
     def test_status_observer_exit_does_not_stop_watcher(self) -> None:
         self.run_cli("start", env={"FAKE_WATCH_SECONDS": "20"})
@@ -559,7 +614,21 @@ class SupervisorTest(unittest.TestCase):
         path.chmod(0o600)
         return path
 
-    def write_bridge_config(self, instance: str = "workstation-1") -> Path:
+    def write_fake_codex(self, version: str = "0.150.1") -> Path:
+        path = self.root / f"codex-{version}"
+        path.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            f"print('codex-cli {version}') if sys.argv[1:] == ['--version'] else None\n",
+            encoding="utf-8",
+        )
+        path.chmod(0o700)
+        return path
+
+    def write_bridge_config(
+        self, instance: str = "workstation-1", codex_version: str = "0.150.1"
+    ) -> Path:
+        codex_bin = self.write_fake_codex(codex_version)
         config = {
             "schema": "codex-monitor.bridge-config/v1",
             "enabled": True,
@@ -567,7 +636,7 @@ class SupervisorTest(unittest.TestCase):
             "codex_home": str(self.root / ".codex"),
             "codex_home_id": semantic_events.codex_home_digest(self.root / ".codex"),
             "workspace": str(self.root),
-            "transport": {"type": "stdio", "command": ["codex", "app-server"]},
+            "transport": {"type": "stdio", "command": [str(codex_bin), "app-server"]},
             "request_timeout_seconds": 30,
             "poll_seconds": 5,
             "lease_seconds": 300,
@@ -693,6 +762,8 @@ class SupervisorTest(unittest.TestCase):
         self.assertEqual(payload["mode"]["selected"], "unattended")
         self.assertEqual(payload["mode"]["reason"], "bridge_not_configured")
         self.assertFalse(payload["auto_resume_available"])
+        self.assertFalse(payload["configuration_ready"])
+        self.assertEqual(payload["delivery_daemon_live"], "not_configured")
         self.assertTrue(payload["zero_turns_while_unchanged"])
         self.assertFalse(payload["agent_slot_occupied"])
         self.assertTrue(payload["state_root"]["suitable"])
@@ -705,12 +776,35 @@ class SupervisorTest(unittest.TestCase):
     def test_doctor_selects_bridge_with_enabled_config(self) -> None:
         config = self.write_bridge_config()
         result, payload = self.run_doctor("--bridge-config", str(config))
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(payload["mode"]["selected"], "unattended")
+        self.assertFalse(payload["auto_resume_available"])
+        self.assertEqual(payload["app_server"]["real_transport_smoke"], "unverified")
+        self.assertEqual(payload["app_server"]["activation"], "missing_or_stale")
+
+        loaded = semantic_events.load_bridge_config(config)
+        semantic_events.activate_bridge(self.outbox(), loaded, [])
+        identity = app_server_bridge._configured_cli_identity(loaded, timeout_seconds=5)
+        app_server_bridge.record_lifecycle_smoke_receipt(
+            self.state,
+            loaded,
+            identity,
+            thread_id="thr_doctor",
+            first_turn_id="turn_doctor_1",
+            second_turn_id="turn_doctor_2",
+        )
+        result, payload = self.run_doctor("--bridge-config", str(config))
         self.assertEqual(payload["mode"]["selected"], "external-event-bridge")
         self.assertTrue(payload["auto_resume_available"])
         self.assertTrue(payload["notification_available"])
+        self.assertTrue(payload["configuration_ready"])
+        self.assertEqual(payload["delivery_daemon_live"], "unknown_not_probed")
+        self.assertEqual(payload["app_server"]["real_transport_smoke"], "passed")
+        self.assertEqual(payload["app_server"]["activation"], "ready")
         _, text = self.run_doctor("--bridge-config", str(config), "--format", "text")
         self.assertIn("mode: external-event-bridge", text)
         self.assertIn("auto-resume available: yes", text)
+        self.assertIn("delivery daemon live: unknown_not_probed", text)
 
     def test_doctor_invalid_or_disabled_config_falls_back_to_unattended(self) -> None:
         bad = self.root / "bad.json"
@@ -792,13 +886,21 @@ class SupervisorTest(unittest.TestCase):
         fake_server.chmod(0o700)
         wake_log = self.root / "wake.log"
         config = json.loads(self.write_bridge_config().read_text())
-        config["transport"]["command"] = [sys.executable, str(fake_server)]
+        config["transport"]["command"] = [str(fake_server), "app-server"]
         config_path = self.write_bridge_config()
         config_path.write_text(json.dumps(config))
         config_path.chmod(0o600)
         binding_path = self.write_binding()
-        semantic_events.activate_bridge(
-            self.outbox(), semantic_events.load_bridge_config(config_path), []
+        loaded_config = semantic_events.load_bridge_config(config_path)
+        semantic_events.activate_bridge(self.outbox(), loaded_config, [])
+        identity = app_server_bridge._configured_cli_identity(
+            loaded_config, timeout_seconds=5
+        )
+        app_server_bridge.record_lifecycle_smoke_receipt(
+            self.state, loaded_config, identity,
+            thread_id="thr_chain",
+            first_turn_id="turn_chain_smoke_1",
+            second_turn_id="turn_chain_smoke_2",
         )
 
         result, _ = self.run_cli(
