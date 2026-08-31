@@ -25,6 +25,7 @@ from collections import deque
 import json
 import os
 import selectors
+import shutil
 import signal
 import socket
 import stat
@@ -421,12 +422,75 @@ def _classify_server_error(
 
 
 def spawn_env(config: Dict[str, Any]) -> Dict[str, str]:
-    """Environment pinning the App Server to the configured CODEX_HOME."""
-    return {"CODEX_HOME": str(Path(config["codex_home"]).expanduser())}
+    """Pin CODEX_HOME and preserve the service's explicit executable PATH."""
+    return {
+        "CODEX_HOME": str(Path(config["codex_home"]).expanduser()),
+        "PATH": os.environ.get("PATH") or os.defpath,
+    }
+
+
+def resolve_executable(value: str, *, search_path: str | None = None) -> str:
+    """Resolve and validate one executable without changing config schemas.
+
+    Legacy v1 bridge configs may still contain a bare ``codex`` token.  New
+    configs and installed services freeze the absolute executable path so a
+    non-interactive service does not depend on its launch-time ``PATH``.
+    """
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise se.SemanticEventError("transport_executable_invalid")
+    if os.path.sep in value or (os.path.altsep and os.path.altsep in value):
+        candidate = Path(value).expanduser()
+        if not candidate.is_absolute():
+            candidate = Path.cwd() / candidate
+        candidate_text = os.path.abspath(str(candidate))
+    else:
+        found = shutil.which(value, path=search_path)
+        if found is None:
+            raise se.SemanticEventError("transport_executable_missing", value)
+        candidate_text = os.path.abspath(found)
+    try:
+        target = Path(candidate_text).resolve(strict=True)
+        info = target.stat()
+    except (FileNotFoundError, OSError) as exc:
+        raise se.SemanticEventError(
+            "transport_executable_missing", candidate_text
+        ) from exc
+    if not stat.S_ISREG(info.st_mode) or not os.access(target, os.X_OK):
+        raise se.SemanticEventError(
+            "transport_executable_not_executable", candidate_text
+        )
+    return candidate_text
+
+
+def resolved_delivery_command(
+    config: Dict[str, Any], resolved_executable: str | None = None,
+    configured_executable: str | None = None,
+) -> list[str]:
+    """Return an absolute transport argv, validating a service-time freeze."""
+    command = list(config["transport"]["command"])
+    configured = command[0]
+    if resolved_executable is None:
+        command[0] = resolve_executable(configured)
+        return command
+    frozen = resolve_executable(resolved_executable)
+    if not os.path.isabs(frozen):  # Defensive; resolve_executable guarantees this.
+        raise se.SemanticEventError("resolved_executable_not_absolute")
+    installed_token = configured_executable if configured_executable is not None else configured
+    if configured_executable is not None and configured != configured_executable:
+        raise se.SemanticEventError("configured_executable_mismatch")
+    if os.path.isabs(installed_token):
+        if resolve_executable(installed_token) != frozen:
+            raise se.SemanticEventError("resolved_executable_mismatch")
+    elif Path(frozen).name != Path(installed_token).name:
+        raise se.SemanticEventError("resolved_executable_mismatch")
+    command[0] = frozen
+    return command
 
 
 def attempt_delivery(
-    config: Dict[str, Any], event: Dict[str, Any]
+    config: Dict[str, Any], event: Dict[str, Any],
+    resolved_executable: str | None = None,
+    configured_executable: str | None = None,
 ) -> Tuple[str, str, str]:
     """Deliver one wake event into its bound thread and wait for completion.
 
@@ -442,7 +506,7 @@ def attempt_delivery(
         )
     wake_text = se.wake_message(event)
     session = AppServerSession(
-        config["transport"]["command"],
+        resolved_delivery_command(config, resolved_executable, configured_executable),
         float(config["request_timeout_seconds"]),
         env=spawn_env(config),
     )
@@ -508,6 +572,18 @@ def deliver_loop(args: argparse.Namespace) -> int:
             )
         )
         return 0 if getattr(args, "exit_zero_if_disabled", False) else 3
+    try:
+        resolved_delivery_command(
+            config,
+            getattr(args, "resolved_executable", None),
+            getattr(args, "configured_executable", None),
+        )
+    except se.SemanticEventError as exc:
+        print(json.dumps({
+            "schema_version": f"{BRIDGE_PREFIX}.deliver/v1",
+            "state": "error", "reason": exc.reason, "detail": exc.detail,
+        }, sort_keys=True))
+        return 12
     outbox = se.outbox_root(Path(args.state_dir))
     try:
         se.read_bridge_activation(outbox, config)
@@ -578,7 +654,12 @@ def deliver_loop(args: argparse.Namespace) -> int:
             "event": event["event"],
         }
         try:
-            turn_id, turn_status, _wake = attempt_delivery(config, event)
+            turn_id, turn_status, _wake = attempt_delivery(
+                config,
+                event,
+                getattr(args, "resolved_executable", None),
+                getattr(args, "configured_executable", None),
+            )
             # Acknowledge only after the turn reached an interpretable state.
             ack = se.acknowledge_event(
                 outbox,
@@ -949,7 +1030,20 @@ def protocol_check_command(args: argparse.Namespace) -> int:
     the minimal methods used by this bridge. It is distinct from a recorded
     real lifecycle smoke, which is version-specific.
     """
-    codex_bin = str(args.codex_bin)
+    try:
+        codex_bin = resolve_executable(str(args.codex_bin))
+    except se.SemanticEventError as exc:
+        print(json.dumps({
+            "schema_version": f"{BRIDGE_PREFIX}.protocol-check/v1",
+            "codex_bin": str(args.codex_bin),
+            "required_methods": sorted(REQUIRED_PROTOCOL_METHODS),
+            "schema_compatible": False,
+            "reported_version_matches_recorded_smoke": False,
+            "compatibility": "probe_failed",
+            "reason": exc.reason,
+            "detail": exc.detail,
+        }, sort_keys=True))
+        return 12
     payload: Dict[str, Any] = {
         "schema_version": f"{BRIDGE_PREFIX}.protocol-check/v1",
         "codex_bin": codex_bin,
@@ -1072,6 +1166,8 @@ def _write_private_json_output(path: Path, payload: Dict[str, Any]) -> None:
 
 def init_config_command(args: argparse.Namespace) -> int:
     codex_home = str(Path(args.codex_home).expanduser().resolve(strict=False))
+    command = list(args.command)
+    command[0] = resolve_executable(command[0])
     config = {
         "schema": se.BRIDGE_CONFIG_SCHEMA,
         "enabled": args.enabled,
@@ -1079,7 +1175,7 @@ def init_config_command(args: argparse.Namespace) -> int:
         "codex_home": codex_home,
         "codex_home_id": se.codex_home_digest(Path(codex_home)),
         "workspace": str(Path(args.workspace).resolve(strict=False)),
-        "transport": {"type": "stdio", "command": args.command},
+        "transport": {"type": "stdio", "command": command},
         "request_timeout_seconds": args.request_timeout_seconds,
         "poll_seconds": args.poll_seconds,
         "lease_seconds": args.lease_seconds,
@@ -1135,6 +1231,14 @@ def parser() -> argparse.ArgumentParser:
     deliver.add_argument(
         "--exit-zero-if-disabled", action="store_true",
         help="service mode: disabled config is a clean stop, avoiding restart loops",
+    )
+    deliver.add_argument(
+        "--resolved-executable",
+        help=argparse.SUPPRESS,
+    )
+    deliver.add_argument(
+        "--configured-executable",
+        help=argparse.SUPPRESS,
     )
     deliver.set_defaults(func=deliver_loop)
 

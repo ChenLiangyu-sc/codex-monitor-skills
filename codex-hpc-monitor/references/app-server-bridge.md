@@ -66,6 +66,14 @@ python3 <skill-dir>/scripts/app_server_bridge.py init-config \
 Missing output parent directories are created with mode `0700`; symlinked or
 non-directory parent components are rejected.
 
+`init-config` resolves `command[0]` and stores an absolute executable path.
+Legacy v1 configs with bare or relative command tokens remain readable;
+managed service install/repair resolves them once, freezes both the exact token
+and resulting absolute executable in the service definition, and rejects a
+later mismatch even when relative paths share a basename.
+The generated systemd/launchd definition also carries an explicit `PATH`, so
+an npm Codex shim can find its pinned runtime outside an interactive shell.
+
 The configuration records both the `codex_home` path and its digest; a
 mismatch between them is rejected at load time, and every spawned App
 Server runs with `CODEX_HOME` pinned to that path.
@@ -204,6 +212,10 @@ The woken turn must, in order:
 python3 <skill-dir>/scripts/postflight_guard.py begin <event_id> \
   --terminal-digest sha256:... --owner <turn-identity> --state-dir ...
 ```
+
+For CLI convenience, `--terminal-digest` may instead be the raw 64-character
+lowercase hex value. The guard normalizes it to `sha256:<hex>` before touching
+state; event/config APIs continue to require the prefixed wire form.
 
    Exit `0` = this turn owns the postflight; `3` = already completed;
    `5` = another turn's claim is in progress — **fail closed**, report and

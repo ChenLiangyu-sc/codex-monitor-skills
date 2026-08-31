@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import plistlib
 import subprocess
 import sys
@@ -18,6 +19,7 @@ HERE = Path(__file__).resolve().parent
 SCRIPT = HERE / "bridge_service.py"
 import semantic_events as se
 import bridge_service as service
+import app_server_bridge as bridge_adapter
 
 
 SERVICE_NAME = "codex-monitor-test"
@@ -32,6 +34,9 @@ class BridgeServiceTests(unittest.TestCase):
         self.workspace = self.root / "workspace"
         self.codex_home = self.root / ".codex"
         self.config = self.root / "bridge.json"
+        self.fake_codex = self.root / "codex"
+        self.fake_codex.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        self.fake_codex.chmod(0o700)
         payload = {
             "schema": se.BRIDGE_CONFIG_SCHEMA,
             "enabled": True,
@@ -39,7 +44,9 @@ class BridgeServiceTests(unittest.TestCase):
             "codex_home": str(self.codex_home),
             "codex_home_id": se.codex_home_digest(self.codex_home),
             "workspace": str(self.workspace),
-            "transport": {"type": "stdio", "command": ["codex", "app-server"]},
+            "transport": {
+                "type": "stdio", "command": [str(self.fake_codex), "app-server"]
+            },
             "request_timeout_seconds": 30,
             "poll_seconds": 5,
             "lease_seconds": 300,
@@ -136,7 +143,18 @@ class BridgeServiceTests(unittest.TestCase):
         plist = plistlib.loads(payload["definition"].encode())
         self.assertEqual(plist["Label"], SERVICE_NAME)
         self.assertTrue(plist["RunAtLoad"])
-        self.assertNotIn("EnvironmentVariables", plist)
+        self.assertEqual(
+            plist["EnvironmentVariables"]["PATH"].split(":" )[0], str(self.root)
+        )
+        arguments = plist["ProgramArguments"]
+        self.assertEqual(
+            arguments[arguments.index("--resolved-executable") + 1],
+            str(self.fake_codex),
+        )
+        self.assertEqual(
+            arguments[arguments.index("--configured-executable") + 1],
+            str(self.fake_codex),
+        )
 
     def test_repair_detects_and_recovers_definition_drift(self) -> None:
         self.cli(*self.install_args())
@@ -319,9 +337,91 @@ class BridgeServiceTests(unittest.TestCase):
         content = service.render_systemd(
             Path("/tmp/state%name$HOME"), Path("/tmp/config%id$X"),
             HERE / "app_server_bridge.py",
+            str(self.fake_codex), str(self.fake_codex), "/tmp/bin%name$PATH:/usr/bin",
         ).decode()
         self.assertIn("state%%name$$HOME", content)
         self.assertIn("config%%id$$X", content)
+        self.assertIn("--resolved-executable", content)
+        self.assertIn("--configured-executable", content)
+        self.assertIn("PATH=/tmp/bin%%name$$PATH:/usr/bin", content)
+
+    def test_legacy_bare_command_is_frozen_at_install(self) -> None:
+        payload = json.loads(self.config.read_text())
+        payload["transport"]["command"][0] = "codex"
+        self.config.write_text(json.dumps(payload))
+        env = os.environ.copy()
+        env["PATH"] = str(self.root)
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), *self.install_args(), "--dry-run"],
+            text=True, capture_output=True, check=False, timeout=10, env=env,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        body = json.loads(result.stdout)
+        self.assertEqual(body["resolved_executable"], str(self.fake_codex))
+        self.assertIn(str(self.fake_codex), body["definition"])
+
+    def test_legacy_relative_command_is_frozen_across_service_cwd(self) -> None:
+        executable = self.root / "bin" / "codex"
+        executable.parent.mkdir()
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o700)
+        payload = json.loads(self.config.read_text())
+        payload["transport"]["command"][0] = "bin/codex"
+        self.config.write_text(json.dumps(payload))
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), *self.install_args(), "--dry-run"],
+            text=True, capture_output=True, check=False, timeout=10, cwd=self.root,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        body = json.loads(result.stdout)
+        self.assertEqual(body["resolved_executable"], str(executable))
+        loaded = se.load_bridge_config(self.config)
+        with mock.patch("pathlib.Path.cwd", return_value=Path("/unrelated")):
+            command = bridge_adapter.resolved_delivery_command(
+                loaded, str(executable), "bin/codex"
+            )
+        self.assertEqual(command[0], str(executable))
+        drifted = dict(loaded)
+        drifted["transport"] = dict(loaded["transport"])
+        drifted["transport"]["command"] = ["other/codex", "app-server"]
+        with self.assertRaises(se.SemanticEventError) as ctx:
+            bridge_adapter.resolved_delivery_command(
+                drifted, str(executable), "bin/codex"
+            )
+        self.assertEqual(ctx.exception.reason, "configured_executable_mismatch")
+
+    def test_missing_executable_fails_before_definition_write(self) -> None:
+        payload = json.loads(self.config.read_text())
+        payload["transport"]["command"][0] = "definitely-missing-codex"
+        self.config.write_text(json.dumps(payload))
+        result = self.cli(*self.install_args())
+        self.assertEqual(result.returncode, 12, result.stdout)
+        self.assertEqual(
+            json.loads(result.stdout)["reason"], "transport_executable_missing"
+        )
+        self.assertFalse((self.service_dir / f"{SERVICE_NAME}.service").exists())
+
+    def test_repair_detects_changed_frozen_executable(self) -> None:
+        self.assertEqual(self.cli(*self.install_args()).returncode, 0)
+        replacement = self.root / "codex-new"
+        replacement.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        replacement.chmod(0o700)
+        payload = json.loads(self.config.read_text())
+        payload["transport"]["command"][0] = str(replacement)
+        self.config.write_text(json.dumps(payload))
+        base = [
+            "repair", "--platform", "linux", "--service-dir", str(self.service_dir),
+            "--service-name", SERVICE_NAME, "--state-dir", str(self.state),
+            "--bridge-config", str(self.config), "--no-manager",
+        ]
+        detected = self.cli(*base)
+        self.assertEqual(detected.returncode, 3, detected.stdout)
+        self.assertEqual(json.loads(detected.stdout)["state"], "drifted")
+        repaired = self.cli(*base, "--apply")
+        self.assertEqual(repaired.returncode, 0, repaired.stdout)
+        self.assertIn(str(replacement), (
+            self.service_dir / f"{SERVICE_NAME}.service"
+        ).read_text())
 
     def test_launchd_reload_continues_when_agent_is_inactive(self) -> None:
         results = [

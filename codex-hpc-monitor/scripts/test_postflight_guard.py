@@ -13,6 +13,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 GUARD = HERE / "postflight_guard.py"
+import semantic_events as se
 
 
 def run_guard(*args: str) -> tuple[int, dict]:
@@ -65,6 +66,32 @@ class PostflightGuardTests(unittest.TestCase):
         self.assertEqual(code, 3)
         self.assertEqual(payload["state"], "already_marked")
 
+    def test_raw_and_prefixed_digest_forms_normalize_identically(self) -> None:
+        raw = self.digest.removeprefix("sha256:")
+        code, payload = run_guard(
+            "mark", self.event_id, "--terminal-digest", raw,
+            "--state-dir", str(self.state),
+        )
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(payload["terminal_digest"], self.digest)
+        code, payload = run_guard(
+            "mark", self.event_id, "--terminal-digest", self.digest,
+            "--state-dir", str(self.state),
+        )
+        self.assertEqual(code, 3, payload)
+        self.assertEqual(payload["terminal_digest"], self.digest)
+
+    def test_raw_digest_begin_is_normalized_before_claim(self) -> None:
+        code, payload = run_guard(
+            "begin", self.event_id,
+            "--terminal-digest", self.digest.removeprefix("sha256:"),
+            "--owner", "turn-raw", "--state-dir", str(self.state),
+        )
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(payload["terminal_digest"], self.digest)
+        _, checked = run_guard("check", self.event_id, "--state-dir", str(self.state))
+        self.assertEqual(checked["record"]["terminal_digest"], self.digest)
+
     def test_digest_conflict_blocks_and_fails_closed(self) -> None:
         run_guard("mark", self.event_id, "--terminal-digest", self.digest,
                   "--state-dir", str(self.state))
@@ -88,6 +115,25 @@ class PostflightGuardTests(unittest.TestCase):
             "--state-dir", str(self.state),
         )
         self.assertEqual(code, 12)
+        self.assertEqual(
+            payload["detail"],
+            "expected 64 lowercase hex or sha256:<64 lowercase hex>",
+        )
+        for bad in ("A" * 64, "a" * 63, "sha256:" + "A" * 64):
+            code, payload = run_guard(
+                "begin", self.event_id, "--terminal-digest", bad,
+                "--owner", "turn-bad", "--state-dir", str(self.state),
+            )
+            self.assertEqual(code, 12, bad)
+            self.assertEqual(payload["reason"], "terminal_digest_invalid")
+
+    def test_semantic_events_contract_remains_prefix_strict(self) -> None:
+        with self.assertRaises(se.SemanticEventError) as ctx:
+            se.postflight_mark(
+                self.state, self.event_id,
+                terminal_digest=self.digest.removeprefix("sha256:"),
+            )
+        self.assertEqual(ctx.exception.reason, "terminal_digest_invalid")
 
     def test_list_reports_markers(self) -> None:
         run_guard("mark", self.event_id, "--terminal-digest", self.digest,

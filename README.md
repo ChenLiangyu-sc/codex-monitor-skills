@@ -149,6 +149,15 @@ provides local event timelines, independent non-model notification sinks,
 and human-confirmed dead-letter retry. See
 [`references/operations.md`](codex-hpc-monitor/references/operations.md).
 
+`init-config` resolves the App Server executable to an absolute path. Service
+installation also resolves legacy v1 configs whose command begins with bare or
+relative `codex`, freezes both the original token and absolute executable into
+the definition, and supplies an explicit service `PATH`; delivery rejects a
+later config/executable mismatch even when relative paths share a basename. The
+postflight CLI accepts either 64 lowercase hex or the canonical
+`sha256:<64 lowercase hex>` terminal digest and always stores/reports the
+canonical form; the internal event contract remains prefix-strict.
+
 Shared runtime code
 (`semantic_events.py`, `app_server_bridge.py`, `postflight_guard.py`,
 `monitor_events.py`, `bridge_service.py`) is
@@ -346,7 +355,7 @@ real-smoke Codex version, and runs a non-blocking scheduled advisory check
 against the latest Codex CLI.
 
 Current operations-hardening baseline after independent review:
-**448 tests passing** (240 HPC monitor tests and 208 long-task monitor tests),
+**474 tests passing** (253 HPC monitor tests and 221 long-task monitor tests),
 including the outbox, App Server fake, postflight claim, doctor,
 protocol contract check, approval-request fail-closed behavior, service
 definition lifecycle, independent notification receipts, event timeline,

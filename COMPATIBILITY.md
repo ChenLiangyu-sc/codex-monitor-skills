@@ -79,6 +79,17 @@ Review round 2 contract changes (all additive, validated strictly):
 
 Review round 3 behavior hardening (no schema-string changes):
 
+- New bridge configs store an absolute transport executable. Existing
+  `codex-monitor.bridge-config/v1` files with a bare or relative `codex` command
+  remain readable; service install/repair freezes both the original token and
+  resolved executable, writes an explicit service `PATH`, and delivery rejects
+  token or executable drift.
+  The schema field set is unchanged.
+- `postflight_guard.py` CLI `begin`/`mark` accept either raw 64-character
+  lowercase hex or `sha256:`-prefixed terminal digests and normalize to the
+  prefixed form before calling `semantic_events.py`. Direct semantic-event
+  APIs remain prefix-strict.
+
 - `turn/completed` acknowledges only an exact target turn with
   `status=completed`; official `failed` and `interrupted` statuses retry,
   while malformed completion shapes fail closed.

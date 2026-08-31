@@ -111,6 +111,13 @@ timestamped backup. `--service-name` is deliberately required: assign a
 different stable name to every state/config pair so two skills or workspaces
 cannot overwrite or control each other's daemon.
 
+Install/repair resolves the configured App Server executable before writing
+anything, freezes its original token and absolute path in the definition, and writes an explicit
+service `PATH`. This supports legacy v1 configs with bare or relative command
+tokens without relying on the service manager's minimal environment. A missing
+or non-executable target fails before definition mutation; `repair` reports
+drift when the configured token or resolved executable changes.
+
 Useful commands:
 
 ```bash

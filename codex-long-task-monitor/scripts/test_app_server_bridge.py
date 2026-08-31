@@ -16,6 +16,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -23,6 +24,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 BRIDGE = HERE / "app_server_bridge.py"
 import semantic_events as se
+import app_server_bridge as bridge
 
 
 FAKE_SERVER = r'''#!/usr/bin/env python3
@@ -742,7 +744,8 @@ class BridgeAdapterTests(unittest.TestCase):
         result = subprocess.run(
             [sys.executable, str(BRIDGE), "init-config", "--output", str(config_path),
              "--instance-id", "workstation-1", "--workspace", str(workspace),
-             "--codex-home", str(codex_home), "--enabled"],
+             "--codex-home", str(codex_home), "--enabled",
+             "--command", sys.executable, str(self.fake)],
             text=True, capture_output=True, check=False, timeout=10)
         self.assertEqual(result.returncode, 0)
         self.assertEqual(private_parent.stat().st_mode & 0o777, 0o700)
@@ -761,6 +764,102 @@ class BridgeAdapterTests(unittest.TestCase):
         self.assertEqual(config["codex_home_id"], binding["codex_home_id"])
         self.assertEqual(binding["app_server_instance"], config["instance_id"])
         self.assertEqual(binding["workspace"], config["workspace"])
+        self.assertTrue(Path(config["transport"]["command"][0]).is_absolute())
+
+    def test_init_config_resolves_bare_executable_and_rejects_missing(self) -> None:
+        executable = self.root / "codex"
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o700)
+        output = self.root / "resolved.json"
+        env = os.environ.copy()
+        env["PATH"] = str(self.root)
+        accepted = subprocess.run(
+            [sys.executable, str(BRIDGE), "init-config", "--output", str(output),
+             "--instance-id", "workstation-1", "--workspace", str(self.project),
+             "--codex-home", str(self.root / ".codex"),
+             "--command", "codex", "app-server"],
+            text=True, capture_output=True, check=False, timeout=10, env=env,
+        )
+        self.assertEqual(accepted.returncode, 0, accepted.stdout)
+        self.assertEqual(
+            json.loads(output.read_text())["transport"]["command"][0], str(executable)
+        )
+        missing_output = self.root / "missing.json"
+        refused = subprocess.run(
+            [sys.executable, str(BRIDGE), "init-config", "--output", str(missing_output),
+             "--instance-id", "workstation-1", "--workspace", str(self.project),
+             "--codex-home", str(self.root / ".codex"),
+             "--command", "missing-codex", "app-server"],
+            text=True, capture_output=True, check=False, timeout=10, env=env,
+        )
+        self.assertEqual(refused.returncode, 12, refused.stdout)
+        self.assertEqual(json.loads(refused.stdout)["reason"], "transport_executable_missing")
+        self.assertFalse(missing_output.exists())
+
+    def test_init_config_rejects_non_executable_before_write(self) -> None:
+        executable = self.root / "codex-not-executable"
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o600)
+        output = self.root / "nonexec.json"
+        result = subprocess.run(
+            [sys.executable, str(BRIDGE), "init-config", "--output", str(output),
+             "--instance-id", "workstation-1", "--workspace", str(self.project),
+             "--codex-home", str(self.root / ".codex"),
+             "--command", str(executable), "app-server"],
+            text=True, capture_output=True, check=False, timeout=10,
+        )
+        self.assertEqual(result.returncode, 12, result.stdout)
+        self.assertEqual(
+            json.loads(result.stdout)["reason"],
+            "transport_executable_not_executable",
+        )
+        self.assertFalse(output.exists())
+
+    def test_frozen_executable_supports_legacy_config_without_path_lookup(self) -> None:
+        executable = self.root / "codex"
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o700)
+        config = json.loads(self.write_config().read_text())
+        config["transport"]["command"][0] = "codex"
+        with mock.patch.dict(os.environ, {"PATH": ""}):
+            command = bridge.resolved_delivery_command(config, str(executable))
+        self.assertEqual(command[0], str(executable))
+
+    def test_frozen_executable_mismatch_fails_closed(self) -> None:
+        executable = self.root / "other"
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o700)
+        config = json.loads(self.write_config().read_text())
+        config["transport"]["command"][0] = "codex"
+        with self.assertRaises(se.SemanticEventError) as ctx:
+            bridge.resolved_delivery_command(config, str(executable))
+        self.assertEqual(ctx.exception.reason, "resolved_executable_mismatch")
+
+    def test_service_executable_mismatch_fails_before_event_claim(self) -> None:
+        config = self.write_config()
+        event = self.publish_event()
+        self.activate_config(config)
+        executable = self.root / "other"
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o700)
+        result = subprocess.run(
+            [sys.executable, str(BRIDGE), "deliver", "--once",
+             "--state-dir", str(self.state), "--bridge-config", str(config),
+             "--resolved-executable", str(executable)],
+            text=True, capture_output=True, check=False, timeout=10,
+        )
+        self.assertEqual(result.returncode, 12, result.stdout)
+        self.assertEqual(json.loads(result.stdout)["reason"], "resolved_executable_mismatch")
+        self.assertEqual(self.delivery_of(event["event_id"])["state"], "pending")
+
+    def test_spawn_environment_preserves_explicit_service_path(self) -> None:
+        config = json.loads(self.write_config().read_text())
+        with mock.patch.dict(os.environ, {"PATH": "/service/bin:/usr/bin"}):
+            environment = bridge.spawn_env(config)
+        self.assertEqual(environment["PATH"], "/service/bin:/usr/bin")
+        self.assertEqual(environment["CODEX_HOME"], config["codex_home"])
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(bridge.spawn_env(config)["PATH"], os.defpath)
 
     def test_init_command_rejects_symlinked_parent(self) -> None:
         real = self.root / "real"

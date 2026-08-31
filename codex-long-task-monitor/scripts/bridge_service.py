@@ -29,6 +29,7 @@ _SCRIPT_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 import semantic_events as se
+import app_server_bridge as bridge_adapter
 
 
 PREFIX = "codex-monitor.bridge-service"
@@ -81,14 +82,37 @@ def _ensure_service_directory(path: Path) -> None:
         raise se.SemanticEventError("service_directory_unsafe")
 
 
-def _resolved_inputs(args: argparse.Namespace) -> tuple[Path, Path, Path, Dict[str, Any]]:
+def _resolved_inputs(
+    args: argparse.Namespace,
+) -> tuple[Path, Path, Path, str, str, str, Dict[str, Any]]:
     state_dir = Path(args.state_dir).expanduser().resolve(strict=False)
     config_path = Path(args.bridge_config).expanduser().resolve(strict=True)
     config = se.load_bridge_config(config_path)
     bridge = Path(__file__).resolve().with_name("app_server_bridge.py")
     if not bridge.is_file():
         raise se.SemanticEventError("bridge_script_missing")
-    return state_dir, config_path, bridge, config
+    resolved_executable = bridge_adapter.resolved_delivery_command(config)[0]
+    configured_executable = config["transport"]["command"][0]
+    service_path = _service_environment_path(resolved_executable)
+    return state_dir, config_path, bridge, resolved_executable, configured_executable, service_path, config
+
+
+def _service_environment_path(resolved_executable: str) -> str:
+    """Freeze a usable, explicit PATH for non-interactive service managers."""
+    candidates = [
+        str(Path(resolved_executable).parent),
+        str(Path(sys.executable).resolve().parent),
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+        "/opt/homebrew/bin",
+    ]
+    candidates.extend(os.environ.get("PATH", "").split(os.pathsep))
+    result: list[str] = []
+    for value in candidates:
+        if value and os.path.isabs(value) and value not in result:
+            result.append(value)
+    return os.pathsep.join(result)
 
 
 def _systemd_quote(value: str) -> str:
@@ -98,11 +122,16 @@ def _systemd_quote(value: str) -> str:
     return '"' + escaped.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def render_systemd(state_dir: Path, config_path: Path, bridge: Path) -> bytes:
+def render_systemd(
+    state_dir: Path, config_path: Path, bridge: Path,
+    resolved_executable: str, configured_executable: str, service_path: str,
+) -> bytes:
     argv = [
         sys.executable, str(bridge), "deliver",
         "--state-dir", str(state_dir),
         "--bridge-config", str(config_path),
+        "--resolved-executable", resolved_executable,
+        "--configured-executable", configured_executable,
         "--exit-zero-if-disabled",
     ]
     command = " ".join(_systemd_quote(item) for item in argv)
@@ -112,6 +141,7 @@ def render_systemd(state_dir: Path, config_path: Path, bridge: Path) -> bytes:
         "After=default.target\n\n"
         "[Service]\n"
         "Type=simple\n"
+        f"Environment={_systemd_quote('PATH=' + service_path)}\n"
         f"ExecStart={command}\n"
         "Restart=on-failure\n"
         "RestartSec=5\n"
@@ -124,7 +154,8 @@ def render_systemd(state_dir: Path, config_path: Path, bridge: Path) -> bytes:
 
 
 def render_launchd(
-    service_name: str, state_dir: Path, config_path: Path, bridge: Path
+    service_name: str, state_dir: Path, config_path: Path, bridge: Path,
+    resolved_executable: str, configured_executable: str, service_path: str,
 ) -> bytes:
     payload = {
         "Label": service_name,
@@ -132,8 +163,11 @@ def render_launchd(
             sys.executable, str(bridge), "deliver",
             "--state-dir", str(state_dir),
             "--bridge-config", str(config_path),
+            "--resolved-executable", resolved_executable,
+            "--configured-executable", configured_executable,
             "--exit-zero-if-disabled",
         ],
+        "EnvironmentVariables": {"PATH": service_path},
         "RunAtLoad": True,
         "KeepAlive": {"SuccessfulExit": False},
         "ProcessType": "Background",
@@ -142,12 +176,19 @@ def render_launchd(
 
 
 def _definition(args: argparse.Namespace, platform: str) -> tuple[Path, bytes, Dict[str, Any]]:
-    state_dir, config_path, bridge, config = _resolved_inputs(args)
+    (
+        state_dir, config_path, bridge, resolved_executable, configured_executable, service_path, config
+    ) = _resolved_inputs(args)
     path = _service_path(args, platform)
     content = (
-        render_launchd(args.service_name, state_dir, config_path, bridge)
+        render_launchd(
+            args.service_name, state_dir, config_path, bridge,
+            resolved_executable, configured_executable, service_path,
+        )
         if platform == "darwin"
-        else render_systemd(state_dir, config_path, bridge)
+        else render_systemd(
+            state_dir, config_path, bridge, resolved_executable, configured_executable, service_path
+        )
     )
     metadata = {
         "service_path": str(path),
@@ -155,6 +196,9 @@ def _definition(args: argparse.Namespace, platform: str) -> tuple[Path, bytes, D
         "bridge_config": str(config_path),
         "bridge_enabled": config["enabled"],
         "instance_id": config["instance_id"],
+        "resolved_executable": resolved_executable,
+        "configured_executable": configured_executable,
+        "service_path_environment": service_path,
     }
     return path, content, metadata
 

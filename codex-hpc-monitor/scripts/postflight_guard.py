@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import socket
 import sys
 import time
@@ -32,6 +33,19 @@ import semantic_events as se
 
 
 POSTFLIGHT_PREFIX = "codex-monitor.postflight"
+RAW_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def normalize_terminal_digest(value: str) -> str:
+    """Accept the two documented CLI forms and return the strict wire form."""
+    if isinstance(value, str) and RAW_SHA256_RE.fullmatch(value):
+        return f"sha256:{value}"
+    if isinstance(value, str) and se.SHA256_PREFIX_RE.fullmatch(value):
+        return value
+    raise se.SemanticEventError(
+        "terminal_digest_invalid",
+        "expected 64 lowercase hex or sha256:<64 lowercase hex>",
+    )
 
 
 def check_command(args: argparse.Namespace) -> int:
@@ -59,22 +73,24 @@ def check_command(args: argparse.Namespace) -> int:
 
 def mark_command(args: argparse.Namespace) -> int:
     try:
+        terminal_digest = normalize_terminal_digest(args.terminal_digest)
         outcome = se.postflight_mark(
             Path(args.state_dir),
             args.event_id,
-            terminal_digest=args.terminal_digest,
+            terminal_digest=terminal_digest,
         )
     except se.SemanticEventError as exc:
         print(json.dumps({
             "schema_version": f"{POSTFLIGHT_PREFIX}.mark/v1",
             "state": "error",
             "reason": exc.reason,
+            "detail": exc.detail,
         }, sort_keys=True))
         return 12
     payload = {
         "schema_version": f"{POSTFLIGHT_PREFIX}.mark/v1",
         "event_id": args.event_id,
-        "terminal_digest": args.terminal_digest,
+        "terminal_digest": terminal_digest,
         "state": outcome,
     }
     print(json.dumps(payload, sort_keys=True))
@@ -84,10 +100,11 @@ def mark_command(args: argparse.Namespace) -> int:
 def begin_command(args: argparse.Namespace) -> int:
     owner = args.owner or f"{socket.gethostname()}:{os.getpid()}:{time.time_ns():x}"
     try:
+        terminal_digest = normalize_terminal_digest(args.terminal_digest)
         outcome = se.postflight_begin(
             Path(args.state_dir),
             args.event_id,
-            terminal_digest=args.terminal_digest,
+            terminal_digest=terminal_digest,
             owner=owner,
         )
     except se.SemanticEventError as exc:
@@ -95,12 +112,13 @@ def begin_command(args: argparse.Namespace) -> int:
             "schema_version": f"{POSTFLIGHT_PREFIX}.begin/v1",
             "state": "error",
             "reason": exc.reason,
+            "detail": exc.detail,
         }, sort_keys=True))
         return 12
     print(json.dumps({
         "schema_version": f"{POSTFLIGHT_PREFIX}.begin/v1",
         "event_id": args.event_id,
-        "terminal_digest": args.terminal_digest,
+        "terminal_digest": terminal_digest,
         "owner": owner,
         "state": outcome,
         # An unknown in_progress result must fail closed: report it and
