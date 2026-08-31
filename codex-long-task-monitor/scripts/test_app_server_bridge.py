@@ -976,7 +976,8 @@ class BridgeAdapterTests(unittest.TestCase):
             [sys.executable, str(BRIDGE), "init-config",
              "--output", str(link / "bridge.json"),
              "--instance-id", "workstation-1", "--workspace", str(self.project),
-             "--codex-home", str(self.root / ".codex")],
+             "--codex-home", str(self.root / ".codex"),
+             "--command", str(self.fake), "app-server"],
             text=True, capture_output=True, check=False, timeout=10,
         )
         self.assertEqual(result.returncode, 12)
