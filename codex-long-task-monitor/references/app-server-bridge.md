@@ -156,6 +156,69 @@ claim to pending and exits without creating a wake turn.
 Without the strict flag, a binding with no config remains compatible but emits
 both a prominent stderr warning and a structured JSON warning.
 
+### Goal scheduler continuation gate (custom Codex 0.151)
+
+The bridge adapter also exposes a separate, experimental control plane for a
+locally patched Codex 0.151 App Server. This is for a Goal supervisor that must
+end its current turn while a deterministic monitor waits, without allowing the
+Goal runtime to create idle continuation turns in the meantime. Ordinary event
+delivery never calls this control plane and keeps its stable initialize payload
+and delivery behavior unchanged.
+
+Arm the gate only after the monitor binding is durable:
+
+```bash
+python3 <skill-dir>/scripts/app_server_bridge.py continuation-gate arm \
+  --state-dir ~/.cache/<skill-state> \
+  --bridge-config ~/.config/codex-monitor/bridge.json \
+  --event-binding ~/.config/codex-monitor/binding-<task>.json \
+  --binding-id <stable-monitor-binding-id>
+```
+
+The command enables `capabilities.experimentalApi`, resumes the exact bound
+thread to verify its workspace, reads the current Goal, requires it to be
+`active`, calls `thread/goal/continuation/set` with that exact Goal id, then
+reads the marker back. It returns success only when read-back reports the same
+active Goal with `deferred=true`. It never calls `turn/start` and does not
+write to the project.
+
+The `--state-dir` for this command must resolve outside the bound workspace.
+On success it writes a `0600` durable receipt below a `0700`
+`.continuation-gates` directory. The receipt is bound to the stable binding id,
+full binding and config digests, thread and Goal ids, Codex home and workspace,
+reported Codex 0.151 version, absolute executable, and executable SHA-256.
+Repeating `arm` through a new App Server process is idempotent for the same
+Goal. A replacement Goal, changed binding/config, or executable drift fails
+closed instead of arming the new Goal under an old receipt.
+
+Read the live marker without changing it:
+
+```bash
+python3 <skill-dir>/scripts/app_server_bridge.py continuation-gate get \
+  --state-dir ~/.cache/<skill-state> \
+  --bridge-config ~/.config/codex-monitor/bridge.json \
+  --event-binding ~/.config/codex-monitor/binding-<task>.json \
+  --binding-id <stable-monitor-binding-id>
+```
+
+Clear/reconcile only the Goal id returned by the successful `arm` call:
+
+```bash
+python3 <skill-dir>/scripts/app_server_bridge.py continuation-gate clear \
+  --state-dir ~/.cache/<skill-state> \
+  --bridge-config ~/.config/codex-monitor/bridge.json \
+  --event-binding ~/.config/codex-monitor/binding-<task>.json \
+  --binding-id <stable-monitor-binding-id> \
+  --expected-goal-id <armed-goal-id>
+```
+
+`clear` requires the matching receipt and binding id, sends the receipt-bound
+Goal id as `expectedGoalId`, and verifies `deferred=false` by read-back. It is
+idempotent when that same Goal is already clear and refuses to touch a
+replacement Goal. An explicit wake turn also clears the Codex marker at turn
+start; this command remains the safe reconciliation path when no wake turn is
+being created.
+
 The launcher rejects an attempt to add or change a binding on an already
 active run as `active_run_binding_conflict`; bindings are immutable run
 intent, not an attach operation. Let an existing unattended run finish and

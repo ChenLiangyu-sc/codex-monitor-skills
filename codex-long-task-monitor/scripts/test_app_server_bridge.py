@@ -32,6 +32,8 @@ import json, os, sys, time
 
 MODE = os.environ.get("FAKE_MODE", "ok")
 LOG = os.environ.get("FAKE_LOG")
+RPC_LOG = os.environ.get("FAKE_RPC_LOG")
+GOAL_STATE = os.environ.get("FAKE_GOAL_STATE")
 CWD = os.environ.get("FAKE_THREAD_CWD", "/default/workspace")
 TURN_DELAY = float(os.environ.get("FAKE_TURN_DELAY", "0"))
 
@@ -48,6 +50,22 @@ def log(text):
         with open(LOG, "a", encoding="utf-8") as handle:
             handle.write(text + "\n===\n")
 
+def rpc_log(method, params):
+    if RPC_LOG:
+        with open(RPC_LOG, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"method": method, "params": params}, sort_keys=True) + "\n")
+
+def read_goal():
+    if GOAL_STATE and os.path.exists(GOAL_STATE):
+        with open(GOAL_STATE, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    return {"goalId": "goal_test_1", "status": "active", "deferred": False}
+
+def write_goal(value):
+    if GOAL_STATE:
+        with open(GOAL_STATE, "w", encoding="utf-8") as handle:
+            json.dump(value, handle)
+
 for raw in sys.stdin:
     line = raw.strip()
     if not line:
@@ -58,6 +76,7 @@ for raw in sys.stdin:
         continue
     method = message.get("method")
     mid = message.get("id")
+    rpc_log(method, message.get("params"))
     if MODE == "garbage":
         sys.stdout.write("this is not json\n")
         sys.stdout.flush()
@@ -107,6 +126,17 @@ for raw in sys.stdin:
             send({"id": mid, "result": {"thread": {"id": message["params"]["threadId"]}}})
         else:
             send({"id": mid, "result": {"thread": {"id": message["params"]["threadId"], "cwd": CWD}}})
+    elif method == "thread/goal/continuation/get":
+        send({"id": mid, "result": read_goal()})
+    elif method in {"thread/goal/continuation/set", "thread/goal/continuation/clear"}:
+        goal = read_goal()
+        expected = message["params"].get("expectedGoalId")
+        if goal.get("goalId") != expected or goal.get("status") != "active":
+            send({"id": mid, "error": {"code": -32602, "message": "stale expected goal"}})
+        else:
+            goal["deferred"] = method.endswith("/set")
+            write_goal(goal)
+            send({"id": mid, "result": goal})
     elif method == "turn/start":
         if MODE == "crash_turn_start":
             sys.stderr.write("turn start failed access_token=very-secret-value\n")
@@ -161,6 +191,8 @@ class BridgeAdapterTests(unittest.TestCase):
         self.fake.write_text(FAKE_SERVER, encoding="utf-8")
         self.fake.chmod(0o700)
         self.wake_log = self.root / "wake.log"
+        self.rpc_log = self.root / "rpc.log"
+        self.goal_state = self.root / "goal.json"
         self.project = self.root / "project"
 
     def tearDown(self) -> None:
@@ -224,6 +256,8 @@ class BridgeAdapterTests(unittest.TestCase):
         env.update({
             "FAKE_MODE": mode,
             "FAKE_LOG": str(self.wake_log),
+            "FAKE_RPC_LOG": str(self.rpc_log),
+            "FAKE_GOAL_STATE": str(self.goal_state),
             "FAKE_THREAD_CWD": str(self.project),
         })
         if turn_delay is not None:
@@ -282,6 +316,32 @@ class BridgeAdapterTests(unittest.TestCase):
         return se._read_delivery(
             se.event_dir(se.outbox_root(self.state), event_id), event_id
         )
+
+    def continuation_gate(
+        self,
+        action: str,
+        *,
+        config: Path,
+        binding: Path,
+        binding_id: str = "binding-test-1",
+        expected_goal_id: str | None = None,
+        state_dir: Path | None = None,
+    ) -> tuple[int, dict]:
+        command = [
+            sys.executable, str(BRIDGE), "continuation-gate", action,
+            "--state-dir", str(state_dir or self.state),
+            "--bridge-config", str(config),
+            "--event-binding", str(binding),
+            "--binding-id", binding_id,
+        ]
+        if expected_goal_id is not None:
+            command += ["--expected-goal-id", expected_goal_id]
+        result = subprocess.run(
+            command, text=True, capture_output=True, check=False,
+            env=self.deliver_env("ok"), timeout=10,
+        )
+        self.assertTrue(result.stdout.strip(), result.stderr)
+        return result.returncode, json.loads(result.stdout)
 
     def protocol_files(self) -> dict[str, dict]:
         request = lambda method, ref: {
@@ -1319,6 +1379,164 @@ class BridgeAdapterTests(unittest.TestCase):
         payload = json.loads(result.stdout)
         self.assertIn(
             "server_notification:turn/completed", payload["contract_failures"]
+        )
+
+    def test_continuation_gate_arm_restart_get_and_clear_are_idempotent(self) -> None:
+        config = self.write_config()
+        binding = self.write_binding_file()
+
+        code, armed = self.continuation_gate(
+            "arm", config=config, binding=binding
+        )
+        self.assertEqual(code, 0, armed)
+        self.assertEqual(armed["goal_id"], "goal_test_1")
+        self.assertTrue(armed["deferred"])
+        self.assertFalse(armed["model_turn_created"])
+        receipt_path = Path(armed["receipt"])
+        first_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        loaded_config = se.load_bridge_config(config)
+        loaded_binding = se.load_event_binding(binding)
+        identity = bridge._configured_cli_identity(loaded_config, timeout_seconds=5)
+        self.assertEqual(
+            first_receipt["schema"], bridge.CONTINUATION_GATE_RECEIPT_SCHEMA
+        )
+        self.assertEqual(
+            first_receipt["config_digest"],
+            bridge._continuation_gate_config_digest(loaded_config),
+        )
+        self.assertEqual(
+            first_receipt["binding_digest"],
+            bridge._continuation_gate_binding_digest(loaded_binding),
+        )
+        self.assertEqual(
+            first_receipt["executable_sha256"], identity["executable_sha256"]
+        )
+        self.assertEqual(first_receipt["state"], "armed")
+        self.assertEqual(first_receipt["goal_id"], "goal_test_1")
+        self.assertEqual(receipt_path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(receipt_path.parent.stat().st_mode & 0o777, 0o700)
+        self.assertFalse(
+            bridge._path_is_within(receipt_path, self.project.resolve(strict=False))
+        )
+
+        # A fresh CLI/App Server process reuses the marker and durable receipt.
+        code, rearmed = self.continuation_gate(
+            "arm", config=config, binding=binding
+        )
+        self.assertEqual(code, 0, rearmed)
+        second_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        self.assertEqual(second_receipt["armed_at"], first_receipt["armed_at"])
+
+        code, queried = self.continuation_gate(
+            "get", config=config, binding=binding
+        )
+        self.assertEqual(code, 0, queried)
+        self.assertTrue(queried["deferred"])
+
+        code, cleared = self.continuation_gate(
+            "clear", config=config, binding=binding,
+            expected_goal_id="goal_test_1",
+        )
+        self.assertEqual(code, 0, cleared)
+        self.assertFalse(cleared["deferred"])
+        cleared_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        self.assertEqual(cleared_receipt["state"], "cleared")
+
+        code, cleared_again = self.continuation_gate(
+            "clear", config=config, binding=binding,
+            expected_goal_id="goal_test_1",
+        )
+        self.assertEqual(code, 0, cleared_again)
+        self.assertEqual(
+            json.loads(receipt_path.read_text(encoding="utf-8"))["cleared_at"],
+            cleared_receipt["cleared_at"],
+        )
+
+        rpc = [json.loads(line) for line in self.rpc_log.read_text().splitlines()]
+        self.assertNotIn("turn/start", {entry["method"] for entry in rpc})
+        initialize = [entry for entry in rpc if entry["method"] == "initialize"]
+        self.assertTrue(initialize)
+        self.assertTrue(all(
+            entry["params"].get("capabilities", {}).get("experimentalApi") is True
+            for entry in initialize
+        ))
+
+    def test_continuation_gate_rejects_goal_replacement_without_mutating_new_goal(self) -> None:
+        config = self.write_config()
+        binding = self.write_binding_file()
+        code, armed = self.continuation_gate("arm", config=config, binding=binding)
+        self.assertEqual(code, 0, armed)
+        self.goal_state.write_text(json.dumps({
+            "goalId": "goal_replacement", "status": "active", "deferred": False,
+        }), encoding="utf-8")
+
+        before = len(self.rpc_log.read_text().splitlines())
+        code, failed = self.continuation_gate("arm", config=config, binding=binding)
+        self.assertEqual(code, 12)
+        self.assertEqual(failed["reason"], "continuation_goal_replaced")
+        new_rpc = [
+            json.loads(line) for line in self.rpc_log.read_text().splitlines()[before:]
+        ]
+        self.assertNotIn(
+            "thread/goal/continuation/set",
+            {entry["method"] for entry in new_rpc},
+        )
+        self.assertEqual(
+            json.loads(self.goal_state.read_text(encoding="utf-8")),
+            {"goalId": "goal_replacement", "status": "active", "deferred": False},
+        )
+
+        code, failed = self.continuation_gate(
+            "clear", config=config, binding=binding,
+            expected_goal_id="goal_test_1",
+        )
+        self.assertEqual(code, 12)
+        self.assertEqual(failed["reason"], "continuation_goal_replaced")
+
+    def test_continuation_gate_requires_project_external_state_and_bound_identity(self) -> None:
+        config = self.write_config()
+        binding = self.write_binding_file()
+        code, failed = self.continuation_gate(
+            "arm", config=config, binding=binding,
+            state_dir=self.project / ".monitor-state",
+        )
+        self.assertEqual(code, 12)
+        self.assertEqual(failed["reason"], "continuation_state_inside_workspace")
+
+        wrong_binding = self.write_binding_file(workspace=str(self.root / "other"))
+        code, failed = self.continuation_gate(
+            "arm", config=config, binding=wrong_binding
+        )
+        self.assertEqual(code, 12)
+        self.assertEqual(failed["reason"], "continuation_binding_workspace_mismatch")
+
+    def test_continuation_gate_receipt_rejects_binding_config_and_executable_drift(self) -> None:
+        config = self.write_config()
+        binding = self.write_binding_file()
+        code, armed = self.continuation_gate("arm", config=config, binding=binding)
+        self.assertEqual(code, 0, armed)
+
+        drifted_binding = self.write_binding_file(thread_id="thr_test_2")
+        code, failed = self.continuation_gate(
+            "arm", config=config, binding=drifted_binding
+        )
+        self.assertEqual(code, 12)
+        self.assertEqual(failed["reason"], "continuation_receipt_binding_digest_mismatch")
+
+        binding = self.write_binding_file()
+        drifted_config = self.write_config(poll_seconds=0.06)
+        code, failed = self.continuation_gate(
+            "arm", config=drifted_config, binding=binding
+        )
+        self.assertEqual(code, 12)
+        self.assertEqual(failed["reason"], "continuation_receipt_config_digest_mismatch")
+
+        config = self.write_config()
+        self.fake.write_text(FAKE_SERVER + "\n# executable drift\n", encoding="utf-8")
+        code, failed = self.continuation_gate("arm", config=config, binding=binding)
+        self.assertEqual(code, 12)
+        self.assertEqual(
+            failed["reason"], "continuation_receipt_executable_sha256_mismatch"
         )
 
     def test_protocol_check_rejects_missing_initialized_and_required_fields(self) -> None:

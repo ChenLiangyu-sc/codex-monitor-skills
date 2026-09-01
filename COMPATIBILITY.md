@@ -56,10 +56,12 @@ Baseline before changes: 100 tests passing (55 `codex-hpc-monitor`,
 | `<skill>.semantic-event/v1` | WP3 | Run-dir record of the event publication outcome |
 | `codex-monitor.sink-receipt/v1` | Operations hardening | Independent at-least-once receipt bound to sink ID, mode, and destination digest; does not alter wake delivery |
 | `codex-monitor.app-server-lifecycle-smoke/v1` | Lifecycle diagnostics hardening | Private local receipt proving a confirmed two-connection initialize/thread-start/turn-completed/reinitialize/thread-resume/turn-completed smoke, bound to config and executable hash |
+| `codex-monitor.continuation-gate-receipt/v1` | Scheduler wait-gate integration | Project-external private receipt binding one stable monitor binding, exact thread/Goal, config, and Codex 0.151 executable hash to an experimentally armed or cleared idle-continuation marker |
 
 Operations hardening also adds output-only schemas under
 `codex-monitor.bridge-service.*`, `codex-monitor.bridge.protocol-check/v1`,
-`codex-monitor.bridge.activation-check/v1`, and `codex-monitor.events.*`.
+`codex-monitor.bridge.activation-check/v1`,
+`codex-monitor.bridge.continuation-gate/v1`, and `codex-monitor.events.*`.
 They are command responses rather than monitor
 authority. Dead-letter retry is an explicit human-confirmed transition on the
 existing `codex-monitor.delivery/v1`; it never mutates `event.json`.

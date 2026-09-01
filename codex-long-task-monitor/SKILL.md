@@ -33,6 +33,14 @@ Auto-resume exists **only** through the explicitly configured event bridge
 infer auto-resume merely because a terminal file, worker script, or Goal
 exists. A terminal file cannot awaken an inactive Codex turn by itself.
 
+When a Goal supervisor explicitly requests scheduler wait-gate integration
+with the locally patched Codex 0.151 App Server, read the "Goal scheduler
+continuation gate" section of the bridge reference. Use its explicit
+`continuation-gate arm` result only after durable monitor binding, and do not
+commit an external-wait state unless the same active Goal reads back with
+`deferred=true`. Preserve the returned Goal id for receipt-bound `clear`.
+This control plane creates no model turn and does not change ordinary delivery.
+
 Enable a binding only on a new supervisor run. Never retrofit it onto an
 active unattended run: the launcher rejects that as
 `active_run_binding_conflict`. Audit the existing outbox with

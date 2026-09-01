@@ -126,6 +126,16 @@ model turn before skill logic can debounce it, so these skills explicitly
 forbid creating or retaining a periodic Goal solely for status checks. Use an
 event-driven bridge, or unattended mode until a natural user turn.
 
+For the locally patched Codex 0.151 runtime only, `app_server_bridge.py
+continuation-gate get|arm|clear` provides an experimental, no-model-turn
+control plane that lets a Goal supervisor persist and verify the exact
+thread/Goal idle-continuation deferral before it commits an external wait.
+This path requires a stable monitor binding id and a private state root outside
+the project; its durable receipt is bound to the binding, config, Goal, and
+Codex executable hash. It is separate from default event delivery, which
+continues to use only the stable App Server lifecycle. See the bridge reference
+for the full CLI and fail-closed replacement-Goal rules.
+
 Bridge release gates (partially met): all tests green on supported Pythons,
 skill validation for both skills, one opt-in live end-to-end test against a
 real Codex App Server, offline/duplicate-delivery and multi-instance

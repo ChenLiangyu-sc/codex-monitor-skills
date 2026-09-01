@@ -49,6 +49,8 @@ import semantic_events as se
 BRIDGE_PREFIX = "codex-monitor.bridge"
 LIFECYCLE_SMOKE_SCHEMA = "codex-monitor.app-server-lifecycle-smoke/v1"
 MAX_LIFECYCLE_SMOKE_BYTES = 16 * 1024
+CONTINUATION_GATE_RECEIPT_SCHEMA = "codex-monitor.continuation-gate-receipt/v1"
+MAX_CONTINUATION_GATE_RECEIPT_BYTES = 16 * 1024
 CLIENT_INFO = {"name": "codex-monitor-skills", "title": "monitor bridge", "version": "1"}
 REAL_SMOKE_TESTED_CODEX_VERSIONS = {"0.150.1", "0.151.0"}
 CODEX_VERSION_RE = re.compile(r"(?:codex-cli\s+)?(\d+\.\d+\.\d+)")
@@ -290,9 +292,12 @@ class AppServerSession:
     def notify(self, method: str, params: Dict[str, Any]) -> None:
         self._write({"method": method, "params": params})
 
-    def initialize(self) -> Dict[str, Any]:
+    def initialize(self, *, experimental_api: bool = False) -> Dict[str, Any]:
+        params: Dict[str, Any] = {"clientInfo": CLIENT_INFO}
+        if experimental_api:
+            params["capabilities"] = {"experimentalApi": True}
         try:
-            result = self.request("initialize", {"clientInfo": CLIENT_INFO})
+            result = self.request("initialize", params)
         except DeliveryError as exc:
             if exc.code in {
                 "connection_lost",
@@ -1510,6 +1515,328 @@ def _write_private_json_output(path: Path, payload: Dict[str, Any]) -> None:
     se.fsync_directory(path.parent)
 
 
+_BINDING_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
+_GOAL_STATUSES = {
+    "active", "paused", "blocked", "usageLimited", "budgetLimited", "complete",
+}
+
+
+def _continuation_gate_config_digest(config: Dict[str, Any]) -> str:
+    return se.sha256_prefix(se.canonical_json(se.validate_bridge_config(config)))
+
+
+def _continuation_gate_binding_digest(binding: Dict[str, Any]) -> str:
+    return se.sha256_prefix(se.canonical_json(se.validate_event_binding(binding)))
+
+
+def _path_is_within(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def continuation_gate_receipt_path(
+    state_dir: Path,
+    config: Dict[str, Any],
+    binding: Dict[str, Any],
+    binding_id: str,
+) -> Path:
+    """Return the private, project-external receipt path for one stable binding."""
+    state_root = Path(state_dir).expanduser().resolve(strict=False)
+    workspace = Path(config["workspace"]).expanduser().resolve(strict=False)
+    if _path_is_within(state_root, workspace):
+        raise se.SemanticEventError(
+            "continuation_state_inside_workspace",
+            "continuation gate state must be outside the bound workspace",
+        )
+    # The stable caller-owned binding id, not mutable config content, selects
+    # the receipt. Otherwise config/binding drift would silently choose a new
+    # file and bypass the receipt's fail-closed identity comparisons.
+    identity = {"binding_id": binding_id}
+    name = se.sha256_hex(se.canonical_json(identity)) + ".json"
+    return state_root / ".continuation-gates" / name
+
+
+def _validate_continuation_response(
+    value: Dict[str, Any], *, allow_null_goal: bool
+) -> Dict[str, Any]:
+    if set(value) != {"goalId", "status", "deferred"}:
+        raise DeliveryError(
+            "unsupported_response_shape",
+            "continuation response field set is not recognized",
+        )
+    goal_id = value["goalId"]
+    status = value["status"]
+    deferred = value["deferred"]
+    if not isinstance(deferred, bool):
+        raise DeliveryError(
+            "unsupported_response_shape", "continuation deferred is not boolean"
+        )
+    if goal_id is None or status is None:
+        if not allow_null_goal or goal_id is not None or status is not None or deferred:
+            raise DeliveryError(
+                "unsupported_response_shape",
+                "continuation response has an invalid empty-goal shape",
+            )
+        return value
+    if (
+        not isinstance(goal_id, str)
+        or not goal_id
+        or not isinstance(status, str)
+        or status not in _GOAL_STATUSES
+    ):
+        raise DeliveryError(
+            "unsupported_response_shape",
+            "continuation response has an invalid goal identity or status",
+        )
+    return value
+
+
+def _continuation_get(session: AppServerSession, thread_id: str) -> Dict[str, Any]:
+    return _validate_continuation_response(
+        session.request(
+            "thread/goal/continuation/get", {"threadId": thread_id}
+        ),
+        allow_null_goal=True,
+    )
+
+
+def _continuation_set(
+    session: AppServerSession, thread_id: str, expected_goal_id: str
+) -> Dict[str, Any]:
+    return _validate_continuation_response(
+        session.request(
+            "thread/goal/continuation/set",
+            {"threadId": thread_id, "expectedGoalId": expected_goal_id},
+        ),
+        allow_null_goal=False,
+    )
+
+
+def _continuation_clear(
+    session: AppServerSession, thread_id: str, expected_goal_id: str
+) -> Dict[str, Any]:
+    return _validate_continuation_response(
+        session.request(
+            "thread/goal/continuation/clear",
+            {"threadId": thread_id, "expectedGoalId": expected_goal_id},
+        ),
+        allow_null_goal=False,
+    )
+
+
+def _continuation_static_receipt(
+    config: Dict[str, Any],
+    binding: Dict[str, Any],
+    binding_id: str,
+    identity: Dict[str, Any],
+) -> Dict[str, Any]:
+    return {
+        "schema": CONTINUATION_GATE_RECEIPT_SCHEMA,
+        "binding_id": binding_id,
+        "binding_digest": _continuation_gate_binding_digest(binding),
+        "config_digest": _continuation_gate_config_digest(config),
+        "instance_id": config["instance_id"],
+        "codex_home_id": config["codex_home_id"],
+        "workspace_id": se.sha256_prefix(config["workspace"].encode()),
+        "thread_id": binding["thread_id"],
+        "executable": identity["executable"],
+        "executable_sha256": identity["executable_sha256"],
+        "codex_version": identity["codex_version"],
+    }
+
+
+def _read_continuation_receipt(
+    path: Path,
+    static: Dict[str, Any],
+    *,
+    required: bool,
+) -> Dict[str, Any] | None:
+    try:
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise se.SemanticEventError("continuation_receipt_not_regular")
+        if info.st_mode & 0o077:
+            raise se.SemanticEventError("continuation_receipt_permissions_too_open")
+        value = se.read_regular_json(path, MAX_CONTINUATION_GATE_RECEIPT_BYTES)
+    except FileNotFoundError:
+        if not required:
+            return None
+        raise se.SemanticEventError(
+            "continuation_receipt_missing", str(path)
+        )
+    expected = set(static) | {"goal_id", "state", "armed_at", "cleared_at"}
+    if set(value) != expected or value.get("schema") != CONTINUATION_GATE_RECEIPT_SCHEMA:
+        raise se.SemanticEventError("continuation_receipt_invalid")
+    for key, expected_value in static.items():
+        if value.get(key) != expected_value:
+            raise se.SemanticEventError(f"continuation_receipt_{key}_mismatch")
+    if (
+        not isinstance(value.get("goal_id"), str)
+        or not value["goal_id"]
+        or value.get("state") not in {"armed", "cleared"}
+        or se.parse_utc(value.get("armed_at")) is None
+        or (
+            value.get("cleared_at") is not None
+            and se.parse_utc(value.get("cleared_at")) is None
+        )
+        or (value.get("state") == "cleared") != (value.get("cleared_at") is not None)
+    ):
+        raise se.SemanticEventError("continuation_receipt_invalid")
+    return value
+
+
+def _write_continuation_receipt(path: Path, payload: Dict[str, Any]) -> None:
+    safe_path = _private_output_path(path)
+    se.atomic_replace_json(safe_path, payload)
+
+
+def _load_continuation_context(args: argparse.Namespace) -> tuple[
+    Dict[str, Any], Dict[str, Any], Dict[str, Any], Path, Dict[str, Any] | None
+]:
+    if not _BINDING_ID_RE.fullmatch(args.binding_id):
+        raise se.SemanticEventError("continuation_binding_id_invalid")
+    config = se.load_bridge_config(Path(args.bridge_config))
+    binding = se.load_event_binding(Path(args.event_binding))
+    if not config["enabled"]:
+        raise se.SemanticEventError("bridge_disabled")
+    checks = {
+        "codex_home_id": config["codex_home_id"],
+        "app_server_instance": config["instance_id"],
+        "workspace": config["workspace"],
+    }
+    for key, expected in checks.items():
+        if binding[key] != expected:
+            raise se.SemanticEventError(f"continuation_binding_{key}_mismatch")
+    identity = _configured_cli_identity(
+        config, timeout_seconds=float(args.timeout_seconds)
+    )
+    if not identity.get("probe_ok"):
+        raise se.SemanticEventError(str(identity["reason"]))
+    if identity["codex_version"] != "0.151.0":
+        raise se.SemanticEventError("continuation_codex_version_unsupported")
+    receipt_path = continuation_gate_receipt_path(
+        Path(args.state_dir), config, binding, args.binding_id
+    )
+    static = _continuation_static_receipt(config, binding, args.binding_id, identity)
+    receipt = _read_continuation_receipt(receipt_path, static, required=False)
+    return config, binding, identity, receipt_path, receipt
+
+
+def continuation_gate_command(args: argparse.Namespace) -> int:
+    """Control the custom 0.151 Goal continuation marker without a model turn."""
+    config: Dict[str, Any] | None = None
+    session: AppServerSession | None = None
+    try:
+        config, binding, identity, receipt_path, receipt = _load_continuation_context(args)
+        thread_id = binding["thread_id"]
+        session = AppServerSession(
+            list(identity["command"]),
+            float(config["request_timeout_seconds"]),
+            env=spawn_env(config),
+            private_paths=(str(config["workspace"]), str(receipt_path)),
+        )
+        session.initialize(experimental_api=True)
+        session.resume_thread(thread_id, config["workspace"])
+        before = _continuation_get(session, thread_id)
+        action = args.gate_action
+        if action == "get":
+            result = before
+        elif action == "arm":
+            goal_id = before["goalId"]
+            if goal_id is None or before["status"] != "active":
+                raise se.SemanticEventError("continuation_active_goal_required")
+            if receipt is not None and receipt["goal_id"] != goal_id:
+                raise se.SemanticEventError("continuation_goal_replaced")
+            armed = _continuation_set(session, thread_id, goal_id)
+            if armed != {"goalId": goal_id, "status": "active", "deferred": True}:
+                raise DeliveryError(
+                    "continuation_arm_not_verified",
+                    "set response did not confirm the expected active goal",
+                )
+            result = _continuation_get(session, thread_id)
+            if result != armed:
+                raise DeliveryError(
+                    "continuation_arm_readback_mismatch",
+                    "continuation get did not read back the armed marker",
+                )
+            armed_at = receipt["armed_at"] if receipt is not None else se.utc_now()
+            receipt = {
+                **_continuation_static_receipt(config, binding, args.binding_id, identity),
+                "goal_id": goal_id,
+                "state": "armed",
+                "armed_at": armed_at,
+                "cleared_at": None,
+            }
+            _write_continuation_receipt(receipt_path, receipt)
+        else:
+            if receipt is None:
+                raise se.SemanticEventError("continuation_receipt_missing")
+            expected_goal_id = args.expected_goal_id
+            if not expected_goal_id:
+                raise se.SemanticEventError("continuation_expected_goal_id_required")
+            if receipt["goal_id"] != expected_goal_id:
+                raise se.SemanticEventError("continuation_receipt_goal_mismatch")
+            if before["goalId"] != expected_goal_id:
+                raise se.SemanticEventError("continuation_goal_replaced")
+            cleared = _continuation_clear(session, thread_id, expected_goal_id)
+            if (
+                cleared["goalId"] != expected_goal_id
+                or cleared["status"] != before["status"]
+                or cleared["deferred"]
+            ):
+                raise DeliveryError(
+                    "continuation_clear_not_verified",
+                    "clear response did not confirm the expected goal",
+                )
+            result = _continuation_get(session, thread_id)
+            if result != cleared:
+                raise DeliveryError(
+                    "continuation_clear_readback_mismatch",
+                    "continuation get did not read back the cleared marker",
+                )
+            receipt = {
+                **receipt,
+                "state": "cleared",
+                "cleared_at": receipt.get("cleared_at") or se.utc_now(),
+            }
+            _write_continuation_receipt(receipt_path, receipt)
+        print(json.dumps({
+            "schema_version": f"{BRIDGE_PREFIX}.continuation-gate/v1",
+            "state": "ok",
+            "action": action,
+            "binding_id": args.binding_id,
+            "thread_id": thread_id,
+            "goal_id": result["goalId"],
+            "goal_status": result["status"],
+            "deferred": result["deferred"],
+            "receipt_state": receipt["state"] if receipt is not None else "missing",
+            "receipt": str(receipt_path),
+            "model_turn_created": False,
+        }, sort_keys=True))
+        return 0
+    except (DeliveryError, se.SemanticEventError, OSError) as exc:
+        private_paths = (
+            (str(config["codex_home"]), str(config["workspace"]))
+            if config is not None else ()
+        )
+        print(json.dumps({
+            "schema_version": f"{BRIDGE_PREFIX}.continuation-gate/v1",
+            "state": "failed",
+            "action": args.gate_action,
+            "reason": exc.code if isinstance(exc, DeliveryError)
+            else getattr(exc, "reason", type(exc).__name__),
+            "safe_message": redact_stderr_tail(str(exc), private_paths),
+            "model_turn_created": False,
+        }, sort_keys=True))
+        return 12
+    finally:
+        if session is not None:
+            session.close()
+
+
 def init_config_command(args: argparse.Namespace) -> int:
     codex_home = str(Path(args.codex_home).expanduser().resolve(strict=False))
     command = list(args.command)
@@ -1792,6 +2119,26 @@ def parser() -> argparse.ArgumentParser:
     lifecycle_smoke.add_argument("--timeout-seconds", type=positive_float, default=10.0)
     lifecycle_smoke.add_argument("--i-mean-it", action="store_true")
     lifecycle_smoke.set_defaults(func=lifecycle_smoke_command)
+
+    continuation_gate = sub.add_parser(
+        "continuation-gate",
+        help="control the experimental Goal idle-continuation wait gate",
+    )
+    continuation_actions = continuation_gate.add_subparsers(
+        dest="gate_action", required=True
+    )
+    for action in ("get", "arm", "clear"):
+        gate_action = continuation_actions.add_parser(action)
+        gate_action.add_argument("--state-dir", type=Path, required=True)
+        gate_action.add_argument("--bridge-config", type=Path, required=True)
+        gate_action.add_argument("--event-binding", type=Path, required=True)
+        gate_action.add_argument("--binding-id", required=True)
+        gate_action.add_argument(
+            "--timeout-seconds", type=positive_float, default=10.0
+        )
+        if action == "clear":
+            gate_action.add_argument("--expected-goal-id", required=True)
+        gate_action.set_defaults(func=continuation_gate_command)
 
     protocol_check = sub.add_parser(
         "protocol-check",
