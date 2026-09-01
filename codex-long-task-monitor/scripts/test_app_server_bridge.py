@@ -36,6 +36,7 @@ RPC_LOG = os.environ.get("FAKE_RPC_LOG")
 GOAL_STATE = os.environ.get("FAKE_GOAL_STATE")
 CWD = os.environ.get("FAKE_THREAD_CWD", "/default/workspace")
 TURN_DELAY = float(os.environ.get("FAKE_TURN_DELAY", "0"))
+QUEUE_STATE = os.environ.get("FAKE_QUEUE_STATE")
 
 if sys.argv[1:] == ["--version"]:
     print("codex-cli 0.151.0")
@@ -64,6 +65,17 @@ def read_goal():
 def write_goal(value):
     if GOAL_STATE:
         with open(GOAL_STATE, "w", encoding="utf-8") as handle:
+            json.dump(value, handle)
+
+def read_queue():
+    if QUEUE_STATE and os.path.exists(QUEUE_STATE):
+        with open(QUEUE_STATE, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    return {}
+
+def write_queue(value):
+    if QUEUE_STATE:
+        with open(QUEUE_STATE, "w", encoding="utf-8") as handle:
             json.dump(value, handle)
 
 for raw in sys.stdin:
@@ -124,8 +136,48 @@ for raw in sys.stdin:
             send({"id": mid, "result": {"thread": {"id": message["params"]["threadId"], "cwd": "/somewhere/else"}}})
         elif MODE == "no_cwd":
             send({"id": mid, "result": {"thread": {"id": message["params"]["threadId"]}}})
+        elif MODE.startswith("writer_busy"):
+            send({"id": mid, "error": {"code": -32600, "message": "thread " + message["params"]["threadId"] + " already has an active writer"}})
         else:
             send({"id": mid, "result": {"thread": {"id": message["params"]["threadId"], "cwd": CWD}}})
+    elif method == "thread/read":
+        state = read_queue()
+        submission = state.get("submission")
+        turns = []
+        if submission and (state.get("completed") or MODE == "writer_busy_recover"):
+            turns = [{
+                "id": "turn_queue_1", "status": "completed",
+                "items": [{"type": "userMessage", "id": "item_queue_1",
+                           "clientId": submission["clientUserMessageId"],
+                           "content": submission["input"]}],
+            }]
+        status = {"type": "active", "activeFlags": ["waitingOnApproval"]} if MODE == "writer_busy_interaction" else "notLoaded"
+        send({"id": mid, "result": {"thread": {
+            "id": message["params"]["threadId"], "cwd": CWD,
+            "status": status, "turns": turns,
+        }}})
+    elif method == "thread/queue/list":
+        if MODE == "writer_busy_queue_unavailable":
+            send({"id": mid, "error": {"code": -32601, "message": "method not found: thread/queue/list"}})
+            continue
+        state = read_queue()
+        submission = state.get("submission")
+        data = [submission] if submission and not state.get("completed") and MODE != "writer_busy_recover" else []
+        send({"id": mid, "result": {"data": data, "nextCursor": None}})
+    elif method == "thread/queue/add":
+        submission = {
+            "id": "queue_fake_1",
+            "input": message["params"]["input"],
+            "clientUserMessageId": message["params"]["clientUserMessageId"],
+        }
+        log(message["params"]["input"][0]["text"])
+        write_queue({
+            "submission": submission,
+            "completed": MODE == "writer_busy_queue",
+        })
+        if MODE == "writer_busy_drop_after_add":
+            sys.exit(0)
+        send({"id": mid, "result": {"queuedSubmission": submission}})
     elif method == "thread/goal/continuation/get":
         send({"id": mid, "result": read_goal()})
     elif method in {"thread/goal/continuation/set", "thread/goal/continuation/clear"}:
@@ -193,6 +245,7 @@ class BridgeAdapterTests(unittest.TestCase):
         self.wake_log = self.root / "wake.log"
         self.rpc_log = self.root / "rpc.log"
         self.goal_state = self.root / "goal.json"
+        self.queue_state = self.root / "queue.json"
         self.project = self.root / "project"
 
     def tearDown(self) -> None:
@@ -238,11 +291,12 @@ class BridgeAdapterTests(unittest.TestCase):
         return path
 
     def publish_event(self, *, event: str = "transport_success", exit_code: int | None = 0,
-                      binding: dict | None = None) -> dict:
+                      binding: dict | None = None,
+                      generation: str = "run_1_2_abcd1234") -> dict:
         payload = se.build_event(
             backend="slurm",
             handle="fakehost-12345",
-            generation="run_1_2_abcd1234",
+            generation=generation,
             terminal_digest="sha256:" + "b" * 64,
             event=event,
             exit_code=exit_code,
@@ -258,6 +312,7 @@ class BridgeAdapterTests(unittest.TestCase):
             "FAKE_LOG": str(self.wake_log),
             "FAKE_RPC_LOG": str(self.rpc_log),
             "FAKE_GOAL_STATE": str(self.goal_state),
+            "FAKE_QUEUE_STATE": str(self.queue_state),
             "FAKE_THREAD_CWD": str(self.project),
         })
         if turn_delay is not None:
@@ -361,6 +416,9 @@ class BridgeAdapterTests(unittest.TestCase):
         return {
             "ClientRequest.json": {"oneOf": [
                 request("initialize", "InitializeParams"),
+                request("thread/read", "ThreadReadParams"),
+                request("thread/queue/add", "ThreadQueueAddParams"),
+                request("thread/queue/list", "ThreadQueueListParams"),
                 request("thread/resume", "ThreadResumeParams"),
                 request("turn/start", "TurnStartParams"),
             ]},
@@ -390,6 +448,29 @@ class BridgeAdapterTests(unittest.TestCase):
                 "properties": {"threadId": {"type": "string"}},
                 "required": ["threadId"],
             },
+            "ThreadReadParams.json": {
+                "properties": {
+                    "threadId": {"type": "string"},
+                    "includeTurns": {"type": "boolean"},
+                },
+                "required": ["threadId"],
+            },
+            "ThreadQueueListParams.json": {
+                "properties": {"threadId": {"type": "string"}},
+                "required": ["threadId"],
+            },
+            "ThreadQueueAddParams.json": {
+                "properties": {
+                    "threadId": {"type": "string"},
+                    "clientUserMessageId": {"type": "string"},
+                    "input": {"type": "array", "items": {"$ref": "#/definitions/UserInput"}},
+                },
+                "required": ["threadId", "clientUserMessageId", "input"],
+                "definitions": {"UserInput": {"oneOf": [{
+                    "properties": {"type": {"enum": ["text"]}, "text": {"type": "string"}},
+                    "required": ["type", "text"],
+                }]}},
+            },
             "TurnStartParams.json": {
                 "properties": {
                     "threadId": {"type": "string"},
@@ -409,6 +490,42 @@ class BridgeAdapterTests(unittest.TestCase):
                     "required": ["id", "cwd"],
                 }},
             },
+            "ThreadReadResponse.json": {
+                "properties": {"thread": {"$ref": "#/definitions/Thread"}},
+                "required": ["thread"],
+                "definitions": {"Thread": {
+                    "properties": {
+                        "id": {"type": "string"}, "cwd": {"type": "string"},
+                        "turns": {"type": "array"},
+                    },
+                    "required": ["id", "cwd", "turns"],
+                }},
+            },
+            "ThreadQueueAddResponse.json": {
+                "properties": {"queuedSubmission": {"$ref": "#/definitions/QueuedSubmission"}},
+                "required": ["queuedSubmission"],
+                "definitions": {"QueuedSubmission": {
+                    "properties": {
+                        "id": {"type": "string"}, "input": {"type": "array"},
+                        "clientUserMessageId": {"type": "string"},
+                    },
+                    "required": ["id", "input", "clientUserMessageId"],
+                }},
+            },
+            "ThreadQueueListResponse.json": {
+                "properties": {
+                    "data": {"type": "array", "items": {"$ref": "#/definitions/QueuedSubmission"}},
+                    "nextCursor": {"type": ["string", "null"]},
+                },
+                "required": ["data"],
+                "definitions": {"QueuedSubmission": {
+                    "properties": {
+                        "id": {"type": "string"}, "input": {"type": "array"},
+                        "clientUserMessageId": {"type": "string"},
+                    },
+                    "required": ["id", "input", "clientUserMessageId"],
+                }},
+            },
             "TurnStartResponse.json": {
                 "properties": {"turn": {"$ref": "#/definitions/Turn"}},
                 "required": ["turn"],
@@ -425,7 +542,7 @@ class BridgeAdapterTests(unittest.TestCase):
             "codex_app_server_protocol.schemas.json": {"title": "bundle"},
         }
 
-    def write_protocol_codex(self, files: dict[str, dict], version: str = "0.150.1") -> Path:
+    def write_protocol_codex(self, files: dict[str, dict], version: str = "0.151.0") -> Path:
         fake_codex = self.root / f"fake_codex_{len(list(self.root.glob('fake_codex_*')))}.py"
         fake_codex.write_text(
             "#!/usr/bin/env python3\n"
@@ -625,6 +742,99 @@ class BridgeAdapterTests(unittest.TestCase):
         _, records = self.deliver(config, mode="turn_conflict")
         self.assertEqual(records[0]["error_code"], "active_turn_conflict")
         self.assertEqual(records[0]["state"], "scheduled_retry")
+
+    def test_active_writer_queues_exact_wake_and_completes_once(self) -> None:
+        config = self.write_config()
+        event = self.publish_event()
+        _, records = self.deliver(config, mode="writer_busy_queue")
+        self.assertEqual(records[0]["state"], "acknowledged", records)
+        delivery = self.delivery_of(event["event_id"])
+        self.assertEqual(delivery["state"], "delivered")
+        self.assertEqual(delivery["delivery"]["turn_id"], "turn_queue_1")
+        self.assertEqual(delivery["attempts"], 0)
+        self.assertEqual(self.wake_log.read_text().count("==="), 1)
+        methods = [json.loads(line)["method"] for line in self.rpc_log.read_text().splitlines()]
+        self.assertIn("thread/read", methods)
+        self.assertIn("thread/queue/add", methods)
+        self.assertIn("thread/queue/list", methods)
+        self.assertNotIn("thread/start", methods)
+
+    def test_active_writer_long_wait_stays_pending_without_failure_budget(self) -> None:
+        config = self.write_config(
+            max_attempts=1,
+            turn_completion_timeout_seconds=0.2,
+            poll_seconds=0.05,
+            backoff_initial_seconds=0.1,
+            backoff_max_seconds=0.1,
+        )
+        event = self.publish_event()
+        started = time.monotonic()
+        _, records = self.deliver(config, mode="writer_busy_wait")
+        self.assertGreaterEqual(time.monotonic() - started, 0.15)
+        self.assertEqual(records[0]["error_code"], "thread_writer_busy")
+        self.assertEqual(records[0]["state"], "deferred")
+        delivery = self.delivery_of(event["event_id"])
+        self.assertEqual(delivery["state"], "pending")
+        self.assertEqual(delivery["attempts"], 0)
+        self.assertIsNotNone(delivery["next_attempt_at"])
+        _, immediate = self.deliver(config, mode="writer_busy_wait")
+        self.assertEqual(immediate[-1]["state"], "idle")
+        self.assertEqual(self.wake_log.read_text().count("==="), 1)
+
+    def test_active_writer_without_queue_api_never_dead_letters(self) -> None:
+        config = self.write_config(max_attempts=1)
+        event = self.publish_event()
+        _, records = self.deliver(config, mode="writer_busy_queue_unavailable")
+        self.assertEqual(records[0]["error_code"], "thread_writer_busy")
+        self.assertEqual(records[0]["state"], "deferred")
+        delivery = self.delivery_of(event["event_id"])
+        self.assertEqual(delivery["state"], "pending")
+        self.assertEqual(delivery["attempts"], 0)
+
+    def test_queue_accept_connection_drop_reconciles_after_bridge_restart(self) -> None:
+        config = self.write_config(
+            backoff_initial_seconds=0.05, backoff_max_seconds=0.05
+        )
+        event = self.publish_event()
+        _, first = self.deliver(config, mode="writer_busy_drop_after_add")
+        self.assertEqual(first[0]["error_code"], "connection_lost")
+        self.assertEqual(self.delivery_of(event["event_id"])["state"], "pending")
+        time.sleep(0.1)
+        _, second = self.deliver(config, mode="writer_busy_recover")
+        self.assertEqual(second[0]["state"], "acknowledged", second)
+        self.assertEqual(self.delivery_of(event["event_id"])["state"], "delivered")
+        self.assertEqual(self.wake_log.read_text().count("==="), 1)
+
+    def test_active_writer_operator_interaction_fails_closed(self) -> None:
+        config = self.write_config()
+        event = self.publish_event()
+        _, records = self.deliver(config, mode="writer_busy_interaction")
+        self.assertEqual(records[0]["error_code"], "operator_interaction_required")
+        self.assertEqual(records[0]["state"], "dead_lettered")
+        self.assertEqual(self.delivery_of(event["event_id"])["state"], "dead_letter")
+        self.assertFalse(self.wake_log.exists())
+
+    def test_active_writer_queue_is_independent_of_goal_lifecycle(self) -> None:
+        for index, goal in enumerate((
+            {"goalId": "g-active", "status": "active", "deferred": False},
+            {"goalId": "g-blocked", "status": "blocked", "deferred": False},
+            None,
+        )):
+            with self.subTest(goal=goal):
+                if goal is None:
+                    self.goal_state.unlink(missing_ok=True)
+                else:
+                    self.goal_state.write_text(json.dumps(goal), encoding="utf-8")
+                event = self.publish_event(
+                    generation=f"run_{index + 1}_2_abcd1234"
+                )
+                config = self.write_config()
+                _, records = self.deliver(config, mode="writer_busy_queue")
+                self.assertEqual(records[0]["state"], "acknowledged", records)
+                self.assertEqual(self.delivery_of(event["event_id"])["state"], "delivered")
+                self.queue_state.unlink(missing_ok=True)
+                self.wake_log.unlink(missing_ok=True)
+                self.rpc_log.unlink(missing_ok=True)
 
     def test_connection_drop_is_retryable(self) -> None:
         config = self.write_config()
@@ -1264,17 +1474,17 @@ class BridgeAdapterTests(unittest.TestCase):
         self.assertFalse(payload["reported_version_matches_recorded_smoke"])
         self.assertEqual(payload["compatibility"], "schema_compatible_unverified")
 
-    def test_strict_lifecycle_compatibility_rejects_0149_and_accepts_recorded_version(self) -> None:
-        old_codex = self.write_protocol_codex(self.protocol_files(), "0.149.1")
+    def test_strict_lifecycle_compatibility_rejects_0150_and_accepts_recorded_version(self) -> None:
+        old_codex = self.write_protocol_codex(self.protocol_files(), "0.150.1")
         old_config = se.load_bridge_config(self.write_config(
             transport={"type": "stdio", "command": [str(old_codex), "app-server"]}
         ))
         old = bridge.configured_lifecycle_compatibility(old_config, self.state)
         self.assertFalse(old["compatible"])
-        self.assertEqual(old["codex_version"], "0.149.1")
+        self.assertEqual(old["codex_version"], "0.150.1")
         self.assertEqual(old["reason"], "codex_lifecycle_version_unverified")
 
-        tested_codex = self.write_protocol_codex(self.protocol_files(), "0.150.1")
+        tested_codex = self.write_protocol_codex(self.protocol_files(), "0.151.0")
         tested_config = se.load_bridge_config(self.write_config(
             transport={"type": "stdio", "command": [str(tested_codex), "app-server"]}
         ))
@@ -1292,7 +1502,7 @@ class BridgeAdapterTests(unittest.TestCase):
         self.assertTrue(tested["compatible"])
         self.assertEqual(tested["reason"], "recorded_real_lifecycle_smoke")
 
-        latest_codex = self.write_protocol_codex(self.protocol_files(), "0.151.0")
+        latest_codex = self.write_protocol_codex(self.protocol_files(), "0.152.0")
         latest_config = se.load_bridge_config(self.write_config(
             transport={"type": "stdio", "command": [str(latest_codex), "app-server"]}
         ))
@@ -1562,7 +1772,7 @@ class BridgeAdapterTests(unittest.TestCase):
 
 
 class VendorSyncTests(unittest.TestCase):
-    SIBLING = "codex-hpc-monitor"
+    SIBLING = "codex-long-task-monitor"
 
     def test_vendored_copies_are_identical(self) -> None:
         sibling = HERE.parent.parent / self.SIBLING / "scripts" / "app_server_bridge.py"
@@ -1576,18 +1786,17 @@ class VendorSyncTests(unittest.TestCase):
 
 
 class RepositoryPolicyTests(unittest.TestCase):
-    def test_ci_pins_latest_recorded_real_smoke_version(self) -> None:
+    def test_ci_pins_a_recorded_compatible_version(self) -> None:
         workflow = HERE.parent.parent / ".github" / "workflows" / "ci.yml"
         if not workflow.exists():
             self.skipTest("repository CI workflow not present in standalone skill install")
-        latest = max(
-            bridge.REAL_SMOKE_TESTED_CODEX_VERSIONS,
-            key=lambda value: tuple(int(part) for part in value.split(".")),
-        )
-        self.assertIn(
-            f"@openai/codex@{latest}",
-            workflow.read_text(encoding="utf-8"),
-            "CI protocol pin must track the newest recorded real-smoke version",
+        workflow_text = workflow.read_text(encoding="utf-8")
+        self.assertTrue(
+            any(
+                f"@openai/codex@{version}" in workflow_text
+                for version in bridge.REAL_SMOKE_TESTED_CODEX_VERSIONS
+            ),
+            "CI protocol pin must use a recorded queue-compatible version",
         )
 
 

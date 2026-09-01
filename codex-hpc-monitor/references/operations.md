@@ -17,24 +17,24 @@ python3 <skill-dir>/scripts/app_server_bridge.py protocol-check \
 The result distinguishes:
 
 - `schema_compatible_recorded_version`: generated schema is compatible and
-  the reported Codex version matches a version with a recorded real lifecycle
-  smoke. This is not binary provenance or an attestation;
+  the reported Codex version matches the repository's recorded transport and
+  queue compatibility set. This is not binary provenance or an attestation;
 - `schema_compatible_unverified`: required methods and schema files exist, but
   this exact version has not completed the repository's real smoke;
 - `incompatible` or `probe_failed`: do not enable automatic resume.
 
 `--require-auto-resume` additionally probes the executable frozen in the
 bridge config and fails before watcher launch unless it is a direct
-`codex app-server` command whose exact CLI version has a recorded real
-lifecycle smoke. The current recorded set is 0.150.1 and 0.151.0; 0.149.1 is
-explicitly untrusted after a real `connection_lost` output-closure failure.
+`codex app-server` command whose exact CLI version has the required durable
+queue contract and recorded compatibility evidence. The current recorded set
+is 0.151.0 and 0.152.0; 0.150.1 and older lack the active-writer queue baseline.
 Generated-schema compatibility alone never satisfies this strict gate. A
 successful local `app_server_bridge.py lifecycle-smoke --i-mean-it` receipt,
 bound to the absolute executable hash and full bridge configuration, is also
 required. Bare executable tokens, missing receipts, and binary/config drift
 fail closed.
 
-CI pins the latest recorded real-smoke version and runs an advisory scheduled
+CI pins a recorded compatible version and runs an advisory scheduled
 check against the newest published Codex CLI. Generated schemas are temporary
 and are not committed.
 

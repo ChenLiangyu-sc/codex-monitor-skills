@@ -9,9 +9,11 @@ and never becomes terminal authority.
 
 Protocol baseline (official Codex App Server interface): newline-delimited
 JSON-RPC 2.0 objects without the ``jsonrpc`` envelope field, over the stdio
-of the configured command. Only the stable ``initialize`` handshake,
-``thread/resume``, and ``turn/start`` methods are used. Responses are
-strictly validated; unrecognized shapes fail closed.
+of the configured command. Normal delivery uses ``thread/resume`` and
+``turn/start``. If the exact thread is owned by another long-lived App Server
+session, the experimental durable ``thread/queue/*`` API queues the same wake
+for that session and ``thread/read`` reconciles it after a bridge restart.
+Responses are strictly validated; unrecognized shapes fail closed.
 
 Delivery semantics are at-least-once: a crash between App Server acceptance
 and the local acknowledgement may redeliver one event, and the postflight
@@ -52,11 +54,14 @@ MAX_LIFECYCLE_SMOKE_BYTES = 16 * 1024
 CONTINUATION_GATE_RECEIPT_SCHEMA = "codex-monitor.continuation-gate-receipt/v1"
 MAX_CONTINUATION_GATE_RECEIPT_BYTES = 16 * 1024
 CLIENT_INFO = {"name": "codex-monitor-skills", "title": "monitor bridge", "version": "1"}
-REAL_SMOKE_TESTED_CODEX_VERSIONS = {"0.150.1", "0.151.0"}
+REAL_SMOKE_TESTED_CODEX_VERSIONS = {"0.151.0", "0.152.0"}
 CODEX_VERSION_RE = re.compile(r"(?:codex-cli\s+)?(\d+\.\d+\.\d+)")
 REQUIRED_PROTOCOL_METHODS = {
     "initialize",
     "initialized",
+    "thread/read",
+    "thread/queue/add",
+    "thread/queue/list",
     "thread/resume",
     "turn/start",
     "turn/completed",
@@ -327,6 +332,219 @@ class AppServerSession:
                 "thread cwd does not match the bound workspace",
             )
 
+    @staticmethod
+    def _input_is_exact_text(value: object, expected_text: str) -> bool:
+        return (
+            isinstance(value, list)
+            and len(value) == 1
+            and isinstance(value[0], dict)
+            and value[0].get("type") == "text"
+            and value[0].get("text") == expected_text
+        )
+
+    def read_thread(self, thread_id: str, expected_workspace: str) -> Dict[str, Any]:
+        result = self.request(
+            "thread/read", {"threadId": thread_id, "includeTurns": True}
+        )
+        thread = result.get("thread")
+        if (
+            not isinstance(thread, dict)
+            or thread.get("id") != thread_id
+            or not isinstance(thread.get("turns"), list)
+        ):
+            raise DeliveryError(
+                "unsupported_response_shape",
+                "thread/read returned a different or malformed thread",
+            )
+        cwd = thread.get("cwd")
+        if not isinstance(cwd, str) or cwd != expected_workspace:
+            raise DeliveryError(
+                "binding_mismatch",
+                "thread/read cwd does not match the bound workspace",
+            )
+        return thread
+
+    @staticmethod
+    def _operator_interaction_pending(thread: Dict[str, Any]) -> bool:
+        status = thread.get("status")
+        if not isinstance(status, dict) or status.get("type") != "active":
+            return False
+        flags = status.get("activeFlags")
+        return isinstance(flags, list) and any(
+            flag in {"waitingOnApproval", "waitingOnUserInput"} for flag in flags
+        )
+
+    @classmethod
+    def _persisted_wake_turn(
+        cls, thread: Dict[str, Any], client_id: str, wake_text: str
+    ) -> tuple[str, str] | None:
+        matches: list[tuple[str, str]] = []
+        for turn in thread.get("turns", []):
+            if not isinstance(turn, dict):
+                raise DeliveryError(
+                    "unsupported_response_shape", "thread/read carried a malformed turn"
+                )
+            turn_id = turn.get("id")
+            status = turn.get("status")
+            items = turn.get("items")
+            if (
+                not isinstance(turn_id, str)
+                or not isinstance(status, str)
+                or not isinstance(items, list)
+            ):
+                raise DeliveryError(
+                    "unsupported_response_shape", "thread/read carried a malformed turn"
+                )
+            for item in items:
+                if not isinstance(item, dict) or item.get("type") != "userMessage":
+                    continue
+                # Older persisted rollouts may omit clientId. The wake text
+                # embeds the immutable event id/digest and is therefore also
+                # an exact reconciliation key.
+                item_client_id = item.get("clientId")
+                if item_client_id == client_id or (
+                    item_client_id is None
+                    and cls._input_is_exact_text(item.get("content"), wake_text)
+                ):
+                    if not cls._input_is_exact_text(item.get("content"), wake_text):
+                        raise DeliveryError(
+                            "binding_mismatch",
+                            "persisted client message id has different wake content",
+                        )
+                    matches.append((turn_id, status))
+                    break
+        if not matches:
+            return None
+        for preferred in ("completed", "inProgress", "failed", "interrupted"):
+            for match in matches:
+                if match[1] == preferred:
+                    return match
+        raise DeliveryError(
+            "unsupported_response_shape", "persisted wake turn has unknown status"
+        )
+
+    def queued_wake(
+        self, thread_id: str, client_id: str, wake_text: str
+    ) -> Dict[str, Any] | None:
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        matches: list[Dict[str, Any]] = []
+        for _page in range(100):
+            params: Dict[str, Any] = {"threadId": thread_id, "limit": 100}
+            if cursor is not None:
+                params["cursor"] = cursor
+            result = self.request("thread/queue/list", params)
+            data = result.get("data")
+            next_cursor = result.get("nextCursor")
+            if not isinstance(data, list) or not (
+                next_cursor is None or isinstance(next_cursor, str)
+            ):
+                raise DeliveryError(
+                    "unsupported_response_shape", "thread/queue/list result is malformed"
+                )
+            for submission in data:
+                if (
+                    not isinstance(submission, dict)
+                    or not isinstance(submission.get("id"), str)
+                    or not isinstance(submission.get("clientUserMessageId"), str)
+                    or not isinstance(submission.get("input"), list)
+                ):
+                    raise DeliveryError(
+                        "unsupported_response_shape",
+                        "thread/queue/list carried a malformed submission",
+                    )
+                if submission.get("clientUserMessageId") != client_id:
+                    continue
+                if not self._input_is_exact_text(submission.get("input"), wake_text):
+                    raise DeliveryError(
+                        "binding_mismatch",
+                        "queued client message id has different or malformed wake content",
+                    )
+                matches.append(submission)
+            if next_cursor is None:
+                break
+            if not next_cursor or next_cursor in seen_cursors:
+                raise DeliveryError(
+                    "unsupported_response_shape", "thread/queue/list cursor did not advance"
+                )
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+        else:
+            raise DeliveryError(
+                "unsupported_response_shape", "thread/queue/list exceeded pagination bound"
+            )
+        if len(matches) > 1:
+            raise DeliveryError(
+                "unsupported_response_shape",
+                "multiple queued submissions share the event identity",
+            )
+        return matches[0] if matches else None
+
+    def enqueue_wake(
+        self, thread_id: str, client_id: str, wake_text: str
+    ) -> Dict[str, Any]:
+        result = self.request(
+            "thread/queue/add",
+            {
+                "threadId": thread_id,
+                "input": [{"type": "text", "text": wake_text}],
+                "clientUserMessageId": client_id,
+            },
+        )
+        queued = result.get("queuedSubmission")
+        if (
+            not isinstance(queued, dict)
+            or not isinstance(queued.get("id"), str)
+            or queued.get("clientUserMessageId") != client_id
+            or not self._input_is_exact_text(queued.get("input"), wake_text)
+        ):
+            raise DeliveryError(
+                "unsupported_response_shape", "thread/queue/add result is malformed"
+            )
+        return queued
+
+    def deliver_queued_wake(
+        self,
+        thread_id: str,
+        expected_workspace: str,
+        event_id: str,
+        wake_text: str,
+        timeout_seconds: float,
+        poll_seconds: float,
+        on_tick: Callable[[], None],
+    ) -> tuple[str, str]:
+        """Reconcile or queue one durable wake for a foreign active writer."""
+        client_id = "codex-monitor-" + event_id.removeprefix("sha256:")
+        deadline = time.monotonic() + timeout_seconds
+        enqueued_here = False
+        while True:
+            on_tick()
+            thread = self.read_thread(thread_id, expected_workspace)
+            persisted = self._persisted_wake_turn(thread, client_id, wake_text)
+            if persisted is not None:
+                turn_id, status = persisted
+                if status == "completed":
+                    return turn_id, status
+                if status == "failed":
+                    raise DeliveryError("turn_failed", "queued wake turn failed")
+                if status == "interrupted":
+                    raise DeliveryError("turn_aborted", "queued wake turn was interrupted")
+            queued = self.queued_wake(thread_id, client_id, wake_text)
+            if self._operator_interaction_pending(thread):
+                raise DeliveryError(
+                    "operator_interaction_required",
+                    "active thread is waiting on approval or user input",
+                )
+            if persisted is None and queued is None and not enqueued_here:
+                self.enqueue_wake(thread_id, client_id, wake_text)
+                enqueued_here = True
+            if time.monotonic() >= deadline:
+                raise DeliveryError(
+                    "thread_writer_busy",
+                    "wake remains queued behind the active thread writer",
+                )
+            time.sleep(min(5.0, max(0.05, poll_seconds)))
+
     def start_turn(self, thread_id: str, wake_text: str) -> str:
         result = self.request(
             "turn/start",
@@ -497,12 +715,16 @@ def _classify_server_error(
     text = str(detail).lower()
     if code == -32001:
         return DeliveryError("overloaded", "app server reports overload (-32001)")
+    if code == -32601 or "method not found" in text or "unknown method" in text:
+        return DeliveryError("server_error", f"{method} is unavailable: {detail}")
     if "archiv" in text:
         return DeliveryError("thread_archived", str(detail))
     if "not found" in text or "no such" in text or "missing" in text or "unknown thread" in text:
         return DeliveryError("thread_missing", str(detail))
     if "mcp" in text:
         return DeliveryError("required_mcp_failure", str(detail))
+    if "already has an active writer" in text:
+        return DeliveryError("thread_writer_busy", str(detail))
     if "active turn" in text or "already running" in text:
         return DeliveryError("active_turn_conflict", str(detail))
     return DeliveryError("server_error", f"{method} failed: {detail}")
@@ -619,10 +841,42 @@ def attempt_delivery(
 
     try:
         stage = "initialize"
-        session.initialize()
+        session.initialize(experimental_api=True)
         renew()
         stage = "thread_resume"
-        session.resume_thread(binding["thread_id"], binding["workspace"])
+        try:
+            session.resume_thread(binding["thread_id"], binding["workspace"])
+        except DeliveryError as exc:
+            if exc.code != "thread_writer_busy":
+                raise
+            # A foreground App Server can own the writer for its entire
+            # session, not merely for the current turn. Queue the immutable
+            # wake for that exact session instead of fighting the writer.
+            stage = "thread_queue"
+            try:
+                turn_id, turn_status = session.deliver_queued_wake(
+                    binding["thread_id"],
+                    binding["workspace"],
+                    event["event_id"],
+                    wake_text,
+                    float(config["turn_completion_timeout_seconds"]),
+                    float(config["poll_seconds"]),
+                    renew,
+                )
+            except DeliveryError as queue_exc:
+                unavailable = queue_exc.message.lower()
+                if queue_exc.code == "server_error" and any(
+                    marker in unavailable
+                    for marker in ("method not found", "unknown method", "is unavailable")
+                ):
+                    raise DeliveryError(
+                        "thread_writer_busy",
+                        "active writer requires a durable queue API that this "
+                        "App Server does not expose",
+                    ) from queue_exc
+                raise
+            renew()
+            return turn_id, turn_status, wake_text
         renew()
         stage = "turn_start"
         turn_id = session.start_turn(binding["thread_id"], wake_text)
@@ -806,6 +1060,29 @@ def deliver_loop(args: argparse.Namespace) -> int:
                 # Another owner already controls the event. The stale owner
                 # must stop without mutating delivery state.
                 outcome = "lease_lost"
+            elif exc.code == "thread_writer_busy":
+                outcome = se.defer_event(
+                    outbox,
+                    event["event_id"],
+                    owner=owner,
+                    code=exc.code,
+                    safe_message=redact_stderr_tail(
+                        exc.message,
+                        (str(config["codex_home"]), str(config["workspace"])),
+                    ),
+                    stage=exc.stage,
+                    now=utc_now(),
+                    delay_seconds=max(
+                        0.05,
+                        min(
+                            float(config["backoff_max_seconds"]),
+                            max(
+                                float(config["poll_seconds"]),
+                                float(config["backoff_initial_seconds"]),
+                            ),
+                        ),
+                    ),
+                )
             else:
                 outcome = se.record_delivery_failure(
                     outbox,
@@ -1050,6 +1327,9 @@ def _protocol_contract_failures(root: Path) -> list[str]:
     client_requests = _schema_candidates(root, "ClientRequest.json")
     for method, params_ref in (
         ("initialize", "InitializeParams"),
+        ("thread/read", "ThreadReadParams"),
+        ("thread/queue/add", "ThreadQueueAddParams"),
+        ("thread/queue/list", "ThreadQueueListParams"),
         ("thread/resume", "ThreadResumeParams"),
         ("turn/start", "TurnStartParams"),
     ):
@@ -1108,6 +1388,24 @@ def _protocol_contract_failures(root: Path) -> list[str]:
     ):
         failures.append("thread_resume_params:threadId")
 
+    read_params = _schema_candidates(root, "ThreadReadParams.json")
+    if not any(
+        _required_fields(schema, "threadId")
+        and isinstance(schema["properties"]["threadId"], dict)
+        and schema["properties"]["threadId"].get("type") == "string"
+        for schema in read_params
+    ):
+        failures.append("thread_read_params:threadId")
+
+    queue_list_params = _schema_candidates(root, "ThreadQueueListParams.json")
+    if not any(
+        _required_fields(schema, "threadId")
+        and isinstance(schema["properties"]["threadId"], dict)
+        and schema["properties"]["threadId"].get("type") == "string"
+        for schema in queue_list_params
+    ):
+        failures.append("thread_queue_list_params:threadId")
+
     start_params = _schema_candidates(root, "TurnStartParams.json")
     valid_start_params = False
     for schema in start_params:
@@ -1147,6 +1445,35 @@ def _protocol_contract_failures(root: Path) -> list[str]:
     if not valid_start_params:
         failures.append("turn_start_params:threadId,input[text]")
 
+    queue_add_params = _schema_candidates(root, "ThreadQueueAddParams.json")
+    valid_queue_add = False
+    for schema in queue_add_params:
+        if not _required_fields(schema, "threadId", "input", "clientUserMessageId"):
+            continue
+        properties = schema["properties"]
+        definitions = schema.get("definitions")
+        user_input = definitions.get("UserInput", {}) if isinstance(definitions, dict) else {}
+        input_schema = properties.get("input")
+        text_variant = any(
+            isinstance(item, dict)
+            and _required_fields(item, "type", "text")
+            and item["properties"]["type"].get("enum") == ["text"]
+            for item in user_input.get("oneOf", [])
+            if isinstance(user_input, dict)
+        )
+        if (
+            properties.get("threadId", {}).get("type") == "string"
+            and properties.get("clientUserMessageId", {}).get("type") == "string"
+            and isinstance(input_schema, dict)
+            and input_schema.get("type") == "array"
+            and input_schema.get("items", {}).get("$ref") == "#/definitions/UserInput"
+            and text_variant
+        ):
+            valid_queue_add = True
+            break
+    if not valid_queue_add:
+        failures.append("thread_queue_add_params:threadId,clientUserMessageId,input[text]")
+
     resume_responses = _schema_candidates(root, "ThreadResumeResponse.json")
     if not any(
         _required_fields(schema, "thread")
@@ -1155,6 +1482,39 @@ def _protocol_contract_failures(root: Path) -> list[str]:
         for schema in resume_responses
     ):
         failures.append("thread_resume_response:thread.id,cwd")
+
+    read_responses = _schema_candidates(root, "ThreadReadResponse.json")
+    if not any(
+        _required_fields(schema, "thread")
+        and _property_refs_definition(schema, "thread", "Thread")
+        and _definition_has_fields(schema, "Thread", "id", "cwd", "turns")
+        for schema in read_responses
+    ):
+        failures.append("thread_read_response:thread.id,cwd,turns")
+
+    queue_add_responses = _schema_candidates(root, "ThreadQueueAddResponse.json")
+    if not any(
+        _required_fields(schema, "queuedSubmission")
+        and _property_refs_definition(schema, "queuedSubmission", "QueuedSubmission")
+        and _definition_has_fields(
+            schema, "QueuedSubmission", "id", "input", "clientUserMessageId"
+        )
+        for schema in queue_add_responses
+    ):
+        failures.append("thread_queue_add_response:queuedSubmission")
+
+    queue_list_responses = _schema_candidates(root, "ThreadQueueListResponse.json")
+    if not any(
+        _required_fields(schema, "data")
+        and _definition_has_fields(
+            schema, "QueuedSubmission", "id", "input", "clientUserMessageId"
+        )
+        and schema.get("properties", {}).get("data", {}).get("type") == "array"
+        and schema.get("properties", {}).get("data", {}).get("items", {}).get("$ref")
+        == "#/definitions/QueuedSubmission"
+        for schema in queue_list_responses
+    ):
+        failures.append("thread_queue_list_response:data[queuedSubmission]")
 
     start_responses = _schema_candidates(root, "TurnStartResponse.json")
     if not any(
@@ -1250,7 +1610,10 @@ def protocol_check_command(args: argparse.Namespace) -> int:
             json.loads(schema_path.read_text(encoding="utf-8"))
             required_files = {
                 "ClientRequest.json", "ServerNotification.json", "ServerRequest.json",
-                "InitializeResponse.json", "ThreadResumeResponse.json",
+                "InitializeResponse.json", "ThreadReadParams.json",
+                "ThreadReadResponse.json", "ThreadQueueAddParams.json",
+                "ThreadQueueAddResponse.json", "ThreadQueueListParams.json",
+                "ThreadQueueListResponse.json", "ThreadResumeResponse.json",
                 "TurnStartResponse.json", "TurnCompletedNotification.json",
             }
             missing_files = sorted(
@@ -1915,7 +2278,7 @@ def lifecycle_smoke_command(args: argparse.Namespace) -> int:
                 private_paths=(str(config["workspace"]),),
             )
             stage = "initialize"
-            session.initialize()
+            session.initialize(experimental_api=True)
             stage = "thread_start"
             started = session.request(
                 "thread/start",
@@ -1956,9 +2319,18 @@ def lifecycle_smoke_command(args: argparse.Namespace) -> int:
                 private_paths=(str(config["workspace"]),),
             )
             stage = "reinitialize"
-            session.initialize()
+            session.initialize(experimental_api=True)
             stage = "thread_resume"
             session.resume_thread(thread_id, config["workspace"])
+            stage = "thread_queue_probe"
+            queue_probe = session.request(
+                "thread/queue/list", {"threadId": thread_id, "limit": 1}
+            )
+            if not isinstance(queue_probe.get("data"), list):
+                raise DeliveryError(
+                    "unsupported_response_shape",
+                    "thread/queue/list lifecycle probe returned malformed data",
+                )
             stage = "second_turn"
             second_turn_id = session.start_turn(
                 thread_id,

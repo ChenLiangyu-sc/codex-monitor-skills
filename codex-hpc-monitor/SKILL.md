@@ -128,7 +128,8 @@ wake; it checks binding/config/activation readiness and requires the configured
 direct Codex CLI version to have a recorded real App Server lifecycle smoke
 plus a matching local `lifecycle-smoke --i-mean-it` receipt bound to the
 absolute executable hash and full config. It does not prove daemon liveness.
-Treat 0.149.1 as incompatible; 0.150.1 and 0.151.0 are currently recorded.
+Treat 0.150.1 and older as incompatible with active-writer delivery; 0.151.0
+and 0.152.0 are currently recorded with the required durable queue contract.
 
 Goal Guardrails 0.7 proposals freeze one `--bridge-service-name`. The monitor
 validates that token and records it in the immutable manifest and monitoring

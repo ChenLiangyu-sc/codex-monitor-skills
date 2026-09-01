@@ -719,7 +719,7 @@ class SupervisorTest(unittest.TestCase):
         path.chmod(0o600)
         return path
 
-    def write_fake_codex(self, version: str = "0.150.1") -> Path:
+    def write_fake_codex(self, version: str = "0.151.0") -> Path:
         path = self.root / f"codex-{version}"
         path.write_text(
             "#!/usr/bin/env python3\n"
@@ -731,7 +731,7 @@ class SupervisorTest(unittest.TestCase):
         return path
 
     def write_bridge_config(
-        self, instance: str = "workstation-1", codex_version: str = "0.150.1"
+        self, instance: str = "workstation-1", codex_version: str = "0.151.0"
     ) -> Path:
         codex_bin = self.write_fake_codex(codex_version)
         config = {

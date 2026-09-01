@@ -1001,6 +1001,56 @@ def record_delivery_failure(
     return outcome
 
 
+def defer_event(
+    outbox: Path,
+    event_id: str,
+    *,
+    owner: str,
+    code: str,
+    safe_message: str,
+    stage: Optional[str],
+    now: datetime,
+    delay_seconds: float,
+) -> str:
+    """Release a busy-writer delivery without consuming its failure budget.
+
+    A thread writer may belong to a healthy foreground session for hours.
+    Treating that ownership as an ordinary failed delivery would eventually
+    dead-letter a durable event even though nothing is wrong with the event or
+    transport. This transition preserves ``attempts`` and only schedules the
+    next bounded reconciliation attempt.
+    """
+    if code != "thread_writer_busy":
+        raise SemanticEventError("defer_code_invalid")
+    if stage is not None and not isinstance(stage, str):
+        raise SemanticEventError("failure_stage_invalid")
+    if (
+        isinstance(delay_seconds, bool)
+        or not isinstance(delay_seconds, (int, float))
+        or delay_seconds <= 0
+        or delay_seconds > 86400
+    ):
+        raise SemanticEventError("defer_delay_invalid")
+    with _OutboxLock(outbox):
+        dir_path, delivery = _load_for_mutation(outbox, event_id, owner)
+        if delivery["state"] == "delivered":
+            return "already_delivered"
+        delivery["last_error"] = {
+            "code": code,
+            "safe_message": sanitize_safe_message(safe_message),
+            "stage": sanitize_safe_message(stage)[:64] if stage is not None else None,
+            "app_server_exit_code": None,
+            "stderr_tail": None,
+        }
+        delivery["state"] = "pending"
+        delivery["lease"] = {"owner": None, "expires_at": None}
+        delivery["next_attempt_at"] = (
+            now + timedelta(seconds=float(delay_seconds))
+        ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        _write_delivery(dir_path, delivery)
+    return "deferred"
+
+
 def release_event(outbox: Path, event_id: str, *, owner: str) -> str:
     """Release a held lease without counting a failure (daemon shutdown)."""
     with _OutboxLock(outbox):

@@ -38,7 +38,9 @@ durable outbox             (atomic, local filesystem, at-least-once)
 optional delivery daemon   (foreground, or explicit user service)
       |
 thread/resume -> turn/start -> wait turn/completed
-      |                        (session held open; lease renewed throughout)
+      | active writer
+      +-> thread/read + durable thread/queue/add/list
+                          (foreground session starts the queued turn when idle)
       |
 idempotent postflight     (postflight_guard.py begin/complete claim)
 ```
@@ -142,9 +144,9 @@ python3 <skill-dir>/scripts/supervise_slurm_job.py start <job-id> --host <login-
 The strict flag verifies the binding/config identity, enabled config, and
 durable activation receipt before launch. It also probes the configured direct
 `codex app-server` executable and accepts only an exact version with a recorded
-real initialize/resume/start/completed smoke. Codex CLI 0.149.1 is known to
-close its output in a real deployment and is rejected; 0.150.1 and 0.151.0
-are currently recorded. The matching local lifecycle-smoke receipt is also
+real initialize/resume/start/completed smoke plus the durable queue contract.
+Codex CLI 0.150.1 lacks the required queue API and is rejected; 0.151.0 and
+0.152.0 are currently recorded. The matching local lifecycle-smoke receipt is also
 required. Commands not shaped as `<absolute-executable> app-server`, unknown
 reported versions, missing receipts, and executable/config hash drift fail
 strict preflight. The receipt is local evidence, not a cryptographic remote
@@ -258,7 +260,13 @@ One delivery attempt is one App Server session:
    returned `thread.cwd` must match the bound thread and workspace
    (missing or wrong `cwd` dead-letters as `binding_mismatch`); a
    different thread is never created;
-4. `turn/start` with the fixed wake text;
+4. normally, `turn/start` with the fixed wake text. If resume reports that
+   the exact thread already has an active writer, re-read the thread and
+   workspace, reconcile the event's stable client id and exact wake text
+   against persisted turns and `thread/queue/list`, and add it once with
+   `thread/queue/add` only when neither exists. The owning foreground App
+   Server observes the durable queue and starts it after its current turn is
+   idle; the bridge never steals or terminates that writer;
 5. **keep the session open and read notifications until the turn reaches
    `turn/completed`** (bounded by `turn_completion_timeout_seconds`) —
    closing after `turn/start` would abort the wake turn mid-postflight;
@@ -350,6 +358,7 @@ race with `complete` and reopen an already-recorded side effect.
 | Request timeout | retry (`request_timeout`) | maybe duplicated |
 | Required MCP startup failure | retry (`required_mcp_failure`) | later |
 | App Server requests command/file/permission/MCP/user-input approval | dead-letter (`operator_interaction_required`); never answers or auto-approves | possibly started, never acknowledged |
+| Thread has a long-lived active writer | reconcile/add through durable thread queue; bounded polling, then `deferred` as `thread_writer_busy` | once the owning session becomes idle |
 | Active-turn conflict | retry (`active_turn_conflict`) | later |
 | `turn/completed` reports `failed` / `interrupted` | retry (`turn_failed`/`turn_aborted`) | possibly duplicated; claim keeps effects single |
 | Completion misses the target turn id | ignored until valid completion or timeout | no acknowledgement |
@@ -361,8 +370,11 @@ race with `complete` and reopen an already-recorded side effect.
 | Unexpected response shape | dead-letter (`unsupported_response_shape`) | no |
 | Wrong workspace/instance/CODEX_HOME binding | never claimed by this daemon | no |
 
-Retries use exponential backoff with jitter and dead-letter after
-`max_attempts`. Inspect with `app_server_bridge.py status` or
+Ordinary retries use exponential backoff with jitter and dead-letter after
+`max_attempts`. `thread_writer_busy` is deliberately different: it remains
+pending, does not increment `attempts`, and uses a bounded delay, so a healthy
+foreground session cannot exhaust the failure budget. Queue and persisted-turn
+reconciliation survives bridge restarts. Inspect with `app_server_bridge.py status` or
 `monitor_events.py timeline`. Each failure stores a bounded
 `last_error.stage`, nullable `last_error.app_server_exit_code`, and a
 secret/path-redacted 2,048-character `last_error.stderr_tail`. These fields distinguish
@@ -389,9 +401,10 @@ entries are ignored.
   group/world-readable ones are rejected.
 - Events contain only enums, opaque handles, and digests — never raw logs,
   prompts, responses, artifact contents, credentials, or callback text.
-- Only the stable `initialize`, `thread/resume`, and `turn/start` methods
-  plus turn notifications over stdio are used; no shell/process methods,
-  no experimental WebSocket, no TCP.
+- Delivery uses `initialize`, `thread/resume`, `turn/start`, `thread/read`,
+  and the experimental durable `thread/queue/add` and `thread/queue/list`
+  methods plus turn notifications over stdio; no shell/process methods, no
+  experimental WebSocket, no TCP.
 - No tokens on command lines; `codex_home_id` is a non-secret digest of the
   CODEX_HOME path.
 - Outbox and state directories are `0700`, files `0600`, symlinks rejected,

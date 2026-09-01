@@ -63,8 +63,11 @@ delivery daemon you run separately resumes the exact bound Codex thread,
 starts one wake turn, holds the session open until `turn/completed`, and
 acknowledges only when that notification belongs to the started turn and
 has `status=completed`. Failed, interrupted, missing-id, or malformed
-completion events never acknowledge delivery. It uses only the stable `initialize`,
-`thread/resume`, and `turn/start` App Server methods over stdio, pins
+completion events never acknowledge delivery. If a foreground App Server owns
+the writer, the daemon reconciles the event against `thread/read` and the
+durable `thread/queue/*` API so that owning session starts the fixed wake after
+it becomes idle. It uses `initialize`, `thread/resume`, `turn/start`,
+`thread/read`, and the experimental durable queue methods over stdio, pins
 `CODEX_HOME`, and requires the resumed thread's `cwd` to match the bound
 workspace. Delivery is at-least-once (no network-level exactly-once is
 claimed) with leases renewed throughout delivery, exponential backoff,
@@ -97,8 +100,8 @@ are all present **and** the configured direct `codex app-server` executable
 reports an exact CLI version with a recorded real lifecycle smoke. It also
 requires a local `lifecycle-smoke` receipt bound to the exact absolute
 executable hash, full bridge config, Codex home, and workspace. Codex CLI
-0.149.1 is deliberately rejected after a real output-closure failure;
-0.150.1 and 0.151.0 are currently recorded. This preflight does not claim
+0.150.1 is rejected because it lacks the required durable queue API; 0.151.0
+and 0.152.0 are currently recorded. This preflight does not claim
 that the delivery daemon is currently alive.
 
 `codex-hpc-monitor start` also accepts Goal Guardrails 0.7's frozen
@@ -187,7 +190,8 @@ canonical form; the internal event contract remains prefix-strict.
 Before strict auto-resume can be enabled, run the explicit
 `lifecycle-smoke --i-mean-it` command while the configured Codex account is
 available. It creates an isolated test thread, completes one read-only/no-
-approval turn, reconnects, resumes that thread, and completes a second turn.
+approval turn, reconnects, resumes that thread, verifies the durable queue
+surface, and completes a second turn.
 Only then is a private receipt written. Replacing the executable or changing
 any bridge-config field invalidates the receipt; legacy configs with a bare
 `codex` executable must be regenerated so PATH drift cannot validate a
@@ -215,8 +219,9 @@ The current compatibility evidence is intentionally layered:
 | Codex CLI | Schema/protocol fixture | Deterministic fake lifecycle | Recorded real transport | Strict local start |
 | --- | --- | --- | --- | --- |
 | 0.149.1 | compatible fixture | passed | failed in deployment (`connection_lost`) | rejected |
-| 0.150.1 | compatible | passed | passed 2026-08-29 | requires matching local receipt |
+| 0.150.1 | legacy direct-delivery schema | passed | no durable thread queue | rejected |
 | 0.151.0 | compatible | passed | passed 2026-08-31 | requires matching local receipt |
+| 0.152.0 | compatible including queue | passed | schema and live cross-session queue/list probed 2026-09-01 | requires matching local receipt |
 | any unrecorded version | run `protocol-check` | version-independent client tests only | unverified | rejected |
 
 The fake lifecycle column validates this repository's client state machine;
@@ -421,7 +426,7 @@ real-smoke Codex version, and runs a non-blocking scheduled advisory check
 against the latest Codex CLI.
 
 Current operations-hardening baseline after independent review:
-**516 tests passing** (276 HPC monitor tests and 240 long-task monitor tests),
+**538 tests passing** (287 HPC monitor tests and 251 long-task monitor tests),
 including the outbox, App Server fake, postflight claim, doctor,
 protocol contract check, approval-request fail-closed behavior, service
 definition lifecycle, independent notification receipts, event timeline,
@@ -434,9 +439,11 @@ idempotent postflight claim) but **not** a real Codex App Server or a real
 model turn. No credentials or network access are required. Opt-in live
 lifecycle smokes were run successfully with Codex CLI 0.150.1 on 2026-08-29
 and 0.151.0 on 2026-08-31 (real initialize, thread start/resume across a new
-connection, wake turns, and strict `turn/completed`); they are not part of
-default CI and do not by themselves prove the woken model performed a
-business postflight correctly.
+connection, wake turns, and strict `turn/completed`). Codex 0.152.0's
+generated queue contract and cross-session `thread/queue/list` were probed on
+2026-09-01; an exact local lifecycle receipt is still mandatory. These live
+checks are not part of default CI and do not by themselves prove the woken
+model performed a business postflight correctly.
 
 ## Contributing
 

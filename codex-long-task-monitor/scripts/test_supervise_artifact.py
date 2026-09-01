@@ -687,7 +687,7 @@ class ArtifactSupervisorTests(unittest.TestCase):
             return result, result.stdout
         return result, json.loads(result.stdout)
 
-    def write_fake_codex(self, version: str = "0.150.1") -> Path:
+    def write_fake_codex(self, version: str = "0.151.0") -> Path:
         path = self.root / f"codex-{version}"
         path.write_text(
             "#!/usr/bin/env python3\n"
@@ -698,7 +698,7 @@ class ArtifactSupervisorTests(unittest.TestCase):
         path.chmod(0o700)
         return path
 
-    def write_bridge_config(self, codex_version: str = "0.150.1") -> Path:
+    def write_bridge_config(self, codex_version: str = "0.151.0") -> Path:
         codex_bin = self.write_fake_codex(codex_version)
         config = {
             "schema": semantic_events.BRIDGE_CONFIG_SCHEMA,

@@ -561,6 +561,43 @@ class OutboxTests(unittest.TestCase):
         claimed = se.claim_next_event(self.outbox, owner="d", lease_seconds=60, now=later)
         self.assertIsNotNone(claimed)
 
+    def test_writer_busy_defer_survives_restart_without_consuming_attempts(self) -> None:
+        self.publish()
+        se.claim_next_event(self.outbox, owner="bridge-a", lease_seconds=60, now=NOW)
+        outcome = se.defer_event(
+            self.outbox,
+            self.event["event_id"],
+            owner="bridge-a",
+            code="thread_writer_busy",
+            safe_message="foreground writer owns the thread",
+            stage="thread_queue",
+            now=NOW,
+            delay_seconds=30,
+        )
+        self.assertEqual(outcome, "deferred")
+        delivery = se._read_delivery(
+            se.event_dir(self.outbox, self.event["event_id"]), self.event["event_id"]
+        )
+        self.assertEqual(delivery["state"], "pending")
+        self.assertEqual(delivery["attempts"], 0)
+        self.assertEqual(delivery["last_error"]["code"], "thread_writer_busy")
+        self.assertIsNone(
+            se.claim_next_event(
+                self.outbox,
+                owner="bridge-after-restart",
+                lease_seconds=60,
+                now=NOW + timedelta(seconds=29),
+            )
+        )
+        reclaimed = se.claim_next_event(
+            self.outbox,
+            owner="bridge-after-restart",
+            lease_seconds=60,
+            now=NOW + timedelta(seconds=31),
+        )
+        self.assertIsNotNone(reclaimed)
+        self.assertEqual(reclaimed[1]["attempts"], 0)
+
     def test_non_retryable_failure_dead_letters_immediately(self) -> None:
         self.publish()
         se.claim_next_event(self.outbox, owner="d", lease_seconds=60, now=NOW)
@@ -767,7 +804,7 @@ class PostflightTests(unittest.TestCase):
 
 
 class VendorSyncTests(unittest.TestCase):
-    SIBLING = "codex-hpc-monitor"
+    SIBLING = "codex-long-task-monitor"
 
     def test_vendored_copies_are_identical(self) -> None:
         sibling = HERE.parent.parent / self.SIBLING / "scripts" / "semantic_events.py"

@@ -60,7 +60,8 @@ preflight checks binding/config/activation readiness and requires the configured
 direct Codex CLI version to have a recorded real App Server lifecycle smoke
 plus a matching local `lifecycle-smoke --i-mean-it` receipt bound to the
 absolute executable hash and full config. It does not prove daemon liveness.
-Treat 0.149.1 as incompatible; 0.150.1 and 0.151.0 are currently recorded.
+Treat 0.150.1 and older as incompatible with active-writer delivery; 0.151.0
+and 0.152.0 are currently recorded with the required durable queue contract.
 
 When a monitor is started with `--event-binding`, each verified terminal
 record additionally publishes one durable semantic event into the local
