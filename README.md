@@ -130,6 +130,9 @@ For the locally patched Codex 0.151 runtime only, `app_server_bridge.py
 continuation-gate get|arm|clear` provides an experimental, no-model-turn
 control plane that lets a Goal supervisor persist and verify the exact
 thread/Goal idle-continuation deferral before it commits an external wait.
+The supervisor must invoke arm synchronously inside that target thread's
+current explicit turn and wait for read-back before the turn ends; unrelated
+background-shell arm is outside the zero-turn contract.
 This path requires a stable monitor binding id and a private state root outside
 the project; its durable receipt is bound to the binding, config, Goal, and
 Codex executable hash. It is separate from default event delivery, which

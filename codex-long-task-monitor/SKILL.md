@@ -39,6 +39,8 @@ continuation gate" section of the bridge reference. Use its explicit
 `continuation-gate arm` result only after durable monitor binding, and do not
 commit an external-wait state unless the same active Goal reads back with
 `deferred=true`. Preserve the returned Goal id for receipt-bound `clear`.
+Arm synchronously inside the target thread's current explicit turn and finish
+read-back before that turn ends; do not arm from an unrelated background shell.
 This control plane creates no model turn and does not change ordinary delivery.
 
 Enable a binding only on a new supervisor run. Never retrofit it onto an

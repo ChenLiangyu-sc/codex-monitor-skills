@@ -191,6 +191,11 @@ Repeating `arm` through a new App Server process is idempotent for the same
 Goal. A replacement Goal, changed binding/config, or executable drift fails
 closed instead of arming the new Goal under an old receipt.
 
+The target Goal supervisor must run `arm` synchronously before its current
+explicit turn ends. The read-back is the handoff point before the primary Goal
+runtime can reach idle. Calling `arm` later from an unrelated shell is not a
+supported zero-turn handoff.
+
 Read the live marker without changing it:
 
 ```bash
@@ -216,8 +221,9 @@ python3 <skill-dir>/scripts/app_server_bridge.py continuation-gate clear \
 Goal id as `expectedGoalId`, and verifies `deferred=false` by read-back. It is
 idempotent when that same Goal is already clear and refuses to touch a
 replacement Goal. An explicit wake turn also clears the Codex marker at turn
-start; this command remains the safe reconciliation path when no wake turn is
-being created.
+start. This command only clears the marker and never calls `turn/start` or
+starts Goal continuation; a later explicit resume remains responsible for
+forward progress.
 
 The launcher rejects an attempt to add or change a binding on an already
 active run as `active_run_binding_conflict`; bindings are immutable run
