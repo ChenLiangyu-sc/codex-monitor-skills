@@ -135,6 +135,7 @@ python3 <skill-dir>/scripts/app_server_bridge.py init-binding \
 python3 <skill-dir>/scripts/supervise_slurm_job.py start <job-id> --host <login-host> ... \
   --event-binding ~/.config/codex-monitor/binding-<task>.json \
   --bridge-config ~/.config/codex-monitor/bridge.json \
+  --bridge-service-name <installed-service-name> \
   --require-auto-resume
 ```
 
@@ -148,6 +149,12 @@ required. Commands not shaped as `<absolute-executable> app-server`, unknown
 reported versions, missing receipts, and executable/config hash drift fail
 strict preflight. The receipt is local evidence, not a cryptographic remote
 attestation. It cannot prove daemon liveness.
+
+Goal Guardrails 0.7 requires the service-name token in its frozen start
+policy. The supervisor validates and records it for provenance only. It never
+uses this option to control or select a service, and it never converts the
+name into liveness evidence. Use `bridge_service.py status --service-name ...`
+as a separate operational check.
 
 The delivery process revalidates this receipt when it starts and again after
 each event claim, immediately before App Server delivery. If the executable

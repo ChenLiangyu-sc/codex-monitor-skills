@@ -284,6 +284,111 @@ class SupervisorTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertNotIn("warnings", payload)
 
+    def test_goal_guardrails_070_bridge_service_contract_is_persisted(self) -> None:
+        binding = self.write_binding()
+        config = self.write_bridge_config()
+        loaded = semantic_events.load_bridge_config(config)
+        semantic_events.activate_bridge(self.outbox(), loaded, [])
+        identity = app_server_bridge._configured_cli_identity(
+            loaded, timeout_seconds=5
+        )
+        app_server_bridge.record_lifecycle_smoke_receipt(
+            self.state, loaded, identity,
+            thread_id="thr_smoke", first_turn_id="turn_1", second_turn_id="turn_2",
+        )
+        service_name = "codex-hpc-monitor-note-train-bridge"
+        command = [
+            sys.executable, str(SCRIPT), "start", "12345",
+            "--host", "fakehost",
+            "--poll-seconds", "60",
+            "--pending-alert-seconds", "0",
+            "--terminal-observability-seconds", "300",
+            "--max-watch-seconds", "86400",
+            "--state-dir", str(self.state),
+            "--expected-owner", "alice",
+            "--expected-job-name", "h27-series-screen",
+            "--expected-partition", "h200-ib-1",
+            "--event-binding", str(binding),
+            "--bridge-config", str(config),
+            "--bridge-service-name", service_name,
+            "--require-auto-resume",
+            # Test-only dependency injection; production uses the installed default.
+            "--watcher-path", str(self.fake),
+            "--handshake-seconds", "3",
+        ]
+        result = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            check=False,
+            env={**os.environ, "FAKE_EXIT": "0"},
+            timeout=8,
+        )
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(payload["bridge_service_name"], service_name)
+        terminal = self.wait_state("terminal")
+        run = Path(terminal["run_dir"])
+        manifest = json.loads((run / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["bridge_service_name"], service_name)
+        self.assertEqual(manifest["contract"]["bridge_service_name"], service_name)
+        self.assertEqual(terminal["bridge_service_name"], service_name)
+        self.assertNotIn("--bridge-service-name", manifest["watcher_argv"])
+
+    def test_bridge_service_name_requires_binding_and_config(self) -> None:
+        result, payload = self.run_cli(
+            "start", "--bridge-service-name", "codex-monitor-test-bridge"
+        )
+        self.assertEqual(result.returncode, 12)
+        self.assertIn(
+            "requires --event-binding and --bridge-config", payload["detail"]
+        )
+        self.assertFalse(self.state.exists())
+
+    def test_bridge_service_name_rejects_unsafe_token(self) -> None:
+        result = subprocess.run(
+            self.command("start", "--bridge-service-name", "bad/service"),
+            text=True, capture_output=True, check=False, timeout=8,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("must be 1-128 characters", result.stderr)
+        self.assertFalse(self.state.exists())
+
+    def test_active_run_rejects_bridge_service_name_drift(self) -> None:
+        binding = self.write_binding()
+        config = self.write_bridge_config()
+        loaded = semantic_events.load_bridge_config(config)
+        semantic_events.activate_bridge(self.outbox(), loaded, [])
+        identity = app_server_bridge._configured_cli_identity(
+            loaded, timeout_seconds=5
+        )
+        app_server_bridge.record_lifecycle_smoke_receipt(
+            self.state, loaded, identity,
+            thread_id="thr_smoke", first_turn_id="turn_1", second_turn_id="turn_2",
+        )
+        common = (
+            "--event-binding", str(binding),
+            "--bridge-config", str(config),
+            "--require-auto-resume",
+        )
+        first, payload = self.run_cli(
+            "start", *common,
+            "--bridge-service-name", "codex-monitor-service-a",
+            env={"FAKE_WATCH_SECONDS": "20"},
+        )
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertEqual(payload["state"], "active")
+        second, payload = self.run_cli(
+            "start", *common,
+            "--bridge-service-name", "codex-monitor-service-b",
+            env={"FAKE_WATCH_SECONDS": "20"},
+        )
+        self.assertEqual(second.returncode, 12)
+        self.assertEqual(payload["start_result"], "active_run_bridge_service_conflict")
+        self.assertEqual(payload["active_bridge_service_name"], "codex-monitor-service-a")
+        self.assertEqual(payload["requested_bridge_service_name"], "codex-monitor-service-b")
+
     def test_require_auto_resume_rejects_missing_live_smoke_receipt(self) -> None:
         binding = self.write_binding()
         config = self.write_bridge_config()

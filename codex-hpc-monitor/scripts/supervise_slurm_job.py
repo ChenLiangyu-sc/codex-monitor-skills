@@ -29,6 +29,7 @@ import semantic_events
 
 JOB_ID_RE = re.compile(r"^[0-9]+(?:_[0-9]+)?$")
 HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+BRIDGE_SERVICE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,127}$")
 SCHEMA_PREFIX = "codex-hpc-monitor"
 # Watcher exit code -> semantic wake event. Verified scheduler outcomes only.
 # Exit 4 (pending threshold alert) deliberately maps to nothing: a queue-wait
@@ -241,6 +242,8 @@ def run_status(run: Optional[Path], host: str, job_id: str) -> Dict[str, Any]:
             "job_id": job_id,
         }
 
+    manifest = read_json(run / "manifest.json")
+    bridge_service_name = manifest.get("bridge_service_name")
     watcher_state = verified_local_state(run, host, job_id)
     terminal = read_json(run / "terminal.json")
     if terminal:
@@ -259,6 +262,8 @@ def run_status(run: Optional[Path], host: str, job_id: str) -> Dict[str, Any]:
             "terminal": terminal,
             "watcher_state": watcher_state,
         }
+        if isinstance(bridge_service_name, str):
+            candidate["bridge_service_name"] = bridge_service_name
         _code, verification = terminal_wait_result(candidate)
         candidate["terminal_verified"] = verification["terminal_verified"]
         if not verification["terminal_verified"]:
@@ -278,7 +283,7 @@ def run_status(run: Optional[Path], host: str, job_id: str) -> Dict[str, Any]:
         state = "supervisor_lost"
     else:
         state = "launch_unconfirmed"
-    return {
+    payload = {
         "schema_version": f"{SCHEMA_PREFIX}.status/v1",
         "state": state,
         "host": host,
@@ -292,6 +297,9 @@ def run_status(run: Optional[Path], host: str, job_id: str) -> Dict[str, Any]:
         "child_exit": child_exit or None,
         "watcher_state": watcher_state,
     }
+    if isinstance(bridge_service_name, str):
+        payload["bridge_service_name"] = bridge_service_name
+    return payload
 
 
 def open_lifetime_lock(base: Path) -> int:
@@ -351,7 +359,7 @@ def validate_identity(job_id: str, host: str) -> None:
 
 
 def monitoring_contract(args: argparse.Namespace) -> Dict[str, Any]:
-    return {
+    contract = {
         "host": args.host,
         "job_id": args.job_id,
         "poll_seconds": args.poll_seconds,
@@ -363,6 +371,9 @@ def monitoring_contract(args: argparse.Namespace) -> Dict[str, Any]:
         "expected_job_name": args.expected_job_name,
         "expected_partition": args.expected_partition,
     }
+    if args.bridge_service_name is not None:
+        contract["bridge_service_name"] = args.bridge_service_name
+    return contract
 
 
 def contract_digest(contract: Dict[str, Any]) -> str:
@@ -658,6 +669,12 @@ def publish_semantic_event(
 
 def start_monitor(args: argparse.Namespace) -> int:
     validate_identity(args.job_id, args.host)
+    if args.bridge_service_name is not None and (
+        args.event_binding is None or args.bridge_config is None
+    ):
+        raise ValueError(
+            "--bridge-service-name requires --event-binding and --bridge-config"
+        )
     event_binding = resolved_event_binding(args)
     auto_resume_warnings = auto_resume_preflight(args, event_binding)
     emit_auto_resume_warnings(auto_resume_warnings)
@@ -676,10 +693,15 @@ def start_monitor(args: argparse.Namespace) -> int:
         run = current_run(base)
         payload = run_status(run, args.host, args.job_id)
         current_binding = None
+        current_service_name = None
         if run is not None:
-            candidate = read_json(run / "manifest.json").get("event_binding")
+            active_manifest = read_json(run / "manifest.json")
+            candidate = active_manifest.get("event_binding")
             if isinstance(candidate, dict):
                 current_binding = candidate
+            candidate_service = active_manifest.get("bridge_service_name")
+            if isinstance(candidate_service, str):
+                current_service_name = candidate_service
         if event_binding is not None and current_binding != event_binding:
             payload["start_result"] = "active_run_binding_conflict"
             payload["requested_event_binding_digest"] = event_binding_digest(
@@ -688,6 +710,12 @@ def start_monitor(args: argparse.Namespace) -> int:
             payload["active_event_binding_digest"] = event_binding_digest(
                 current_binding
             )
+            print_start_payload(payload, auto_resume_warnings)
+            return 12
+        if args.bridge_service_name != current_service_name:
+            payload["start_result"] = "active_run_bridge_service_conflict"
+            payload["requested_bridge_service_name"] = args.bridge_service_name
+            payload["active_bridge_service_name"] = current_service_name
             print_start_payload(payload, auto_resume_warnings)
             return 12
         payload["start_result"] = "already_active"
@@ -738,6 +766,8 @@ def start_monitor(args: argparse.Namespace) -> int:
             manifest["event_binding"] = event_binding
             manifest["event_binding_digest"] = event_binding_digest(event_binding)
             manifest["event_backend"] = "slurm"
+        if args.bridge_service_name is not None:
+            manifest["bridge_service_name"] = args.bridge_service_name
         publish_json_no_replace(run / "manifest.json", manifest)
         if event_binding is not None:
             # Written before the supervisor exists: durable proof that this
@@ -1630,6 +1660,14 @@ def nonnegative_float(value: str) -> float:
     return parsed
 
 
+def bridge_service_name(value: str) -> str:
+    if BRIDGE_SERVICE_NAME_RE.fullmatch(value) is None:
+        raise argparse.ArgumentTypeError(
+            "must be 1-128 characters using letters, digits, '.', '_', ':', '@', or '-'"
+        )
+    return value
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     sub = result.add_subparsers(dest="command", required=True)
@@ -1666,6 +1704,14 @@ def parser() -> argparse.ArgumentParser:
         "--bridge-config",
         type=Path,
         help="bridge configuration the binding must agree with (optional)",
+    )
+    start.add_argument(
+        "--bridge-service-name",
+        type=bridge_service_name,
+        help=(
+            "freeze the delivery service identity in the monitor manifest for audit; "
+            "does not start, stop, select, or prove liveness of that service"
+        ),
     )
     start.add_argument(
         "--require-auto-resume",

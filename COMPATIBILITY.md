@@ -136,6 +136,13 @@ Activation hardening behavior (additive):
   compatibility but adds a structured `warnings` field and a prominent stderr
   warning; the additive `--require-auto-resume` option fails before launch
   unless binding, enabled matching config, and activation receipt are ready.
+- HPC `start` accepts Goal Guardrails 0.7's additive
+  `--bridge-service-name`. When present, the validated value is stored as the
+  optional manifest field `bridge_service_name` and inside `contract`; old
+  manifests without it remain readable and retain their prior contract digest.
+  The value is provenance only, requires both binding and bridge config, and
+  cannot drift on an active run. It does not imply service liveness or grant
+  service-management authority.
 
 App Server lifecycle diagnostics hardening (additive, 2026-08-31):
 

@@ -101,6 +101,13 @@ executable hash, full bridge config, Codex home, and workspace. Codex CLI
 0.150.1 and 0.151.0 are currently recorded. This preflight does not claim
 that the delivery daemon is currently alive.
 
+`codex-hpc-monitor start` also accepts Goal Guardrails 0.7's frozen
+`--bridge-service-name`. The value is validated and stored in the immutable
+manifest/contract as provenance, and a different value cannot be retrofitted
+onto an active run. It deliberately does not start, stop, select, or prove
+liveness of that service. The option requires `--event-binding` and
+`--bridge-config`; service health remains a separate operational check.
+
 If the App Server asks for command, file, permission, MCP, or user-input
 approval during the wake turn, the bridge never answers it. The attempt
 fails closed as `operator_interaction_required` for human diagnosis instead
@@ -401,7 +408,7 @@ real-smoke Codex version, and runs a non-blocking scheduled advisory check
 against the latest Codex CLI.
 
 Current operations-hardening baseline after independent review:
-**512 tests passing** (272 HPC monitor tests and 240 long-task monitor tests),
+**516 tests passing** (276 HPC monitor tests and 240 long-task monitor tests),
 including the outbox, App Server fake, postflight claim, doctor,
 protocol contract check, approval-request fail-closed behavior, service
 definition lifecycle, independent notification receipts, event timeline,

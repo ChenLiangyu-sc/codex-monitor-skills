@@ -106,6 +106,7 @@ For a newly enabled closed loop, add both identity files on the initial start:
 ```bash
   --event-binding ~/.config/codex-monitor/binding-<task>.json \
   --bridge-config ~/.config/codex-monitor/bridge.json \
+  --bridge-service-name <installed-service-name> \
   --require-auto-resume
 ```
 
@@ -118,6 +119,13 @@ direct Codex CLI version to have a recorded real App Server lifecycle smoke
 plus a matching local `lifecycle-smoke --i-mean-it` receipt bound to the
 absolute executable hash and full config. It does not prove daemon liveness.
 Treat 0.149.1 as incompatible; 0.150.1 and 0.151.0 are currently recorded.
+
+Goal Guardrails 0.7 proposals freeze one `--bridge-service-name`. The monitor
+validates that token and records it in the immutable manifest and monitoring
+contract for audit. It does not use the token to start, stop, select, or infer
+liveness of a systemd/LaunchAgent service. Supplying it requires both
+`--event-binding` and `--bridge-config`; changing it on an active run fails
+closed as `active_run_bridge_service_conflict`.
 
 Include every known identity constraint. Omit unknown optional fields; never guess them. The launcher returns after a bounded handshake while the supervisor and watcher continue independently.
 

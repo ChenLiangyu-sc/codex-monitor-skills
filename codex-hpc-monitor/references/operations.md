@@ -177,6 +177,9 @@ clean service stop.
 
 When the requested outcome requires a wake turn, start a new monitor with
 `--event-binding`, `--bridge-config`, and `--require-auto-resume` together.
+Goal Guardrails 0.7 also freezes `--bridge-service-name <name>`; use the same
+stable name passed to `bridge_service.py install`. The supervisor stores that
+name for audit but does not control or probe the service through this option.
 The strict option fails before creating a run or launching a watcher unless
 the binding/config identity matches, the config is enabled, and its durable
 activation receipt exists. It does not probe delivery-daemon liveness.
